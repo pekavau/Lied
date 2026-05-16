@@ -122,7 +122,7 @@ Lied app (Rust + axum)         ← serves both interfaces
 **Authentication:**
 - Local accounts (username/password, argon2id hashing) are the baseline — required for self-hostable deployments without external dependencies.
 - OIDC is an optional, configurable second auth method for orgs that want SSO.
-- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). App passwords are cached on devices and must not share a session with the REST/web login.
+- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
 - REST API uses session cookies (web client) or bearer tokens (programmatic).
 
 **Authorization:**
@@ -139,10 +139,10 @@ Canonical directory tree (also the public contract for external tools mounting t
     arrangements/
         <arrangement-slug>/
             score/                          ← full-score files
-                <name>.{pdf,musicxml,ly}
+                <name>.<ext>                   (.pdf, .musicxml, .ly, .png, …)
             voices/
                 <voice-slug>/
-                    <name>.{pdf,musicxml,ly}   ← canonical voice files
+                    <name>.<ext>               ← canonical voice files
                     annotations/
                         <user-slug>/
                             <name>.pdf         ← personal annotation files
@@ -419,12 +419,24 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ## Data Model
 
 ### Decisions
+
+#### Scope & ownership
 - **Provenance** is flat metadata on `Arrangement` (publisher, arranger, purchase date, license notes, copy count). No separate publisher/license entity unless querying by publisher becomes a clear need.
 - **Editions/variants (UC-19, UC-20).** Each `Arrangement` is already a specific edition. Multiple editions of one work = multiple `Arrangement` rows sharing a `Work`. `Arrangement.status` (`active`, `archived`) lets an org retire an old edition without deleting it; multiple editions may be active simultaneously.
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
+- **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
+- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. Admins can add instruments without a code change.
+
+#### Lifecycle, existence, audit
 - **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints but never surfaced via WebDAV.
-- **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem.
+- **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem, Tag.
 - **Soft-delete cascade: hide-with-references.** A soft-delete sets `deleted_at` on the targeted entity only — never on its descendants. Queries that join parent → child filter `WHERE parent.deleted_at IS NULL AND child.deleted_at IS NULL`, so a soft-deleted parent makes its subtree invisible *through it* without changing the children's own state. Undelete just clears the parent's `deleted_at` and the subtree reappears automatically. CollectionItems / PartAssignments that reference a soft-deleted target remain in the collection but render as "[removed]" with the slug shown — broken references are surfaced, not silently dropped. Soft-cascade and block-on-references were both rejected: soft-cascade makes undelete ambiguous (was the child already deleted before, or only by cascade?); block-on-references creates bad UX ("can't delete until you remove from 7 collections").
+- **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
+- **Time zones.** Two rules:
+  1. **All instants are `timestamptz`, stored and serialized in UTC** (ISO 8601 with `Z` suffix: `2026-05-16T14:30:00Z`). Postgres `timestamptz` stores UTC internally regardless of session TZ. Rust uses `chrono::DateTime<Utc>`. Covers: `created_at`, `updated_at`, audit-log `at`, `last_used_at`, `revoked_at`, `notified_at`, `acknowledged_at`, session expiry, JWT `iat`/`exp`.
+  2. **Civil dates** (calendar facts without a time) use `date`. Currently only `Arrangement.purchase_date` — "we purchased this on 2026-04-12" is a fact about a calendar day, not a UTC instant.
+
+  Display happens in the user's local TZ — browser detects, server returns UTC, client formats. Server never guesses a display TZ. **Datetime crate: `chrono`** with `serde` + `clock` features (broader ecosystem integration than `time` for sqlx/axum/utoipa).
 - **Unique constraints** (all are partial indexes `WHERE deleted_at IS NULL` where the entity has soft-delete, so the constraint applies to live rows only):
 
   | Entity | Constraint |
@@ -445,6 +457,8 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   | `Work`, `GlobalAnnotation` | none — duplicates allowed (Work duplicates resolved via phase-2 merge tooling; multiple GlobalAnnotations per arrangement is the norm) |
 
   Phase-1 design: `PartAssignment` permits only one user per voice per item. Cover-player / doubling support would relax this by adding a `role` discriminator on the row.
+
+#### Files & storage
 - **Conversion provenance.** `File.derived_from_file_id` (nullable FK) links a derived file to its source; a file with no `derived_from` is a source. `File.conversion_quality` (`clean`, `omr`, `manual`) surfaces UC-10's lossless-vs-approximate distinction. No separate `Conversion` table — the FK + quality enum is sufficient until we need failure history.
 - **Multiple full-score files per arrangement.** Permitted: an Arrangement can have several files with `voice_id IS NULL` (e.g. LilyPond source + publisher PDF + annotated conductor copy), disambiguated by `(name, format)`. No `primary_score` flag in phase 1 — consumers pick by convention: source-format preferred (LilyPond → MusicXML → PDF), earliest `created_at` to break ties; UI offers the full list when there's choice. Adding `Arrangement.primary_score_file_id` later is a non-breaking migration if the convention proves insufficient.
 - **Storage path is derived, not stored.** The MinIO object key for a `File` is computed deterministically from the entity tree:
@@ -452,16 +466,15 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   - Full-score file: `orgs/<org-slug>/arrangements/<arr-slug>/score/<file-name>.<ext>`
   - Extension is derived from `File.mime_type`.
   Slug immutability (see WebDAV layout) keeps the path stable; the rare "rename slug" admin operation moves all affected MinIO objects to the new prefix in one operation. WebDAV writes resolve path segments to entity slugs and insert `File` rows; WebDAV reads recompute the path from the row. The same key is also browsable via MinIO's own web UI / `mc` CLI without going through Lied — a small ops bonus.
+  **Personal annotations are out of scope of this rule** — they are files-by-convention with no `File` row backing them. Their path (`…/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf`) is governed by the personal-annotations naming convention below, not the derived-path rule.
 - **Image subtype.** `File.mime_type` (text) records the actual subtype (`image/png`, `image/jpeg`, `image/tiff`, …). The `format` enum stays coarse and drives routing (e.g. `image` → display-only).
-- **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
-- **Time zones.** Two rules:
-  1. **All instants are `timestamptz`, stored and serialized in UTC** (ISO 8601 with `Z` suffix: `2026-05-16T14:30:00Z`). Postgres `timestamptz` stores UTC internally regardless of session TZ. Rust uses `chrono::DateTime<Utc>`. Covers: `created_at`, `updated_at`, audit-log `at`, `last_used_at`, `revoked_at`, `notified_at`, `acknowledged_at`, session expiry, JWT `iat`/`exp`.
-  2. **Civil dates** (calendar facts without a time) use `date`. Currently only `Arrangement.purchase_date` — "we purchased this on 2026-04-12" is a fact about a calendar day, not a UTC instant.
 
-  Display happens in the user's local TZ — browser detects, server returns UTC, client formats. Server never guesses a display TZ. **Datetime crate: `chrono`** with `serde` + `clock` features (broader ecosystem integration than `time` for sqlx/axum/utoipa).
+#### Annotations & distribution state
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: every required voice has a `PartAssignment`; "rehearsed" coverage additionally requires `acknowledged_at`.
-- **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org>/arrangements/<arr>/voices/<voice>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the source file's latest MinIO version mtime.
+- **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
 - **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director.
+
+#### Search & metadata
 - **Search backend.** Postgres FTS (`tsvector` + GIN) over title, composer, arranger, instrumentation description, and tag names; `pg_trgm` for fuzzy matching on title and composer. No external search service — preserves the single-Postgres self-hostable footprint. If volume ever outgrows this, swap is mechanical.
 - **Structured search fields.** Conductor's UC-2 dimensions split into structured columns vs. tags:
   - `Work.composer` (text, nullable) — composer lives on the abstract work, not the edition. Arrangements without a Work have no composer (folk, internal compositions).
@@ -469,12 +482,12 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   - `Arrangement.difficulty` (smallint 1–8, nullable) — **ABRSM scale** is the canonical numeric for filters and ranges.
   - `Arrangement.difficulty_ratings` (jsonb, nullable) — optional map of scale → grade for cross-referencing, e.g. `{"abrsm": "6", "aba": "3.5", "henle": "5", "rcm": "8"}`. The `abrsm` key, if present, must agree with `difficulty` (rounded). UI suggests known scales (ABRSM, ABA, Henle, RCM, Trinity) via autocomplete.
   - `Arrangement.difficulty_notes` (text, nullable) — prose caveats (e.g. "grade 5 except the cadenza"); expected to be rarely used.
-  - Instrumentation filter joins through `Voice.instrument`; no new field.
-- **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
-- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument`, `Membership.instruments`, and `Membership.principal_instruments` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument ∈ principal_instruments`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. Admins can add instruments without a code change.
-- **Membership roles.** `Membership.role` is a Postgres enum with four values: `owner`, `archivist`, `conductor`, `musician`. Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need.
+  - Instrumentation filter joins through `Voice.instrument_id`; no new field.
 
-Permission matrix:
+#### Authorization
+- **Membership roles.** `Membership.role` is a Postgres enum with four values: `owner`, `archivist`, `conductor`, `musician`. Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need. See the Permission matrix subsection below for the per-role capability breakdown.
+
+### Permission matrix
 
 | Action | owner | archivist | conductor | musician |
 |---|---|---|---|---|
@@ -571,7 +584,7 @@ Work (optional, composer)
   └── Arrangement (status, duration, difficulty 1-8 ABRSM, difficulty_ratings, provenance)
         ├── File(s) [full score]
         ├── ArrangementTag → Tag
-        └── Voice (instrument → Instrument)
+        └── Voice (instrument_id → Instrument)
               └── File (format, mime_type, derived_from?, conversion_quality?)
                     └── [personal annotation files in MinIO, by naming convention]
 
@@ -581,7 +594,7 @@ User
   └── AppPassword (revocable WebDAV credential)
 
 Organization
-  ├── Membership → User (role, instruments[] → Instrument)
+  ├── Membership → User (role, instrument_ids[] → Instrument)
   ├── Tag (name, kind)
   └── Collection (program | standing, indexed by piece number)
         └── CollectionItem (index number) → Arrangement
