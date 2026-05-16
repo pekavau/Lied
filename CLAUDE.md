@@ -181,13 +181,13 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 
 ### Backend
 - **`axum`** — web framework. All HTTP routing for REST + HTMX endpoints.
-- **`sqlx`** (`postgres` feature) — async DB driver with compile-time-checked SQL against a real database. SQL is hand-written; no ORM.
+- **`sqlx`** (`postgres` feature) — async DB driver with compile-time-checked SQL against a real database. SQL is hand-written; no ORM. **Offline mode**: `.sqlx/` (the prepared-query cache produced by `cargo sqlx prepare`) is committed to the repo; `SQLX_OFFLINE=true` is set in CI and in the Docker builder stage so builds are hermetic and need no DB. A CI gate runs `cargo sqlx prepare --check` against the dev DB to catch out-of-sync caches.
 - **`sqlx-cli`** — migrations as plain `.sql` files in `/migrations`, embedded in the binary at build time.
 - **`dav-server`** — WebDAV crate; mounted under `/orgs/...` and `/users/<user>/library/...`.
 - **`aws-sdk-s3`** — official AWS SDK; speaks MinIO natively.
 - **`argon2`** — password hashing for local accounts.
-- **`tower-sessions`** — session cookies for the web client.
-- **`jsonwebtoken`** — bearer tokens for programmatic REST clients.
+- **`tower-sessions`** — session cookies for the web client. Backend: **Postgres-backed store** (`tower-sessions-sqlx-store`); the `sessions` table is added via our `/migrations` directory. Chosen over in-memory because the NFR section says scaling must not be precluded; chosen over Redis to avoid a second service. Each authenticated request reads one row — negligible at our scale; if it ever becomes hot, swap to a Redis-backed store (see Infrastructure pluggability rule in NFR posture).
+- **`jsonwebtoken`** — bearer tokens for programmatic REST clients. **Algorithm: HS256** (symmetric); Lied is the only issuer and verifier, so asymmetric is wasted complexity. The signing secret is 32 random bytes managed via the secrets layer with the hot-rotation flow already specced (new key written, old key honored for a grace window). Token lifetime: **30 days, configurable.** Claims: `sub` (user id), `org` (active org id, nullable for system-admin operations), `iat`, `exp`, `jti` (id for future revocation listing). If federation ever needs external verification, switching to ES256 is a contained migration (accept both during cutover, retire HS256).
 - **`tower-governor`** — rate limiting as axum/tower middleware.
 - **`tracing`** + **`tracing-subscriber`** — structured logging.
 - **`figment`** — layered config (file + env + the `_FILE` / `cmd:` secret-source pattern from the NFR section).
@@ -231,9 +231,33 @@ Lied does not assume a particular self-hosting entity. The realistic shapes:
 
 **The trust assumption phase 1 relies on:** every org in one instance trusts the other orgs in the same instance. This holds for topologies 1 (only one), 2 (allied), and 4 (only one). Topology 3 violates it and requires a tenant-isolation pass before being supported.
 
+### Infrastructure pluggability rule
+
+Anything that stands in for "external system that could be swapped" (session store, rate-limit store, future queue, future cache) is accessed *only* through its crate's trait abstraction. Application code never sees the concrete backend. Specifically: **never JOIN infrastructure tables (e.g. the `sessions` table) with domain tables.** Treat them as opaque key/value stores accessed via the trait. This keeps in-memory → Postgres → Redis migrations to a one-line wiring change with a forced reset where appropriate (sessions: re-login; rate limits: bucket reset), not a data migration.
+
 ### Operational stance
 - **Target deployment:** single self-hosted instance, small numbers of orgs and users — covering topologies 1, 2, and 4.
 - **Configurable limits.** Whenever a limit is imposed (max upload size, rate-limit window, per-org storage cap, conversion job timeout, etc.) it MUST be documented and configurable. Hardcoded limits are not acceptable.
+- **Phase 1 backup posture (minimum bar).** The README documents:
+  - **Postgres:** `pg_dump --format=custom` to a host-mounted volume on a cron schedule; `pg_restore --clean` for recovery.
+  - **MinIO:** `mc mirror` to a second MinIO instance or host directory on the same schedule; reverse mirror for recovery.
+  - **Required volume mounts** in `docker-compose.yml`: Postgres data dir, MinIO data dir, backup target dir, all host-mounted.
+  - **Back up:** those three volumes plus the `.env` / secrets files.
+  - **OK to lose on restore:** in-memory rate-limit state (acceptable), session cookies (users re-login).
+  - A `just backup` target wraps the two commands against the docker-compose volumes.
+
+  **Not promised in phase 1:** point-in-time recovery, continuous WAL streaming, cross-region replication, automated restore verification, a backup-orchestration tool. Those are phase-2 runbook items.
+
+### Default limits (all configurable)
+
+| Limit | Env var | Default | Rationale |
+|---|---|---|---|
+| Max single file upload | `LIED_MAX_UPLOAD_BYTES` | 200 MB | Covers 99.9th-percentile orchestral PDFs; anything larger is almost always a mistake or needs splitting |
+| Max non-upload request body | `LIED_MAX_REQUEST_BYTES` | 256 KB | JSON / form bodies; prevents bomb attacks |
+| Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached |
+| Max arrangements per org | `LIED_MAX_ARRANGEMENTS_PER_ORG` | unset (no limit) | Reserved for SaaS-mode quotas later |
+
+**Uploads stream end-to-end.** axum's `extract::Multipart` reads the body as a stream; chunks flow straight to MinIO via the S3 `UploadPart` API. Server memory per upload is fixed at the chunk buffer size (a few MB), not file size. The same applies to downloads: aws-sdk-s3's `GetObject` returns a `ByteStream` piped directly into the axum response body, with HTTP `Range` requests honored so tablets can seek inside large PDFs.
 
 ### Security baseline
 - **Rate limiting** is built in from day 1, with per-route and per-identity buckets configurable per deployment.
@@ -265,12 +289,34 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all`
 - `cargo deny check` — license + security policy on dependencies
-- Docker image builds successfully
+- `cargo sqlx prepare --check` — verifies `.sqlx/` cache matches the queries in code
+- Docker image builds successfully (with `SQLX_OFFLINE=true`)
 
 ### Local verification
 - **`just`** is the build tool; `justfile` lives at the repo root.
 - **`just check`** runs fmt + clippy + test — the canonical command an autonomous loop runs to verify its work.
-- Other targets: `just fmt`, `just lint`, `just test`, `just migrate`, `just dev` (`docker compose up` + `cargo watch`), `just build` (release binary), `just image` (docker image build).
+- Other targets: `just fmt`, `just lint`, `just test`, `just migrate`, `just prepare` (refreshes `.sqlx/` after SQL changes), `just dev` (`docker compose up` + `cargo watch`), `just build` (release binary), `just image` (docker image build), `just backup` (runs `pg_dump` + `mc mirror` against the docker-compose volumes).
+
+### Toolchain pinning
+- **`rust-toolchain.toml`** at the repo root pins the Rust version explicitly. Example:
+  ```toml
+  [toolchain]
+  channel = "1.86.0"          # pin a specific release, never "stable"
+  components = ["rustfmt", "clippy"]
+  profile = "minimal"
+  ```
+- **MSRV** = the pinned channel. We don't support older Rust versions; `rustup` will fetch the pinned toolchain automatically on first build.
+- **Bump cadence:** deliberate, in a dedicated PR, when there's a real reason (language feature, clippy regression fix, dependency requirement). Not automatic — pinning is the whole point.
+
+### Lied's license and dependency policy
+
+- **Lied is published under `MIT OR Apache-2.0`** — the standard Rust-ecosystem dual license. Maximally permissive, matches the deny.toml allowlist, no friction for self-hosters or downstream packagers. AGPL was considered for SaaS-fork protection but rejected as inappropriate for a learning project; revisiting is non-breaking if Lied ever competes with a hosted offering.
+- **`deny.toml` policy** (the `cargo deny check` CI gate):
+  - **License allowlist:** `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `MPL-2.0`, `Unicode-DFS-2016`, `Unicode-3.0`, `Zlib`, `CC0-1.0`, `Unlicense`.
+  - **Explicitly excluded:** copyleft licenses (GPL, LGPL, AGPL) and any "non-commercial" / "evaluation" terms — pulling them in would constrain Lied's own license.
+  - **Advisories:** `vulnerability = "deny"`, `yanked = "deny"`, `unmaintained = "warn"`.
+  - **Duplicates:** `multiple-versions = "warn"` — not a hard fail, but visible.
+  - **Exception list:** starts empty; any `(crate, license)` exception requires a one-line justification comment in `deny.toml`.
 
 ### Type safety / strictness
 - `#![forbid(unsafe_code)]` at the crate root.
@@ -378,7 +424,29 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
 - **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints but never surfaced via WebDAV.
 - **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem.
+- **Soft-delete cascade: hide-with-references.** A soft-delete sets `deleted_at` on the targeted entity only — never on its descendants. Queries that join parent → child filter `WHERE parent.deleted_at IS NULL AND child.deleted_at IS NULL`, so a soft-deleted parent makes its subtree invisible *through it* without changing the children's own state. Undelete just clears the parent's `deleted_at` and the subtree reappears automatically. CollectionItems / PartAssignments that reference a soft-deleted target remain in the collection but render as "[removed]" with the slug shown — broken references are surfaced, not silently dropped. Soft-cascade and block-on-references were both rejected: soft-cascade makes undelete ambiguous (was the child already deleted before, or only by cascade?); block-on-references creates bad UX ("can't delete until you remove from 7 collections").
+- **Unique constraints** (all are partial indexes `WHERE deleted_at IS NULL` where the entity has soft-delete, so the constraint applies to live rows only):
+
+  | Entity | Constraint |
+  |---|---|
+  | `Organization` | `slug` |
+  | `User` | `slug`; `username`; `email` (partial, where not null) |
+  | `AppPassword` | `(user_id, name)` |
+  | `Instrument` | `key` |
+  | `Arrangement` | `(organization_id, slug)` |
+  | `Voice` | `(arrangement_id, slug)` |
+  | `File` | `(arrangement_id, voice_id, name, format)` for voice files; `(arrangement_id, name, format) WHERE voice_id IS NULL` for full-score files (Postgres treats NULL as distinct, so a partial index covers the score case) |
+  | `Membership` | `(user_id, organization_id)` |
+  | `Collection` | `(organization_id, slug)` |
+  | `CollectionItem` | `(collection_id, index)` |
+  | `PartAssignment` | `(collection_item_id, voice_id)` — one assignee per voice per item; reassignment replaces the row |
+  | `Tag` | `(organization_id, name, kind)` |
+  | `ArrangementTag` | `(arrangement_id, tag_id)` |
+  | `Work`, `GlobalAnnotation` | none — duplicates allowed (Work duplicates resolved via phase-2 merge tooling; multiple GlobalAnnotations per arrangement is the norm) |
+
+  Phase-1 design: `PartAssignment` permits only one user per voice per item. Cover-player / doubling support would relax this by adding a `role` discriminator on the row.
 - **Conversion provenance.** `File.derived_from_file_id` (nullable FK) links a derived file to its source; a file with no `derived_from` is a source. `File.conversion_quality` (`clean`, `omr`, `manual`) surfaces UC-10's lossless-vs-approximate distinction. No separate `Conversion` table — the FK + quality enum is sufficient until we need failure history.
+- **Multiple full-score files per arrangement.** Permitted: an Arrangement can have several files with `voice_id IS NULL` (e.g. LilyPond source + publisher PDF + annotated conductor copy), disambiguated by `(name, format)`. No `primary_score` flag in phase 1 — consumers pick by convention: source-format preferred (LilyPond → MusicXML → PDF), earliest `created_at` to break ties; UI offers the full list when there's choice. Adding `Arrangement.primary_score_file_id` later is a non-breaking migration if the convention proves insufficient.
 - **Storage path is derived, not stored.** The MinIO object key for a `File` is computed deterministically from the entity tree:
   - Voice file: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/<file-name>.<ext>`
   - Full-score file: `orgs/<org-slug>/arrangements/<arr-slug>/score/<file-name>.<ext>`
@@ -386,6 +454,11 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   Slug immutability (see WebDAV layout) keeps the path stable; the rare "rename slug" admin operation moves all affected MinIO objects to the new prefix in one operation. WebDAV writes resolve path segments to entity slugs and insert `File` rows; WebDAV reads recompute the path from the row. The same key is also browsable via MinIO's own web UI / `mc` CLI without going through Lied — a small ops bonus.
 - **Image subtype.** `File.mime_type` (text) records the actual subtype (`image/png`, `image/jpeg`, `image/tiff`, …). The `format` enum stays coarse and drives routing (e.g. `image` → display-only).
 - **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
+- **Time zones.** Two rules:
+  1. **All instants are `timestamptz`, stored and serialized in UTC** (ISO 8601 with `Z` suffix: `2026-05-16T14:30:00Z`). Postgres `timestamptz` stores UTC internally regardless of session TZ. Rust uses `chrono::DateTime<Utc>`. Covers: `created_at`, `updated_at`, audit-log `at`, `last_used_at`, `revoked_at`, `notified_at`, `acknowledged_at`, session expiry, JWT `iat`/`exp`.
+  2. **Civil dates** (calendar facts without a time) use `date`. Currently only `Arrangement.purchase_date` — "we purchased this on 2026-04-12" is a fact about a calendar day, not a UTC instant.
+
+  Display happens in the user's local TZ — browser detects, server returns UTC, client formats. Server never guesses a display TZ. **Datetime crate: `chrono`** with `serde` + `clock` features (broader ecosystem integration than `time` for sqlx/axum/utoipa).
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: every required voice has a `PartAssignment`; "rehearsed" coverage additionally requires `acknowledged_at`.
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org>/arrangements/<arr>/voices/<voice>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the source file's latest MinIO version mtime.
 - **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director.
