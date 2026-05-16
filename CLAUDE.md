@@ -167,6 +167,47 @@ A purpose-built display/reader app is a future consideration, not an initial req
 
 ---
 
+## Tech stack
+
+Concretizes the Architecture section. The backend is Rust + axum, the admin UI is HTMX + maud, packaged as a Docker image.
+
+### Backend
+- **`axum`** — web framework. All HTTP routing for REST + HTMX endpoints.
+- **`sqlx`** (`postgres` feature) — async DB driver with compile-time-checked SQL against a real database. SQL is hand-written; no ORM.
+- **`sqlx-cli`** — migrations as plain `.sql` files in `/migrations`, embedded in the binary at build time.
+- **`dav-server`** — WebDAV crate; mounted under `/orgs/...` and `/users/<user>/library/...`.
+- **`aws-sdk-s3`** — official AWS SDK; speaks MinIO natively.
+- **`argon2`** — password hashing for local accounts.
+- **`tower-sessions`** — session cookies for the web client.
+- **`jsonwebtoken`** — bearer tokens for programmatic REST clients.
+- **`tower-governor`** — rate limiting as axum/tower middleware.
+- **`tracing`** + **`tracing-subscriber`** — structured logging.
+- **`figment`** — layered config (file + env + the `_FILE` / `cmd:` secret-source pattern from the NFR section).
+- **`utoipa`** — derives OpenAPI from the axum routes; the API spec doesn't drift from the code.
+- **`thiserror`** for typed domain errors; **`anyhow`** in the binary entrypoint.
+
+### Admin UI
+- **HTMX** for interactivity; server returns HTML fragments.
+- **`maud`** for templates — compile-time HTML macros in Rust syntax. Auto-escapes by default; any `PreEscaped` use needs a justification comment.
+
+### Async runtime
+- **`tokio`** (1.x).
+
+### Build / packaging
+- **Multi-stage `Dockerfile`** — builder runs `cargo build --release`; final image is `gcr.io/distroless/cc-debian12` (~20MB, distro-agnostic).
+- **`docker-compose.yml`** for dev: Postgres + MinIO + the app, with hot reload via `cargo watch`.
+
+### Testing
+- **`cargo test`** native runner.
+- **`testcontainers`** for ephemeral Postgres + MinIO in integration tests; no fixture pollution between tests.
+- **`insta`** for snapshot tests of REST response shapes.
+
+### Deferred (phase 2+)
+- **Audiveris** (Java, separate container) — OMR for PDF/image → MusicXML.
+- **`openidconnect`** — OIDC client when SSO becomes a need.
+
+---
+
 ## Non-functional posture
 
 For the first few iterations the operational target is "as fast and cheap as possible." Hard NFR numbers (latency budgets, availability targets, scale ceilings) are not pinned yet — they get pinned as use grows. The constraint on the design is that none of the choices above should foreclose future scaling, multi-tenancy, or hosted operation.
@@ -184,6 +225,82 @@ For the first few iterations the operational target is "as fast and cheap as pos
   - Secret values are redacted from logs and error responses at the config-layer boundary, not at every call site.
   - Session/JWT signing keys support hot rotation via an admin REST endpoint (new key written, old key honored for a grace window). DB/MinIO credentials tolerate restart for rotation.
   - **Anti-patterns:** no mandatory Vault dependency, no secrets committed to the repo (provide `.env.example` only), no custom encrypted-secrets-file format.
+
+---
+
+## Development workflow & quality bar
+
+Designed to give agentic loops fast, mechanical self-verification, while not adding friction that pays no real dividend.
+
+### CI gates (every PR must pass)
+- `cargo fmt --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all`
+- `cargo deny check` — license + security policy on dependencies
+- Docker image builds successfully
+
+### Local verification
+- **`just`** is the build tool; `justfile` lives at the repo root.
+- **`just check`** runs fmt + clippy + test — the canonical command an autonomous loop runs to verify its work.
+- Other targets: `just fmt`, `just lint`, `just test`, `just migrate`, `just dev` (`docker compose up` + `cargo watch`), `just build` (release binary), `just image` (docker image build).
+
+### Type safety / strictness
+- `#![forbid(unsafe_code)]` at the crate root.
+- `unwrap()` / `expect()` in production paths trigger clippy warnings (so they fail CI). Tests may use them freely.
+
+### Error handling
+- **`thiserror`** for typed error enums in domain code (errors have shape).
+- **`anyhow`** in the binary entrypoint and one-off scripts.
+- One top-level `AppError` implements `axum::response::IntoResponse` so errors become HTTP responses consistently.
+
+### Logging
+- `tracing` everywhere; never `println!` / `eprintln!` in production code.
+- JSON output in production, pretty in dev (toggled via env var).
+- Every request gets a request-ID span; logs use structured fields, never string interpolation.
+
+### Testing posture
+- **Unit tests** colocated with code; fast, no DB.
+- **Integration tests** under `tests/`; use `testcontainers` for real Postgres + MinIO.
+- New code without tests is a PR objection, not a hard CI gate (chasing coverage % produces bad tests).
+
+### Branching & PR flow
+- `main` stays linear — no merge commits, ever.
+- One issue → one branch (`issue-N-short-slug`) → one PR.
+- During development, use `git commit --fixup <sha>` / `--squash <sha>` to direct follow-ups at earlier commits.
+- Before opening the PR, run `git rebase -i --autosquash <base>` to clean the branch into its final commit sequence. A PR with `fixup!` / `squash!` commits left in is not ready.
+- Repo-level git config: `pull.rebase = true`, `rebase.autosquash = true`.
+- GitHub merge mode: **Rebase and merge** (not squash, not merge commit). PRs may carry multiple meaningful commits if the history reads cleanly.
+- PR title references the issue; PR body has the acceptance-criteria checklist + `Closes #N`.
+
+### Commit messages
+- Free-form, imperative mood, matches existing style.
+- Co-author footer when an agent did substantial work.
+- No conventional-commits enforcement.
+
+### Definition of done (issue can close)
+1. Acceptance criteria in the issue body all checked.
+2. CI green (fmt + clippy + test + deny + image build).
+3. Migration applies cleanly from scratch, if schema changed.
+4. Public-API docs updated (rustdoc on public items) if behavior changed.
+5. Branch rebased clean (no `fixup!` / `squash!` left).
+6. CLAUDE.md updated if a design decision shifted.
+
+### Documentation
+- `rustdoc` on public items in any future library crates.
+- `utoipa` generates OpenAPI from the routes; no separate hand-written API doc.
+- CLAUDE.md is the design spec.
+- README is minimal: clone, `docker compose up`, open the UI.
+
+### Security minima (beyond the NFR section)
+- SQL only via `sqlx::query!` / `sqlx::query_as!` (compile-time-checked, parameterized). String-formatted SQL is a PR blocker.
+- XSS: `maud` auto-escapes; `PreEscaped` requires a justification comment.
+- Secrets never logged: enforced by a single `Debug` impl on the config struct that redacts secret fields.
+
+### Not in the bar
+- No coverage threshold.
+- No conventional-commits / changelog automation.
+- No mandatory ADRs.
+- No mutation / fuzz / property-based testing requirements (allowed, not required).
 
 ---
 
