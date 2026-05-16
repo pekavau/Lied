@@ -100,13 +100,15 @@ The application should surface the format of each stored file and make conversio
 ### Backend stack
 
 ```
-PostgreSQL          ← structured metadata, collections, programs, annotations, users, roles
-MinIO               ← file storage (S3-compatible, single binary, self-hostable)
-    │
-    ├── WebDAV interface   ← open access: OS mounting, tablet file managers, MuseScore,
-    │                         Frescobaldi, any WebDAV-capable app — no Lied app required
-    └── REST API           ← music-aware operations: search, collections, part assignment,
-                              annotations, format conversion pipeline
+Lied app (Rust + axum)         ← serves both interfaces
+    ├── WebDAV interface       ← open access: OS mounting, tablet file managers,
+    │                            MuseScore, Frescobaldi, any WebDAV-capable app
+    └── REST API + admin UI    ← music-aware operations: search, collections,
+                                 part assignment, annotations, conversion pipeline
+        │
+        ├── PostgreSQL         ← structured metadata: orgs, users, memberships,
+        │                        arrangements, collections, annotations, tags, audit log
+        └── MinIO              ← file storage (S3-compatible, self-hostable)
 ```
 
 ### Why this split
@@ -135,7 +137,7 @@ Canonical directory tree (also the public contract for external tools mounting t
 ```
 /orgs/<org-slug>/
     arrangements/
-        <arrangement-id>-<title-slug>/
+        <arrangement-slug>/
             score/                          ← full-score files
                 <name>.{pdf,musicxml,ly}
             voices/
@@ -153,8 +155,14 @@ Canonical directory tree (also the public contract for external tools mounting t
     library/                                ← personal/private files (solo practice)
 ```
 
+- All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. Renaming the slug is a separate, explicit operation that breaks any cached WebDAV mount and is reserved for fixing typos.
 - Soft-deleted rows (`deleted_at != NULL`) are hidden from WebDAV listings.
 - The `/orgs/<org>/collections/` subtree is a read-only computed view. Writes go through `/orgs/<org>/arrangements/`.
+- **Collections subtree visibility (auth-filtered):**
+  - `owner` / `archivist` / `conductor` see every voice + the full score for each `CollectionItem` — supports program assembly, printing, and the principal coverage workflow.
+  - `musician` sees only the files for voices where they have a `PartAssignment` on that `CollectionItem`. The full score is invisible.
+  - Guests (PartAssignment without Membership) get the musician's view scoped to their assigned voice(s).
+  - The same files are reachable under `/orgs/<org>/arrangements/...` with the same per-role filtering; the collections subtree is the "what's in this concert, in order" view, not a separate permission domain.
 - `/users/<user>/library/` is private to that user, not bound to any org.
 
 ### Display clients (deferred)
@@ -212,13 +220,33 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 
 For the first few iterations the operational target is "as fast and cheap as possible." Hard NFR numbers (latency budgets, availability targets, scale ceilings) are not pinned yet — they get pinned as use grows. The constraint on the design is that none of the choices above should foreclose future scaling, multi-tenancy, or hosted operation.
 
+### Deployment topologies
+
+Lied does not assume a particular self-hosting entity. The realistic shapes:
+
+1. **One org self-hosts for itself.** An orchestra's IT runs the container for its own members. Multi-org concepts are vestigial here — one org per instance.
+2. **A federation / umbrella body self-hosts for several related orgs.** Music schools with multiple ensembles, regional band associations, conservatories. Member orgs are colleagues; sharing catalog entries is a feature, not a leak.
+3. **Neutral hosting provider runs Lied as SaaS** — strict tenant isolation between unrelated orgs. **Future scenario; explicitly out of scope for phase 1.**
+4. **A single individual self-hosts for personal practice.** Mostly uses `/users/<user>/library/`.
+
+**The trust assumption phase 1 relies on:** every org in one instance trusts the other orgs in the same instance. This holds for topologies 1 (only one), 2 (allied), and 4 (only one). Topology 3 violates it and requires a tenant-isolation pass before being supported.
+
 ### Operational stance
-- **Target deployment:** single self-hosted instance, small numbers of orgs and users. Hosted multi-tenant operation is a future scenario the design must not preclude.
+- **Target deployment:** single self-hosted instance, small numbers of orgs and users — covering topologies 1, 2, and 4.
 - **Configurable limits.** Whenever a limit is imposed (max upload size, rate-limit window, per-org storage cap, conversion job timeout, etc.) it MUST be documented and configurable. Hardcoded limits are not acceptable.
 
 ### Security baseline
 - **Rate limiting** is built in from day 1, with per-route and per-identity buckets configurable per deployment.
-- **Audit logging** is shallow but present from day 1 — log who did what to which entity (auth events, CRUD on Arrangement/Voice/File/Collection, role changes, hard deletes). Depth grows as needs become specific.
+- **Audit logging** is shallow but present from day 1. The rule is **every write to any persistent entity is logged** — not an enumerated list. Concretely this covers:
+  - **Auth events:** login (success/fail), logout, password change, OIDC link, app-password create/use/revoke.
+  - **Authorization events:** Membership create/update/delete, role change, principal-flag change, instrument-assignment change.
+  - **Content writes:** create / update / soft-delete / hard-delete / undelete on Arrangement, Work, Voice, File, Collection, CollectionItem, PartAssignment (including `notified_at`/`acknowledged_at`), Tag, ArrangementTag, GlobalAnnotation, Instrument.
+  - **Admin events:** org create/delete, user create/delete, system-admin grants, slug renames, secret rotation events.
+  - **Reads are NOT logged** in phase 1 — too noisy, low signal. Reserved for phase 2 if compliance requires.
+
+  Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span).
+
+  Append-only by convention; the only mutation is an admin-only redact that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a phase-2 retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
 - **Secrets management:**
   - All secrets are read from environment variables. Every secret env var `X` also accepts `X_FILE` pointing at a path — the Docker secrets convention, which works with Docker Compose/Swarm secrets, Kubernetes secrets, and systemd `LoadCredential=`.
   - The config layer abstracts secret sources so each secret can declare `env:`, `file:`, or `cmd:` (shells out to a helper like `pass`, `op read`, `vault kv get`). Vault / Infisical / 1Password / Bitwarden plug in later without coupling the app to any of them.
@@ -347,9 +375,15 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ### Decisions
 - **Provenance** is flat metadata on `Arrangement` (publisher, arranger, purchase date, license notes, copy count). No separate publisher/license entity unless querying by publisher becomes a clear need.
 - **Editions/variants (UC-19, UC-20).** Each `Arrangement` is already a specific edition. Multiple editions of one work = multiple `Arrangement` rows sharing a `Work`. `Arrangement.status` (`active`, `archived`) lets an org retire an old edition without deleting it; multiple editions may be active simultaneously.
+- **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
 - **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints but never surfaced via WebDAV.
 - **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem.
 - **Conversion provenance.** `File.derived_from_file_id` (nullable FK) links a derived file to its source; a file with no `derived_from` is a source. `File.conversion_quality` (`clean`, `omr`, `manual`) surfaces UC-10's lossless-vs-approximate distinction. No separate `Conversion` table — the FK + quality enum is sufficient until we need failure history.
+- **Storage path is derived, not stored.** The MinIO object key for a `File` is computed deterministically from the entity tree:
+  - Voice file: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/<file-name>.<ext>`
+  - Full-score file: `orgs/<org-slug>/arrangements/<arr-slug>/score/<file-name>.<ext>`
+  - Extension is derived from `File.mime_type`.
+  Slug immutability (see WebDAV layout) keeps the path stable; the rare "rename slug" admin operation moves all affected MinIO objects to the new prefix in one operation. WebDAV writes resolve path segments to entity slugs and insert `File` rows; WebDAV reads recompute the path from the row. The same key is also browsable via MinIO's own web UI / `mc` CLI without going through Lied — a small ops bonus.
 - **Image subtype.** `File.mime_type` (text) records the actual subtype (`image/png`, `image/jpeg`, `image/tiff`, …). The `format` enum stays coarse and drives routing (e.g. `image` → display-only).
 - **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: every required voice has a `PartAssignment`; "rehearsed" coverage additionally requires `acknowledged_at`.
@@ -364,6 +398,22 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   - `Arrangement.difficulty_notes` (text, nullable) — prose caveats (e.g. "grade 5 except the cadenza"); expected to be rarely used.
   - Instrumentation filter joins through `Voice.instrument`; no new field.
 - **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
+- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument`, `Membership.instruments`, and `Membership.principal_instruments` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument ∈ principal_instruments`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. Admins can add instruments without a code change.
+- **Membership roles.** `Membership.role` is a Postgres enum with four values: `owner`, `archivist`, `conductor`, `musician`. Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need.
+
+Permission matrix:
+
+| Action | owner | archivist | conductor | musician |
+|---|---|---|---|---|
+| Manage members & roles | ✓ | | | |
+| Org settings | ✓ | | | |
+| Upload/edit arrangements & files | ✓ | ✓ | | |
+| Manage tags | ✓ | ✓ | | |
+| Build/edit collections | ✓ | ✓ | ✓ | |
+| Global annotations | ✓ | | ✓ | |
+| Part assignments | ✓ | ✓ | ✓ | |
+| Read assigned parts | ✓ | ✓ | ✓ | ✓ |
+| Personal annotations (own) | ✓ | ✓ | ✓ | ✓ |
 
 ### Entities
 
@@ -371,32 +421,50 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 The abstract musical work (e.g. "Beethoven: Symphony No. 5"). Lightweight, used for grouping and search. Not every arrangement requires one.
 Fields: title, `composer` (text, nullable).
 
+**Instrument**
+An instance-wide controlled vocabulary entry. Seeded on first migration with the standard repertoire of ~150 orchestral/band/chamber instruments; admins can add more without a code change.
+Fields: `key` (text, unique, machine-readable, stable — e.g. `trumpet_bb`), `display_name` (text, English default), `aliases` (text[], for search and import normalization), `family` (text — `brass`, `woodwind`, `strings`, `percussion`, `keyboard`, `voice`, `other`; drives UI grouping), `transposition` (text, nullable — e.g. `Bb`, `F`, `Eb`; null for non-transposing instruments), audit fields.
+No `deleted_at` in phase 1: instruments referenced by Voice/Membership can't be hard-deleted; archival is a phase-2 concern.
+
 **Arrangement**
 A specific arrangement for specific instrumentation — what an organization licenses and owns. Also the unit of edition/variant: multiple editions of one work are multiple `Arrangement` rows under the same `Work`.
-Fields: title, work (optional FK), instrumentation description, arranger, publisher, purchase date, license notes, copy count allowed, status (enum: `active`, `archived`), `duration_seconds` (int, nullable), `difficulty` (smallint 1–8, ABRSM, nullable), `difficulty_ratings` (jsonb, nullable), `difficulty_notes` (text, nullable), audit fields, `deleted_at`.
+Fields: organization FK, title, `slug` (text, immutable, unique per organization), work (optional FK), instrumentation description, arranger, publisher, purchase date, license notes, copy count allowed, status (enum: `active`, `archived`), `duration_seconds` (int, nullable), `difficulty` (smallint 1–8, ABRSM, nullable), `difficulty_ratings` (jsonb, nullable), `difficulty_notes` (text, nullable), audit fields, `deleted_at`.
 
 **Voice**
 An individual instrument part within an arrangement (e.g. Flute 1, Violin II, Trumpet in Bb).
-Fields: arrangement FK, name, instrument, audit fields, `deleted_at`.
+Fields: arrangement FK, name, `slug` (text, immutable, unique per arrangement), `instrument_id` FK to Instrument, audit fields, `deleted_at`.
 
 **File**
 An actual file representing a voice or full score, in a specific format.
-Fields: voice FK (nullable for full scores), arrangement FK, format (enum: `lilypond`, `musicxml`, `pdf`, `image`), mime_type, storage path (MinIO), `derived_from_file_id` (nullable FK to File), `conversion_quality` (enum: `clean`, `omr`, `manual`; null if not derived), audit fields, `deleted_at`.
+Fields: voice FK (nullable for full scores), arrangement FK, `name` (text, filename without extension), `format` (enum: `lilypond`, `musicxml`, `pdf`, `image`), `mime_type` (text), `derived_from_file_id` (nullable FK to File), `conversion_quality` (enum: `clean`, `omr`, `manual`; null if not derived), audit fields, `deleted_at`.
+Unique on `(arrangement_id, voice_id, name, format)`. The MinIO object key is **derived** from the entity tree (see Decisions on storage path), not stored — the WebDAV view and the REST view are guaranteed to agree.
 
 **Organization**
 An orchestra or ensemble.
+Fields: `name` (text), `slug` (text, immutable, unique globally), audit fields.
+No `deleted_at`: deleting an org is admin-gated hard delete because the cascade impact is large and undelete UX is messy.
 
 **User**
 A person using the system. No system-wide application role — authorization is per-org via `Membership.role`. Optional `is_system_admin` boolean for instance-level operations (org provisioning, user management).
+Fields: `slug` (text, immutable, unique globally), `username` (citext, unique) — login identifier; renameable, distinct from `slug` so the personal WebDAV path stays stable across renames. `email` (citext, unique, nullable) — used for password reset and notifications; nullable so admins can create users without one (shared kiosk accounts, youth orchestra members). `password_hash` (text, nullable) — argon2id; nullable because OIDC users have no local password. `display_name` (text). `is_system_admin` (bool, default false). Audit fields.
+No `deleted_at` initially — user deletion is admin-gated hard delete with explicit reassignment-or-anonymization of PartAssignments, GlobalAnnotations, and audit log entries. Phase 2 concern.
+
+**AppPassword**
+A revocable, WebDAV-scoped credential issued per device (the per-user app passwords from the Auth section).
+Fields: user FK, `name` (text, user-visible label like "iPad in rehearsal room"), `hash` (text; argon2id of the random token — plaintext is never stored), `prefix` (text, 8 chars; first chars of the token in plaintext, used for log/UI identification without exposing the secret — the GitHub-PAT pattern), `created_at`, `last_used_at` (timestamptz, nullable; updated on each successful auth), `revoked_at` (timestamptz, nullable; null = active, non-null = revoked and never authenticates).
+Unique on `(user, name)`. No `expires_at` in phase 1; nullable expiry column can be added later without a backfill (null = never expires).
+
+Token format: `lied_<base64url(32 random bytes)>`. On creation the plaintext is shown to the user once and discarded server-side. WebDAV `Authorization: Basic base64(username:token)` resolves by looking up the user's non-revoked AppPasswords and `argon2_verify`-ing each.
 
 **Membership**
 A user's membership in an organization.
-Fields: user FK, organization FK, role, instruments (array), `is_principal` (bool), `principal_instruments` (array, subset of the instruments this member leads — array because principals may cover doublings, e.g. trumpet + flugelhorn).
-Coverage check (UC-13): for an arrangement in a collection, every `Voice` whose `instrument ∈ principal_instruments` must have a `PartAssignment`.
+Fields: user FK, organization FK, `role` (enum: `owner`, `archivist`, `conductor`, `musician` — see Decisions for the permission matrix), `instrument_ids` (int[] FK to Instrument), `is_principal` (bool, orthogonal to role), `principal_instrument_ids` (int[] FK to Instrument, subset of `instrument_ids` — array because principals may cover doublings, e.g. trumpet + flugelhorn).
+Coverage check (UC-13): for an arrangement in a collection, every `Voice` whose `instrument_id ∈ principal_instrument_ids` must have a `PartAssignment`.
+Invariant: every org has at least one Membership with `role = owner`; demoting the last owner is rejected.
 
 **Collection**
 A named, indexed set of arrangements belonging to an organization.
-Fields: organization FK, name, type (enum: `program`, `standing`), audit fields, `deleted_at`.
+Fields: organization FK, name, `slug` (text, immutable, unique per organization), type (enum: `program`, `standing`), audit fields, `deleted_at`.
 All collections are indexed by piece number local to the collection. `program` collections have a fixed sequence; `standing` collections are drawn from by number during performance.
 
 **CollectionItem**
@@ -424,18 +492,23 @@ Fields: arrangement FK, tag FK.
 ### Structure
 
 ```
+Instrument (instance-wide controlled vocabulary; seeded ~150 entries)
+
 Work (optional, composer)
   └── Arrangement (status, duration, difficulty 1-8 ABRSM, difficulty_ratings, provenance)
         ├── File(s) [full score]
         ├── ArrangementTag → Tag
-        └── Voice
+        └── Voice (instrument → Instrument)
               └── File (format, mime_type, derived_from?, conversion_quality?)
                     └── [personal annotation files in MinIO, by naming convention]
 
 GlobalAnnotation → Arrangement
 
+User
+  └── AppPassword (revocable WebDAV credential)
+
 Organization
-  ├── Membership → User (role, instruments)
+  ├── Membership → User (role, instruments[] → Instrument)
   ├── Tag (name, kind)
   └── Collection (program | standing, indexed by piece number)
         └── CollectionItem (index number) → Arrangement
