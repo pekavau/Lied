@@ -155,7 +155,7 @@ Canonical directory tree (also the public contract for external tools mounting t
     library/                                ← personal/private files (solo practice)
 ```
 
-- All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. Renaming the slug is a separate, explicit operation that breaks any cached WebDAV mount and is reserved for fixing typos.
+- All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. Renaming a slug is a separate, explicit REST operation (admin-gated: requires `Membership.role = owner` for org-scoped entities, or `is_system_admin` for User and Instrument), audited, and reserved for fixing typos. It performs an atomic move of all affected MinIO objects to the new prefix and updates the entity's `slug` field in one transaction; cached WebDAV mounts pointing at the old slug will break.
 - Soft-deleted rows (`deleted_at != NULL`) are hidden from WebDAV listings.
 - The `/orgs/<org>/collections/` subtree is a read-only computed view. Writes go through `/orgs/<org>/arrangements/`.
 - **Collections subtree visibility (auth-filtered):**
@@ -268,7 +268,7 @@ Anything that stands in for "external system that could be swapped" (session sto
   - **Admin events:** org create/delete, user create/delete, system-admin grants, slug renames, secret rotation events.
   - **Reads are NOT logged** in phase 1 — too noisy, low signal. Reserved for phase 2 if compliance requires.
 
-  Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span).
+  Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span). For writes to instance-wide entities (`Work`, `Instrument`), `org_id` is `NULL` regardless of which org the actor was operating from — instance-wide events are not attributed to an org.
 
   Append-only by convention; the only mutation is an admin-only redact that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a phase-2 retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
 - **Secrets management:**
@@ -424,8 +424,9 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 - **Provenance** is flat metadata on `Arrangement` (publisher, arranger, purchase date, license notes, copy count). No separate publisher/license entity unless querying by publisher becomes a clear need.
 - **Editions/variants (UC-19, UC-20).** Each `Arrangement` is already a specific edition. Multiple editions of one work = multiple `Arrangement` rows sharing a `Work`. `Arrangement.status` (`active`, `archived`) lets an org retire an old edition without deleting it; multiple editions may be active simultaneously.
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
+  **Permissions:** *creating* a Work is open to any authenticated user with at least one Membership in any org (an archivist adding a new piece's abstract entry); *editing* a Work is restricted to its original creator (`created_by`) or any `is_system_admin`. This stops "alice fixes a typo and rewrites a shared title for everyone"; for legitimate edits in someone else's Work, escalate to a system admin.
 - **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
-- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. Admins can add instruments without a code change.
+- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
 
 #### Lifecycle, existence, audit
 - **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints but never surfaced via WebDAV.
@@ -468,10 +469,13 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   Slug immutability (see WebDAV layout) keeps the path stable; the rare "rename slug" admin operation moves all affected MinIO objects to the new prefix in one operation. WebDAV writes resolve path segments to entity slugs and insert `File` rows; WebDAV reads recompute the path from the row. The same key is also browsable via MinIO's own web UI / `mc` CLI without going through Lied — a small ops bonus.
   **Personal annotations are out of scope of this rule** — they are files-by-convention with no `File` row backing them. Their path (`…/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf`) is governed by the personal-annotations naming convention below, not the derived-path rule.
 - **Image subtype.** `File.mime_type` (text) records the actual subtype (`image/png`, `image/jpeg`, `image/tiff`, …). The `format` enum stays coarse and drives routing (e.g. `image` → display-only).
+- **`format` ↔ `mime_type` relationship.** `format` is the coarse routing key (drives conversion eligibility, display logic); `mime_type` is the precise IANA type. `format` is derived from `mime_type` at insert/update time via a lookup table, then stored alongside for fast filtered queries. The invariant: `format` MUST agree with `mime_type` (e.g. `mime_type = image/png` ⇒ `format = image`); rows where they disagree are a bug. The lookup table is implementation detail (e.g. `application/x-lilypond` → `lilypond`, `application/vnd.recordare.musicxml` → `musicxml`, `image/*` → `image`, etc.); the extension used in MinIO paths derives from the same table.
 
 #### Annotations & distribution state
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: every required voice has a `PartAssignment`; "rehearsed" coverage additionally requires `acknowledged_at`.
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
+  **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
+  **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
 - **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director.
 
 #### Search & metadata
@@ -540,7 +544,11 @@ A revocable, WebDAV-scoped credential issued per device (the per-user app passwo
 Fields: user FK, `name` (text, user-visible label like "iPad in rehearsal room"), `hash` (text; argon2id of the random token — plaintext is never stored), `prefix` (text, 8 chars; first chars of the token in plaintext, used for log/UI identification without exposing the secret — the GitHub-PAT pattern), `created_at`, `last_used_at` (timestamptz, nullable; updated on each successful auth), `revoked_at` (timestamptz, nullable; null = active, non-null = revoked and never authenticates).
 Unique on `(user, name)`. No `expires_at` in phase 1; nullable expiry column can be added later without a backfill (null = never expires).
 
-Token format: `lied_<base64url(32 random bytes)>`. On creation the plaintext is shown to the user once and discarded server-side. WebDAV `Authorization: Basic base64(username:token)` resolves by looking up the user's non-revoked AppPasswords and `argon2_verify`-ing each.
+Token format: `lied_<base64url(32 random bytes)>`. On creation the plaintext is shown to the user once and discarded server-side. WebDAV `Authorization: Basic base64(username:token)` resolves by:
+1. Extracting the `prefix` (first 8 chars of the token) and looking up `WHERE user_id = ? AND prefix = ? AND revoked_at IS NULL` — typically returns a single candidate.
+2. `argon2_verify(token, candidate.hash)` on the (rare collision aside) one row.
+
+This keeps WebDAV auth fast despite argon2's intentional slowness — without the prefix lookup, every chatty WebDAV request would `argon2_verify` against every active app password the user has.
 
 **Membership**
 A user's membership in an organization.
@@ -614,7 +622,7 @@ Smallest version that closes the **archivist → musician loop** end-to-end: an 
 - Local accounts only (argon2id); session cookies + bearer tokens for REST; app passwords for WebDAV.
 - Rate limiting, shallow audit log, env / `_FILE` / `cmd:` secrets layer.
 
-**Entities** — full data model from the spec: Org, User, Membership, Work, Arrangement, Voice, File, Collection, CollectionItem, PartAssignment, Tag, ArrangementTag, GlobalAnnotation. Even entities whose flows are deferred get their tables so the schema is stable.
+**Entities** — full data model from the spec: Organization, User, AppPassword, Membership, Work, Instrument, Arrangement, Voice, File, Collection, CollectionItem, PartAssignment, Tag, ArrangementTag, GlobalAnnotation. Even entities whose flows are deferred get their tables so the schema is stable.
 
 **File handling**
 - Upload/download via REST.
@@ -622,11 +630,11 @@ Smallest version that closes the **archivist → musician loop** end-to-end: an 
 - All four formats (lilypond/musicxml/pdf/image) accepted; `format` and `mime_type` recorded but no pipeline runs on them.
 
 **WebDAV**
-- `/orgs/<org>/arrangements/...` — read-write for archivists, read for assigned musicians.
-- `/orgs/<org>/collections/...` — read-only computed view.
-- `/users/<user>/library/` — private personal area.
+- `/orgs/<org-slug>/arrangements/...` — read-write for archivists, read for assigned musicians.
+- `/orgs/<org-slug>/collections/...` — read-only computed view.
+- `/users/<user-slug>/library/` — private personal area.
 
-**Search** — basic listing + ILIKE filter on title/composer. No FTS, no `pg_trgm`, no tag-based search yet.
+**Search** — basic listing + ILIKE filter on `Arrangement.title` and `Work.composer` (via the optional Work join). No FTS, no `pg_trgm`, no tag-based search yet.
 
 **Annotations** — personal annotations work by file convention via WebDAV (musicians drop PDFs in `…/annotations/<user-slug>/`). No staleness indicator. No global annotations flow.
 
