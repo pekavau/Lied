@@ -121,7 +121,7 @@ Lied app (Rust + axum)         ← serves both interfaces
 
 **Authentication:**
 - Local accounts (username/password, argon2id hashing) are the baseline — required for self-hostable deployments without external dependencies.
-- OIDC is an optional, configurable second auth method for orgs that want SSO.
+- OIDC is an optional, configurable second auth method for orgs that want SSO. When OIDC is configured, **local login stays available as a fallback by default** — the break-glass path if the IdP is misconfigured or down. Account linking is by matching verified `email`. A per-org "disable local auth" (SSO-only) policy is a phase-2 toggle; phase 1 keeps both paths to avoid lockout on self-hosted instances.
 - WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
 - REST API uses session cookies (web client) or bearer tokens (programmatic).
 
@@ -138,6 +138,16 @@ These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fr
 - **Optimistic concurrency.** Mutating requests use **ETags derived from `updated_at`** (millisecond epoch). GET returns `ETag: "<ms>"`; `PATCH`/`PUT`/`DELETE` MUST send `If-Match`; a stale value → **`412 Precondition Failed`**. Applies to every entity carrying `updated_at` (Arrangement, Voice, File metadata, Collection, CollectionItem, GlobalAnnotation). HTMX forms carry the ETag in a hidden field. A dedicated `version` column was rejected as redundant — `updated_at` already exists everywhere and ms precision catches concurrent edits.
 - **Error response shape.** All `/v1` errors use **RFC 7807 Problem Details** (`application/problem+json`): `{ "type", "title", "status", "detail", "instance" }`, where `type` is a stable URI (e.g. `https://lied/errors/precondition-failed`) and `instance` carries the request-ID for log correlation. The single top-level `AppError` (see Error handling) emits this. HTMX error responses are HTML fragments, not Problem Details.
 - **CSRF.** Cookie-authenticated state-changing requests (the HTMX admin tree) require a **double-submit token**: a session-bound token in a cookie, copied into an `HX-CSRF` header by a global `htmx:configRequest` handler and validated by middleware. `SameSite=Lax` on the session cookie is a backstop, not the primary defense. Bearer-token `/v1` REST is exempt (not cookie-auth, so not CSRF-able).
+- **API versioning.** JSON REST is served under a **`/v1` prefix from day 1**. The HTMX admin tree (`/admin`) is unversioned — it's server-rendered, ships with the binary, and has no external contract to break. `/v1` is the clean seam for the future federation/SaaS API.
+- **Route-tree boundary.** Four sibling trees share one composed middleware stack (request-ID, rate-limit, auth), each applied with the right extractor — no content-type sniffing:
+  - `/admin/...` → HTML fragments (HTMX; session cookie + CSRF).
+  - `/v1/...` → JSON (session cookie *or* bearer token).
+  - `/orgs/...`, `/users/.../library/...` → WebDAV (app-password auth).
+  - `/healthz`, `/readyz`, `/metrics` → infra, unauthenticated (see below).
+- **Health, readiness, metrics** (infra tree, outside `/v1`):
+  - `/healthz` — liveness; returns 200 whenever the process is up. Drives container-restart decisions.
+  - `/readyz` — readiness; checks Postgres (`SELECT 1`) and MinIO (`HeadBucket`) reachable, 503 if either is down. Drives traffic gating without triggering restarts, so a transient DB blip sheds load instead of cycling the container.
+  - `/metrics` — Prometheus format via `metrics` facade + `metrics-exporter-prometheus` (facade kept swappable for OTLP later; not coupled to axum internals). RED baseline (request rate, error rate, per-route duration histograms) plus upload/download byte counters. **Gated behind `LIED_METRICS_ENABLED` (default off)** since the endpoint is unauthenticated — an operator opts in rather than leaking operational detail from a fresh self-host.
 
 ### WebDAV layout
 
@@ -250,6 +260,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 - **Phase 1 backup posture (minimum bar).** The README documents:
   - **Postgres:** `pg_dump --format=custom` to a host-mounted volume on a cron schedule; `pg_restore --clean` for recovery.
   - **MinIO:** `mc mirror` to a second MinIO instance or host directory on the same schedule; reverse mirror for recovery.
+  - **Ordering:** dump **Postgres first, then MinIO**; restore in the same order. The DB is the authority for existence, so the safe failure mode is a DB reference to a not-yet-mirrored file (a detectable 404) rather than a MinIO object with no DB row (dead bytes, non-corrupting). This is best-effort, not a consistent snapshot — acceptable at this posture; true snapshot coordination is a phase-2 runbook item.
   - **Required volume mounts** in `docker-compose.yml`: Postgres data dir, MinIO data dir, backup target dir, all host-mounted.
   - **Back up:** those three volumes plus the `.env` / secrets files.
   - **OK to lose on restore:** in-memory rate-limit state (acceptable), session cookies (users re-login).
@@ -265,11 +276,20 @@ Anything that stands in for "external system that could be swapped" (session sto
 | Max non-upload request body | `LIED_MAX_REQUEST_BYTES` | 256 KB | JSON / form bodies; prevents bomb attacks |
 | Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached |
 | Max arrangements per org | `LIED_MAX_ARRANGEMENTS_PER_ORG` | unset (no limit) | Reserved for SaaS-mode quotas later |
+| Max list page size | `LIED_MAX_PAGE_SIZE` | 200 (default 50) | Offset/limit pagination ceiling (see HTTP & REST API conventions) |
+| Rate limit, authenticated | `LIED_RATELIMIT_AUTH_PER_MIN` | 120 req/min | HTMX UIs fire several requests per interaction |
+| Rate limit, unauthenticated | `LIED_RATELIMIT_ANON_PER_MIN` | 20 req/min | Per source IP |
+| Rate limit, login/password | `LIED_RATELIMIT_LOGIN_PER_MIN` | 10 req/min | Per IP; brute-force defense |
+| Metrics endpoint | `LIED_METRICS_ENABLED` | off | Unauthenticated `/metrics`; operator opts in |
 
 **Uploads stream end-to-end.** axum's `extract::Multipart` reads the body as a stream; chunks flow straight to MinIO via the S3 `UploadPart` API. Server memory per upload is fixed at the chunk buffer size (a few MB), not file size. The same applies to downloads: aws-sdk-s3's `GetObject` returns a `ByteStream` piped directly into the axum response body, with HTTP `Range` requests honored so tablets can seek inside large PDFs.
 
 ### Security baseline
-- **Rate limiting** is built in from day 1, with per-route and per-identity buckets configurable per deployment.
+- **Rate limiting** is built in from day 1, with per-route and per-identity buckets configurable per deployment. Defaults (all env-overridable):
+  - Authenticated identity: **120 req/min** (`LIED_RATELIMIT_AUTH_PER_MIN`) — HTMX UIs fire several requests per interaction, so the floor is generous.
+  - Unauthenticated IP: **20 req/min** (`LIED_RATELIMIT_ANON_PER_MIN`).
+  - Login / password endpoints: **10 req/min per IP** (`LIED_RATELIMIT_LOGIN_PER_MIN`) — stricter; this is the brute-force surface.
+  - WebDAV is exempt from the per-request limiter (chatty PROPFIND/LOCK traffic) but subject to a generous per-identity ceiling.
 - **Audit logging** is shallow but present from day 1. The rule is **every write to any persistent entity is logged** — not an enumerated list. Concretely this covers:
   - **Auth events:** login (success/fail), logout, password change, OIDC link, app-password create/use/revoke.
   - **Authorization events:** Membership create/update/delete, role change, principal-flag change, instrument-assignment change.
@@ -278,6 +298,8 @@ Anything that stands in for "external system that could be swapped" (session sto
   - **Reads are NOT logged** in phase 1 — too noisy, low signal. Reserved for phase 2 if compliance requires.
 
   Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span). For writes to instance-wide entities (`Work`, `Instrument`), `org_id` is `NULL` regardless of which org the actor was operating from — instance-wide events are not attributed to an org.
+
+  **Redaction policy.** Before any `payload` is written, a single redaction pass in the `audit()` helper replaces a static deny-list of field names with the sentinel `"[redacted]"` (key retained so the diff still shows the field changed): `User.password_hash`, `AppPassword.hash`, `AppPassword` plaintext token, JWT/session signing keys, OIDC client secret, and any value sourced via the `cmd:` / `file:` secret resolvers. This is the second line of defense — secret reads already route through the config layer, which redacts at that boundary (see Secrets management). A deny-list (not allow-list) is used because payloads are arbitrary jsonb; the config-layer redaction backstops anything a new secret field misses.
 
   Append-only by convention; the only mutation is an admin-only redact that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a phase-2 retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
 - **Secrets management:**
