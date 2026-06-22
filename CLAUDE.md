@@ -660,6 +660,40 @@ Organization
 
 ---
 
+## Out of scope (product boundary)
+
+This is the product's outer boundary — distinct from the phase-2 *deferral* list below (those features are planned and the data model already accommodates them). The items here are things Lied deliberately does **not** try to be, possibly ever. Each has a mature tool that does it better; Lied integrates via open formats rather than competing.
+
+**Notation & content creation**
+- **Notation editing / engraving** — entering or editing the notes themselves. Use MuseScore, Frescobaldi (LilyPond), Sibelius, Finale, Dorico; Lied stores and serves their output.
+- **Score authoring loop** — even the deferred conversion pipeline is format transformation, not interactive editing.
+- **Arranging / orchestration / transcription tools** — generating new arrangements algorithmically.
+
+**Audio & performance media**
+- **Audio playback, MIDI synthesis, or playback of scores.**
+- **Audio/video recordings as managed entities** — Lied is a sheet-music archive, not a media library, and has no first-class model for recordings. (A loose file may live in `/users/<user>/library/`, but it is not modeled.)
+- **Practice tooling** — metronome, tuner, slow-down/loop trainers, page-turn pedals. These belong in a display client, which is itself deferred indefinitely.
+- **Live performance sync** — networked page-turning across stands, conductor-driven page advance.
+
+**Rights, commerce, and provenance beyond notes**
+- **Rights/licensing beyond free-text fields** — Lied records `publisher`, `license notes`, `copy count allowed` as flat metadata for the archivist's reference. It does **not** enforce copy limits, track per-copy distribution for compliance, manage royalties, or model license terms structurally.
+- **Purchasing / e-commerce** — UC-4 ("discover → purchase → archive") is a workflow pipeline *into* the archive, not a storefront. Lied never handles money or executes a purchase.
+- **DRM / copy protection** on distributed files.
+
+**People, scheduling, and ensemble operations**
+- **Personnel & scheduling** — who sits in which seat, attendance, rehearsal calendars, availability. Only *voice/part distribution within a section* is in scope, not seating or rostering.
+- **Payroll, dues, membership billing, communications/CRM.**
+- **Concert/event management** — ticketing, venue booking, printed-handout programs. A Lied `Collection` is the *musical* program (pieces + parts), not the event.
+
+**Infrastructure Lied relies on but does not provide**
+- **A bundled display/reader app** — deferred indefinitely; musicians use forScore, MobileSheets, Xodo, or an OS file manager against WebDAV.
+- **Identity provider** — Lied is an OIDC *client* (phase 2), never an IdP for other systems.
+- **General cloud file sync** (Dropbox/Drive-style) — the WebDAV surface is scoped to the music tree, not arbitrary file storage. `/users/<user>/library/` is a convenience, not a sync product.
+- **Email/SMS delivery infrastructure** — the deferred notification flow hands off to an external SMTP/provider; Lied runs no mail server.
+
+**Tenancy posture** (cross-references NFR)
+- **Strict multi-tenant SaaS isolation (topology 3)** — explicitly out for phase 1; requires a tenant-isolation pass. Phase 1 assumes every org in an instance trusts the others.
+
 ## Phase 1 cut
 
 Smallest version that closes the **archivist → musician loop** end-to-end: an archivist uploads a piece, builds a concert program, assigns parts; each musician opens their part on an iPad via WebDAV. Later phases plug in cleanly because the data model already accommodates them.
