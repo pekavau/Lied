@@ -214,6 +214,8 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 - **`tracing`** + **`tracing-subscriber`** — structured logging.
 - **`figment`** — layered config (file + env + the `_FILE` / `cmd:` secret-source pattern from the NFR section).
 - **`utoipa`** — derives OpenAPI from the axum routes; the API spec doesn't drift from the code.
+- **`uuid`** (`v7` + `serde` features) — UUIDv7 primary keys (see Implementation conventions).
+- **`garde`** — derive-based input validation; failures map to a 400 Problem Details (see Implementation conventions).
 - **`thiserror`** for typed domain errors; **`anyhow`** in the binary entrypoint.
 
 ### Admin UI
@@ -366,6 +368,17 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ### Type safety / strictness
 - `#![forbid(unsafe_code)]` at the crate root.
 - `unwrap()` / `expect()` in production paths trigger clippy warnings (so they fail CI). Tests may use them freely.
+
+### Implementation conventions
+
+Structural choices locked before coding so issues don't bake in conflicting decisions.
+
+- **Primary keys: `uuid` v7.** All entity PKs are UUIDv7 (time-ordered → good B-tree insert locality and rough creation ordering for free). Generated app-side via the `uuid` crate. No `bigserial`.
+- **REST resource identifier: UUID in `/v1` paths.** Endpoints address entities by UUID (`/v1/arrangements/{uuid}`), never by slug. Slugs are *scoped* (per-org / per-arrangement) and *renameable* (admin slug-rename op), so they're unsuitable as stable REST URLs; they remain the human-readable keys in the WebDAV tree only. A future slug lookup, if needed, is a `?slug=` resolver, not the canonical path.
+- **JSON field casing: `camelCase`.** Wire JSON uses `camelCase`; Rust structs stay `snake_case` with `#[serde(rename_all = "camelCase")]` applied consistently. The `utoipa` schema reflects the same casing so the OpenAPI contract matches the wire.
+- **Crate layout: workspace with a `lib` target.** The app is a workspace whose core is a library crate (`lied`) with a thin binary (`lied-server`) on top. Integration tests under `tests/` link the lib and may exercise internals directly, not only black-box HTTP — this is what the fixture builders (Testing posture) depend on.
+- **Enums: `text` + `CHECK`, not Postgres native enum types.** All status/type/kind columns (`Membership.role`, `Arrangement.status`, `Collection.type`, `File.format`, `File.conversion_quality`, …) are stored as `text` with a `CHECK (col IN (...))` constraint, mapped to Rust enums via sqlx. Native PG enum types were rejected: `ALTER TYPE ... ADD VALUE` is awkward (can't run in a transaction, can't remove values), and adding a variant should be a plain migration. `Tag.kind` stays free-text by design (no CHECK).
+- **Validation: `garde` derive.** Input DTOs validate via `garde`; a single `garde::Report` → `AppError` mapping at the extractor boundary turns failures into a `400` Problem Details carrying a field-error extension member (`errors: { field: [messages] }` — RFC 7807 permits extensions). Uniform across every endpoint.
 
 ### Error handling
 - **`thiserror`** for typed error enums in domain code (errors have shape).
@@ -536,7 +549,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
   - Instrumentation filter joins through `Voice.instrument_id`; no new field.
 
 #### Authorization
-- **Membership roles.** `Membership.role` is a Postgres enum with four values: `owner`, `archivist`, `conductor`, `musician`. Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need. See the Permission matrix subsection below for the per-role capability breakdown.
+- **Membership roles.** `Membership.role` has four values: `owner`, `archivist`, `conductor`, `musician` (stored as `text` + `CHECK` per the enum convention in Implementation conventions). Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need. See the Permission matrix subsection below for the per-role capability breakdown.
 
 ### Permission matrix
 
