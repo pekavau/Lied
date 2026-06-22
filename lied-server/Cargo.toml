@@ -1,0 +1,17 @@
+[package]
+name = "lied-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lied-server"
+path = "src/main.rs"
+
+[dependencies]
+lied = { path = "../lied" }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

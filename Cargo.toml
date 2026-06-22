@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = ["lied", "lied-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pekavau/Lied"
+
+[workspace.dependencies]
+# Web framework
+axum = { version = "0.7", features = ["multipart", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "timeout", "request-id"] }
+tower-sessions = "0.13"
+tower-sessions-sqlx-store = { version = "0.14", features = ["postgres"] }
+tower_governor = "0.4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "postgres",
+  "uuid",
+  "chrono",
+  "json",
+] }
+
+# Object storage (MinIO via S3 API)
+aws-sdk-s3 = "1"
+aws-config = "1"
+
+# WebDAV
+dav-server = "0.7"
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs & time
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+
+# Validation
+garde = { version = "0.20", features = ["derive"] }
+
+# Errors
+thiserror = { version = "2", features = ["std"] }
+anyhow = "1"
+
+# Logging / metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.1"
+utoipa-rapidoc = { version = "5", features = ["axum"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
