@@ -130,6 +130,15 @@ Lied app (Rust + axum)         ← serves both interfaces
 - No system-wide application roles. An optional `User.is_system_admin` boolean covers instance-level operations (org provisioning, user management).
 - A `PartAssignment` implicitly grants the assigned user **read access to that voice's files** for as long as the assignment exists, regardless of Membership in the org. This is how guests and substitutes access parts.
 
+### HTTP & REST API conventions
+
+These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fragments and is exempt where noted.
+
+- **Pagination.** List endpoints (arrangements, voices, files, members, audit log, …) use **offset/limit**: `GET /v1/arrangements?limit=50&offset=0`. Response is an envelope: `{ "items": [...], "total": N, "limit": L, "offset": O }`. Default `limit` = 50, max = 200 (configurable via `LIED_MAX_PAGE_SIZE`). Cursor pagination was rejected for phase 1: offset gives a cheap `total` for "page 3 of 7" UIs and the concurrent-insert inconsistency window is irrelevant at our scale. Switching to an optional cursor later is additive, not breaking.
+- **Optimistic concurrency.** Mutating requests use **ETags derived from `updated_at`** (millisecond epoch). GET returns `ETag: "<ms>"`; `PATCH`/`PUT`/`DELETE` MUST send `If-Match`; a stale value → **`412 Precondition Failed`**. Applies to every entity carrying `updated_at` (Arrangement, Voice, File metadata, Collection, CollectionItem, GlobalAnnotation). HTMX forms carry the ETag in a hidden field. A dedicated `version` column was rejected as redundant — `updated_at` already exists everywhere and ms precision catches concurrent edits.
+- **Error response shape.** All `/v1` errors use **RFC 7807 Problem Details** (`application/problem+json`): `{ "type", "title", "status", "detail", "instance" }`, where `type` is a stable URI (e.g. `https://lied/errors/precondition-failed`) and `instance` carries the request-ID for log correlation. The single top-level `AppError` (see Error handling) emits this. HTMX error responses are HTML fragments, not Problem Details.
+- **CSRF.** Cookie-authenticated state-changing requests (the HTMX admin tree) require a **double-submit token**: a session-bound token in a cookie, copied into an `HX-CSRF` header by a global `htmx:configRequest` handler and validated by middleware. `SameSite=Lax` on the session cookie is a backstop, not the primary defense. Bearer-token `/v1` REST is exempt (not cookie-auth, so not CSRF-able).
+
 ### WebDAV layout
 
 Canonical directory tree (also the public contract for external tools mounting the volume):
@@ -187,7 +196,7 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 - **`aws-sdk-s3`** — official AWS SDK; speaks MinIO natively.
 - **`argon2`** — password hashing for local accounts.
 - **`tower-sessions`** — session cookies for the web client. Backend: **Postgres-backed store** (`tower-sessions-sqlx-store`); the `sessions` table is added via our `/migrations` directory. Chosen over in-memory because the NFR section says scaling must not be precluded; chosen over Redis to avoid a second service. Each authenticated request reads one row — negligible at our scale; if it ever becomes hot, swap to a Redis-backed store (see Infrastructure pluggability rule in NFR posture).
-- **`jsonwebtoken`** — bearer tokens for programmatic REST clients. **Algorithm: HS256** (symmetric); Lied is the only issuer and verifier, so asymmetric is wasted complexity. The signing secret is 32 random bytes managed via the secrets layer with the hot-rotation flow already specced (new key written, old key honored for a grace window). Token lifetime: **30 days, configurable.** Claims: `sub` (user id), `org` (active org id, nullable for system-admin operations), `iat`, `exp`, `jti` (id for future revocation listing). If federation ever needs external verification, switching to ES256 is a contained migration (accept both during cutover, retire HS256).
+- **`jsonwebtoken`** — bearer tokens for programmatic REST clients. **Algorithm: HS256** (symmetric); Lied is the only issuer and verifier, so asymmetric is wasted complexity. The signing secret is 32 random bytes managed via the secrets layer with the hot-rotation flow already specced (new key written, old key honored for a grace window). Every token carries a **`kid` header** naming the signing key; during the rotation grace window both keys live in the verifier's keyring and the verifier selects by `kid` rather than trial-verifying against each (which would be wasteful and ambiguous in logs). New tokens are signed with the newest key. Token lifetime: **30 days, configurable.** Claims: `sub` (user id), `org` (active org id, nullable for system-admin operations), `iat`, `exp`, `jti` (id for future revocation listing). If federation ever needs external verification, switching to ES256 is a contained migration (accept both during cutover, retire HS256).
 - **`tower-governor`** — rate limiting as axum/tower middleware.
 - **`tracing`** + **`tracing-subscriber`** — structured logging.
 - **`figment`** — layered config (file + env + the `_FILE` / `cmd:` secret-source pattern from the NFR section).
@@ -325,7 +334,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ### Error handling
 - **`thiserror`** for typed error enums in domain code (errors have shape).
 - **`anyhow`** in the binary entrypoint and one-off scripts.
-- One top-level `AppError` implements `axum::response::IntoResponse` so errors become HTTP responses consistently.
+- One top-level `AppError` implements `axum::response::IntoResponse` so errors become HTTP responses consistently. For the `/v1` JSON tree it serializes as RFC 7807 Problem Details (`application/problem+json`); see HTTP & REST API conventions.
 
 ### Logging
 - `tracing` everywhere; never `println!` / `eprintln!` in production code.
@@ -461,6 +470,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 
 #### Files & storage
 - **Conversion provenance.** `File.derived_from_file_id` (nullable FK) links a derived file to its source; a file with no `derived_from` is a source. `File.conversion_quality` (`clean`, `omr`, `manual`) surfaces UC-10's lossless-vs-approximate distinction. No separate `Conversion` table — the FK + quality enum is sufficient until we need failure history.
+- **Atomic file replacement.** Replacing a file (REST or WebDAV `PUT` over an existing path) is **never an in-place mutation**: it inserts a new `File` row and soft-deletes the old one in a single transaction. This preserves the `derived_from_file_id` chain and audit history. The derived MinIO object key is identical, so MinIO versioning captures the content history while the DB row swap captures identity. In-place update was rejected because it would destroy provenance and contradict the "files are immutable representations" model.
 - **Multiple full-score files per arrangement.** Permitted: an Arrangement can have several files with `voice_id IS NULL` (e.g. LilyPond source + publisher PDF + annotated conductor copy), disambiguated by `(name, format)`. No `primary_score` flag in phase 1 — consumers pick by convention: source-format preferred (LilyPond → MusicXML → PDF), earliest `created_at` to break ties; UI offers the full list when there's choice. Adding `Arrangement.primary_score_file_id` later is a non-breaking migration if the convention proves insufficient.
 - **Storage path is derived, not stored.** The MinIO object key for a `File` is computed deterministically from the entity tree:
   - Voice file: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/<file-name>.<ext>`
@@ -533,6 +543,7 @@ Unique on `(arrangement_id, voice_id, name, format)`. The MinIO object key is **
 An orchestra or ensemble.
 Fields: `name` (text), `slug` (text, immutable, unique globally), audit fields.
 No `deleted_at`: deleting an org is admin-gated hard delete because the cascade impact is large and undelete UX is messy.
+**Cascade order** (FK-safe, one transaction): PartAssignments → CollectionItems → Collections → ArrangementTags → Tags → GlobalAnnotations → Files (and their MinIO objects) → Voices → Arrangements → Memberships → the Organization row. **Not cascaded:** `Work` rows (instance-wide, shared across orgs) and `audit_log` rows (retained with their `org_id` so the deletion itself stays forensically auditable after the org is gone).
 
 **User**
 A person using the system. No system-wide application role — authorization is per-org via `Membership.role`. Optional `is_system_admin` boolean for instance-level operations (org provisioning, user management).
