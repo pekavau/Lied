@@ -282,6 +282,16 @@ Anything that stands in for "external system that could be swapped" (session sto
 | Rate limit, login/password | `LIED_RATELIMIT_LOGIN_PER_MIN` | 10 req/min | Per IP; brute-force defense |
 | Metrics endpoint | `LIED_METRICS_ENABLED` | off | Unauthenticated `/metrics`; operator opts in |
 
+**Two tiers of configuration — classify by *who owns the value*, not by what's easiest to edit.**
+
+- **Operator config (env / `_FILE` / `cmd:` via figment; never in the DB or any UI).** Everything that protects the *deployment* — host, process, bandwidth, auth surface: all rate limits, max upload/request bytes, page-size ceiling, JWT lifetime, signing keys, all secrets, the metrics toggle. Owned by whoever runs the container (deploy/filesystem access), not by an org `owner` or even `is_system_admin`. Two reasons it must not move into the admin UI:
+  1. **Trust boundary.** In the federation/SaaS topology the org admin is exactly the party being rate-limited and size-capped — the limited party must not be able to raise its own ceiling.
+  2. **Mechanics.** These are wired into startup middleware (`tower-governor`, body-size layers); read-once-at-boot is trivial, live DB reload is plumbing for zero phase-1 benefit. They change rarely — a restart is acceptable.
+
+  The "every limit MUST be documented and configurable" rule above is satisfied by env config; *configurable* ≠ *editable by an org admin*.
+- **Org policy (DB row / `org_settings`, edited in the admin UI by `owner`).** Only genuine per-org *business policy* that is **not** a resource/abuse protection. In phase 1 this set is nearly empty; candidates as they arise: per-org storage quota (SaaS-mode, deferred), default difficulty scale, default tag vocabulary, display preferences. These live on the `Organization` row or a small settings table.
+- **Hybrid (deferred):** if an org ever needs to tune a Tier-1 limit, the env var sets the operator's **hard ceiling** and the org setting may only make it **stricter** — enforced value = `min(operator_cap, org_setting)`. An org admin can tighten its own limits, never loosen them. Phase 1 needs only the env vars; this pattern is noted so the boundary isn't violated later.
+
 **Uploads stream end-to-end.** axum's `extract::Multipart` reads the body as a stream; chunks flow straight to MinIO via the S3 `UploadPart` API. Server memory per upload is fixed at the chunk buffer size (a few MB), not file size. The same applies to downloads: aws-sdk-s3's `GetObject` returns a `ByteStream` piped directly into the axum response body, with HTTP `Range` requests honored so tablets can seek inside large PDFs.
 
 ### Security baseline
