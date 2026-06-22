@@ -148,6 +148,8 @@ These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fr
   - `/healthz` — liveness; returns 200 whenever the process is up. Drives container-restart decisions.
   - `/readyz` — readiness; checks Postgres (`SELECT 1`) and MinIO (`HeadBucket`) reachable, 503 if either is down. Drives traffic gating without triggering restarts, so a transient DB blip sheds load instead of cycling the container.
   - `/metrics` — Prometheus format via `metrics` facade + `metrics-exporter-prometheus` (facade kept swappable for OTLP later; not coupled to axum internals). RED baseline (request rate, error rate, per-route duration histograms) plus upload/download byte counters. **Gated behind `LIED_METRICS_ENABLED` (default off)** since the endpoint is unauthenticated — an operator opts in rather than leaking operational detail from a fresh self-host.
+- **Sort & filter.** List endpoints accept `?sort=<field>:<dir>` (e.g. `sort=created_at:desc`) and `?filter[<field>]=<value>` (e.g. `filter[status]=active`); multiple filters AND together. Each endpoint declares an **allowlist** of sortable/filterable fields with a default sort (arrangements default `title:asc`); an unknown field or direction → `400` Problem Details. The allowlist keeps this from becoming arbitrary-column SQL surface. The bracket syntax namespaces filters away from control params (`sort`, `limit`, `offset`, `q`) so they never collide. Phase-1 ILIKE search stays a separate `?q=` param.
+- **OpenAPI exposure.** `utoipa` serves the spec at **`/openapi.json` (always available)**; a rendered UI via `utoipa-rapidoc` is mounted at **`/docs`, gated behind `LIED_DOCS_ENABLED` (default on)**. Docs default on (unlike metrics) because the API spec isn't sensitive operational data and discoverability helps the programmatic-client/federation story; an operator who wants it dark flips one flag. RapiDoc over Swagger UI keeps the binary slim (one embedded asset).
 
 ### WebDAV layout
 
@@ -182,6 +184,7 @@ Canonical directory tree (also the public contract for external tools mounting t
   - `musician` sees only the files for voices where they have a `PartAssignment` on that `CollectionItem`. The full score is invisible.
   - Guests (PartAssignment without Membership) get the musician's view scoped to their assigned voice(s).
   - The same files are reachable under `/orgs/<org>/arrangements/...` with the same per-role filtering; the collections subtree is the "what's in this concert, in order" view, not a separate permission domain.
+- **PROPFIND scope at the arrangements root.** A `musician` (or guest/substitute) listing `/orgs/<org>/arrangements/` sees **only arrangements where they hold at least one `PartAssignment`** — unassigned arrangements are simply absent, not shown as empty/403 placeholders. Staff roles (`owner`/`archivist`/`conductor`) see all. Rationale: showing every title with locked subdirs would leak the org's full repertoire and naming to guests and clutter a mounted tablet view with hundreds of inaccessible folders; discoverability of "what the org owns" belongs in the admin UI, not the filesystem view. Consistent with the collections-subtree filtering above.
 - `/users/<user>/library/` is private to that user, not bound to any org.
 
 ### Display clients (deferred)
@@ -281,6 +284,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 | Rate limit, unauthenticated | `LIED_RATELIMIT_ANON_PER_MIN` | 20 req/min | Per source IP |
 | Rate limit, login/password | `LIED_RATELIMIT_LOGIN_PER_MIN` | 10 req/min | Per IP; brute-force defense |
 | Metrics endpoint | `LIED_METRICS_ENABLED` | off | Unauthenticated `/metrics`; operator opts in |
+| API docs UI | `LIED_DOCS_ENABLED` | on | RapiDoc UI at `/docs`; `/openapi.json` always served |
 
 **Two tiers of configuration — classify by *who owns the value*, not by what's easiest to edit.**
 
@@ -376,6 +380,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ### Testing posture
 - **Unit tests** colocated with code; fast, no DB.
 - **Integration tests** under `tests/`; use `testcontainers` for real Postgres + MinIO.
+- **Fixtures** are composable builder helpers (`seed_test_org() -> OrgCtx`, `seed_arrangement(&org)`, `seed_user_with_role(...)`) returning typed handles, layered over a fresh per-test container/schema — not raw per-test SQL. Builders go through the real repository functions so they stay correct as the schema evolves; raw SQL fixtures drift from the actual insert paths and rot.
 - New code without tests is a PR objection, not a hard CI gate (chasing coverage % produces bad tests).
 
 ### Branching & PR flow
@@ -597,6 +602,7 @@ This keeps WebDAV auth fast despite argon2's intentional slowness — without th
 A user's membership in an organization.
 Fields: user FK, organization FK, `role` (enum: `owner`, `archivist`, `conductor`, `musician` — see Decisions for the permission matrix), `instrument_ids` (int[] FK to Instrument), `is_principal` (bool, orthogonal to role), `principal_instrument_ids` (int[] FK to Instrument, subset of `instrument_ids` — array because principals may cover doublings, e.g. trumpet + flugelhorn).
 Coverage check (UC-13): for an arrangement in a collection, every `Voice` whose `instrument_id ∈ principal_instrument_ids` must have a `PartAssignment`.
+**FK integrity on the `int[]` columns:** Postgres can't enforce element-level FKs on an array, so `instrument_ids` / `principal_instrument_ids` are validated against the live `Instrument` set in the service layer on write. This is safe in phase 1 because `Instrument` has no soft-delete and rows are never hard-deleted while referenced — dangling IDs can only come from a bug, not normal flow. Flag for phase 2: if `Instrument` ever gains soft-delete, revisit (DB trigger, or normalize to a `membership_instruments` join table).
 Invariant: every org has at least one Membership with `role = owner`; demoting the last owner is rejected.
 
 **Collection**
