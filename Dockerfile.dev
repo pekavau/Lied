@@ -1,0 +1,16 @@
+# Dev-only image: cargo-watch driven hot reload against the bind-mounted
+# source tree. Not used for production (see Dockerfile for the distroless
+# release build).
+FROM rust:1.96.0-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-watch --locked
+
+WORKDIR /app
+
+EXPOSE 8080
+
+CMD ["cargo", "watch", "-x", "run --package lied-server"]
