@@ -1,0 +1,78 @@
+name: lied
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lied}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lied}
+      POSTGRES_DB: ${POSTGRES_DB:-lied}
+    ports:
+      - "5432:5432"
+    volumes:
+      # Host-mounted per the phase-1 backup posture (CLAUDE.md): `just backup`
+      # and disaster recovery operate directly on these directories.
+      - ./.data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lied}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # Host-mounted per the phase-1 backup posture (CLAUDE.md).
+      - ./.data/minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      LIED_BIND_ADDR: "0.0.0.0:8080"
+      LIED_DATABASE_URL: postgres://${POSTGRES_USER:-lied}:${POSTGRES_PASSWORD:-lied}@postgres:5432/${POSTGRES_DB:-lied}
+      LIED_S3_ENDPOINT: http://minio:9000
+      LIED_S3_BUCKET: ${LIED_S3_BUCKET:-lied}
+      LIED_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      LIED_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      LIED_JWT_SIGNING_KEY: ${LIED_JWT_SIGNING_KEY:-dev-only-insecure-signing-key-do-not-use-in-prod}
+      LIED_TRACING_PRETTY: "true"
+      LIED_METRICS_ENABLED: "${LIED_METRICS_ENABLED:-false}"
+      LIED_DOCS_ENABLED: "${LIED_DOCS_ENABLED:-true}"
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+      - cargo-target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
+
+volumes:
+  # Postgres data, MinIO data, and the backup target dir (./backup, used by
+  # `just backup`) are intentionally host-mounted bind paths above, not
+  # named volumes, per the phase-1 backup posture in CLAUDE.md — required
+  # so `pg_dump`/`mc mirror` and disaster-recovery tooling can reach them
+  # directly from the host. Only the cargo build caches below are named
+  # volumes, since they hold no data that needs backing up.
+  cargo-target:
+  cargo-registry:

@@ -1,0 +1,61 @@
+# cargo-deny policy for Lied.
+# Lied is published under MIT OR Apache-2.0 — see CLAUDE.md
+# "Lied's license and dependency policy" for the rationale.
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # Transitive-only, dev-dependency path: testcontainers (0.23) pulls an
+    # old rustls 0.21 chain via aws-sdk-* test images, and an unmaintained
+    # tokio-tar for extracting container image layers. None of these crates
+    # are reachable from the lied/lied-server production binary — they only
+    # run inside `cargo test`. Tracked for removal once testcontainers ships
+    # a release on a newer rustls/tar stack.
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints (testcontainers -> aws-config dev chain)
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints (same chain)
+    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing (same chain)
+    "RUSTSEC-2025-0111", # tokio-tar: PAX header file smuggling (testcontainers image extraction, dev-only)
+    "RUSTSEC-2024-0436", # paste: unmaintained (transitive, no upstream replacement forced yet)
+    "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained (transitive via testcontainers -> bollard, dev-only)
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+]
+# Explicitly excluded (not listed in `allow`, so they fail by default):
+# copyleft licenses (GPL, LGPL, AGPL) and any "non-commercial" / "evaluation"
+# terms — pulling them in would constrain Lied's own license.
+
+# Exception list: starts empty; any (crate, license) exception requires a
+# one-line justification comment here before being added.
+exceptions = [
+    # webpki-roots ships Mozilla's CA bundle under CDLA-Permissive-2.0, a
+    # permissive data license (not code) pulled in transitively via sqlx's
+    # tls-rustls feature; functionally equivalent to MIT/BSD-style terms for
+    # our purposes (redistribute/use freely, no copyleft obligation).
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
