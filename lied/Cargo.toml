@@ -16,6 +16,8 @@ tower-http = { workspace = true }
 tower-sessions = { workspace = true }
 tower-sessions-sqlx-store = { workspace = true }
 tower_governor = { workspace = true }
+governor = { workspace = true }
+async-trait = { workspace = true }
 
 tokio = { workspace = true }
 
@@ -28,6 +30,9 @@ dav-server = { workspace = true }
 
 argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
 
 figment = { workspace = true }
 
@@ -56,3 +61,5 @@ testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 insta = "1"
 reqwest = { version = "0.12", features = ["json"] }
+tower = { workspace = true, features = ["util"] }
+time = { version = "0.3", features = ["macros"] }

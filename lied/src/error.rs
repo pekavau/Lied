@@ -26,6 +26,15 @@ pub enum AppError {
 
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
+
+    #[error("authentication required")]
+    Unauthorized,
+
+    #[error("forbidden")]
+    Forbidden,
+
+    #[error("too many requests")]
+    TooManyRequests,
 }
 
 /// RFC 7807 Problem Details body.
@@ -49,6 +58,9 @@ impl AppError {
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -59,6 +71,9 @@ impl AppError {
             AppError::Validation(_) => "https://lied/errors/validation-failed",
             AppError::Database(_) => "https://lied/errors/internal",
             AppError::Internal(_) => "https://lied/errors/internal",
+            AppError::Unauthorized => "https://lied/errors/unauthorized",
+            AppError::Forbidden => "https://lied/errors/forbidden",
+            AppError::TooManyRequests => "https://lied/errors/too-many-requests",
         }
     }
 
@@ -69,6 +84,9 @@ impl AppError {
             AppError::Validation(_) => "Validation Failed",
             AppError::Database(_) => "Internal Server Error",
             AppError::Internal(_) => "Internal Server Error",
+            AppError::Unauthorized => "Unauthorized",
+            AppError::Forbidden => "Forbidden",
+            AppError::TooManyRequests => "Too Many Requests",
         }
     }
 }

@@ -16,6 +16,8 @@ tower-http = { version = "0.6", features = ["trace", "limit", "timeout", "reques
 tower-sessions = "0.13"
 tower-sessions-sqlx-store = { version = "0.14", features = ["postgres"] }
 tower_governor = "0.4"
+governor = "0.6"
+async-trait = "0.1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -40,6 +42,9 @@ dav-server = "0.7"
 # Auth
 argon2 = "0.5"
 jsonwebtoken = "9"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
 
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }

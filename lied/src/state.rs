@@ -12,6 +12,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 
+use crate::auth::jwt::Keyring;
 use crate::config::AppConfig;
 
 #[derive(Clone)]
@@ -26,6 +27,9 @@ pub struct AppState {
     /// in which case no recorder is installed (the facade discards) and the
     /// endpoint returns 404.
     pub metrics: Option<PrometheusHandle>,
+    /// HS256 bearer-token signing/verification keyring, seeded from
+    /// `config.jwt_signing_key` (see [`crate::auth::jwt::Keyring`]).
+    pub jwt_keyring: Arc<Keyring>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -93,11 +97,17 @@ impl AppState {
             None
         };
 
+        let jwt_keyring = Arc::new(Keyring::from_single_key(
+            config.jwt_signing_key.expose(),
+            config.jwt_lifetime_days,
+        ));
+
         Ok(Self {
             config: Arc::new(config),
             db,
             s3,
             metrics,
+            jwt_keyring,
         })
     }
 }
