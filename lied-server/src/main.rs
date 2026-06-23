@@ -1,9 +1,17 @@
 #![forbid(unsafe_code)]
 
+use std::net::SocketAddr;
+
 use anyhow::Context;
+
+mod cli;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(command) = cli::parse_args(std::env::args().skip(1)) {
+        return cli::run(command).await;
+    }
+
     let config = lied::config::AppConfig::load().context("failed to load configuration")?;
 
     lied::telemetry::init(&config);
@@ -26,7 +34,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%bind_addr, "listening");
 
-    axum::serve(listener, app).await.context("server error")?;
+    // `with_connect_info` (rather than the plain `into_make_service`) is
+    // required so the login rate-limiter's `PeerIpKeyExtractor` can read
+    // the client's peer IP out of `ConnectInfo` (see
+    // `lied::auth::ratelimit`).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("server error")?;
 
     Ok(())
 }

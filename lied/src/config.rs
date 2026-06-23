@@ -96,6 +96,20 @@ pub struct AppConfig {
     /// Pretty (human-readable) tracing output instead of JSON. Typically only
     /// set in development; production defaults to JSON.
     pub tracing_pretty: bool,
+
+    /// Whether the session cookie carries the `Secure` flag (HTTPS-only).
+    /// Defaults to `false` so a fresh self-host works out of the box: browsers
+    /// silently drop `Secure` cookies on non-TLS origins, so a `true` default
+    /// would break login on the LAN/`localhost`/plain-HTTP deployments that
+    /// self-hostability (a hard CLAUDE.md requirement, topologies 1 & 4)
+    /// explicitly targets — with no error, just a redirect loop back to login.
+    /// **Any deployment served over HTTPS MUST set `LIED_SECURE_COOKIES=true`**
+    /// (documented in `.env.example`); the safe-by-default choice would be
+    /// `true`, but a footgun that silently locks users out is worse than one
+    /// that requires an opt-in flag behind TLS. `HttpOnly` and `SameSite=Lax`
+    /// are not configurable — CLAUDE.md treats those as non-negotiable baseline
+    /// (CSRF backstop + XSS hardening); only `Secure` depends on TLS posture.
+    pub secure_cookies: bool,
 }
 
 /// Defaults mirroring the "Default limits" table in CLAUDE.md.
@@ -122,6 +136,7 @@ struct Defaults {
     metrics_enabled: bool,
     docs_enabled: bool,
     tracing_pretty: bool,
+    secure_cookies: bool,
 }
 
 impl Default for Defaults {
@@ -144,6 +159,10 @@ impl Default for Defaults {
             metrics_enabled: false,
             docs_enabled: true,
             tracing_pretty: false,
+            // Off by default so plain-HTTP self-hosts can log in; HTTPS
+            // deployments opt in via LIED_SECURE_COOKIES=true. See the field
+            // doc on `AppConfig::secure_cookies`.
+            secure_cookies: false,
         }
     }
 }
@@ -232,6 +251,7 @@ impl AppConfig {
             metrics_enabled: defaults.metrics_enabled,
             docs_enabled: defaults.docs_enabled,
             tracing_pretty: defaults.tracing_pretty,
+            secure_cookies: defaults.secure_cookies,
         })
     }
 }
@@ -335,6 +355,7 @@ impl fmt::Debug for AppConfig {
             .field("metrics_enabled", &self.metrics_enabled)
             .field("docs_enabled", &self.docs_enabled)
             .field("tracing_pretty", &self.tracing_pretty)
+            .field("secure_cookies", &self.secure_cookies)
             .finish()
     }
 }
@@ -367,6 +388,7 @@ mod tests {
             metrics_enabled: false,
             docs_enabled: true,
             tracing_pretty: false,
+            secure_cookies: true,
         };
 
         let debug_output = format!("{config:?}");
@@ -379,6 +401,15 @@ mod tests {
         // Non-secret fields remain visible.
         assert!(debug_output.contains("lied"));
         assert!(debug_output.contains("us-east-1"));
+    }
+
+    #[test]
+    fn secure_cookies_defaults_off_for_plain_http_self_hosts() {
+        // Regression (#5): a `true` default silently breaks login on the
+        // plain-HTTP self-host deployments self-hostability targets, because
+        // browsers drop `Secure` cookies on non-TLS origins. HTTPS operators
+        // opt in via LIED_SECURE_COOKIES=true.
+        assert!(!Defaults::default().secure_cookies);
     }
 
     #[test]
