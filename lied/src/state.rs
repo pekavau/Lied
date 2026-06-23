@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sqlx::postgres::{PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 
@@ -18,12 +19,21 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub db: PgPool,
     pub s3: S3Client,
+    /// Render handle for the globally-installed Prometheus recorder.
+    /// `Some` only when `LIED_METRICS_ENABLED` is set: installing the recorder
+    /// is what makes `metrics::counter!`/`histogram!` calls actually record,
+    /// and `/metrics` renders this handle. `None` when metrics are disabled,
+    /// in which case no recorder is installed (the facade discards) and the
+    /// endpoint returns 404.
+    pub metrics: Option<PrometheusHandle>,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum StateError {
     #[error("failed to connect to postgres: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("failed to install metrics recorder: {0}")]
+    Metrics(#[from] metrics_exporter_prometheus::BuildError),
 }
 
 impl AppState {
@@ -71,10 +81,23 @@ impl AppState {
                 .build(),
         );
 
+        // Install the global Prometheus recorder once, here at startup, only
+        // when metrics are enabled. `install_recorder` both registers the
+        // recorder globally (so metric macros anywhere record into it) and
+        // returns the handle `/metrics` renders on demand. When disabled we
+        // install nothing, so the `metrics` facade is a no-op with zero
+        // overhead and the endpoint stays dark.
+        let metrics = if config.metrics_enabled {
+            Some(PrometheusBuilder::new().install_recorder()?)
+        } else {
+            None
+        };
+
         Ok(Self {
             config: Arc::new(config),
             db,
             s3,
+            metrics,
         })
     }
 }

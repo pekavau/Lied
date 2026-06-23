@@ -78,17 +78,16 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Prometheus metrics, gated behind `LIED_METRICS_ENABLED` (default off)
 /// since the endpoint is unauthenticated.
+///
+/// Renders the globally-installed recorder's handle (set up in
+/// [`crate::state::AppState::connect`]). When metrics are disabled no
+/// recorder is installed, so `state.metrics` is `None` and the endpoint
+/// returns 404.
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    if !state.config.metrics_enabled {
-        return (StatusCode::NOT_FOUND, String::new());
+    match &state.metrics {
+        Some(handle) => (StatusCode::OK, handle.render()),
+        None => (StatusCode::NOT_FOUND, String::new()),
     }
-
-    // A full Prometheus exporter handle would normally be installed once at
-    // startup and rendered here; the skeleton renders an empty registry so
-    // the endpoint shape (and the gate) is correct ahead of real metrics
-    // being recorded in later items.
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-    (StatusCode::OK, handle.handle().render())
 }
 
 async fn openapi_json() -> impl IntoResponse {

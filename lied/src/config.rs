@@ -160,6 +160,14 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("secret command for {field} exited with {status:?}; stderr: {stderr}")]
+    SecretCommand {
+        field: &'static str,
+        status: Option<i32>,
+        stderr: String,
+    },
+    #[error("secret {field} resolved to an empty value from {via}")]
+    EmptySecret { field: &'static str, via: String },
 }
 
 impl From<figment::Error> for ConfigError {
@@ -233,9 +241,23 @@ impl AppConfig {
 /// 2. `<NAME>_FILE` — path to a file whose trimmed contents are the secret.
 /// 3. `<NAME>_CMD` — a shell command; its trimmed stdout is the secret.
 ///
-/// Returns `Ok(None)` if none of the three are set.
+/// A source that is *set* but yields an empty value is an error
+/// ([`ConfigError::EmptySecret`]), not a silent `None` — an operator who
+/// wired up a secret source clearly intended a value, so a blank result (an
+/// unset vault, a truncated file) must surface loudly rather than booting the
+/// app with, say, an empty JWT signing key. A non-zero exit from a `_CMD`
+/// source is likewise a hard error ([`ConfigError::SecretCommand`]) rather
+/// than trusting whatever landed on stdout.
+///
+/// Returns `Ok(None)` only when none of the three sources are set at all.
 fn resolve_secret(name: &'static str) -> Result<Option<String>, ConfigError> {
     if let Ok(value) = std::env::var(name) {
+        if value.is_empty() {
+            return Err(ConfigError::EmptySecret {
+                field: name,
+                via: name.to_string(),
+            });
+        }
         return Ok(Some(value));
     }
 
@@ -247,7 +269,14 @@ fn resolve_secret(name: &'static str) -> Result<Option<String>, ConfigError> {
                 source,
             }
         })?;
-        return Ok(Some(contents.trim().to_string()));
+        let secret = contents.trim().to_string();
+        if secret.is_empty() {
+            return Err(ConfigError::EmptySecret {
+                field: name,
+                via: file_var,
+            });
+        }
+        return Ok(Some(secret));
     }
 
     let cmd_var = format!("{name}_CMD");
@@ -260,8 +289,21 @@ fn resolve_secret(name: &'static str) -> Result<Option<String>, ConfigError> {
                 field: name,
                 source,
             })?;
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok(Some(stdout));
+        if !output.status.success() {
+            return Err(ConfigError::SecretCommand {
+                field: name,
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if secret.is_empty() {
+            return Err(ConfigError::EmptySecret {
+                field: name,
+                via: cmd_var,
+            });
+        }
+        return Ok(Some(secret));
     }
 
     Ok(None)
@@ -359,5 +401,36 @@ mod tests {
 
         std::env::remove_var(file_var);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_secret_errors_when_command_fails() {
+        // Distinct base name so the `_CMD` var can't collide with other
+        // env-mutating tests running in parallel in the same binary.
+        let cmd_var = "LIED_TEST_SECRET_CMDFAIL_CMD";
+        std::env::set_var(cmd_var, "echo boom >&2; exit 3");
+
+        let result = resolve_secret("LIED_TEST_SECRET_CMDFAIL");
+        std::env::remove_var(cmd_var);
+
+        match result {
+            Err(ConfigError::SecretCommand { status, .. }) => assert_eq!(status, Some(3)),
+            other => panic!("expected SecretCommand error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_secret_errors_on_empty_command_output() {
+        let cmd_var = "LIED_TEST_SECRET_CMDEMPTY_CMD";
+        // Succeeds (exit 0) but produces no output.
+        std::env::set_var(cmd_var, "true");
+
+        let result = resolve_secret("LIED_TEST_SECRET_CMDEMPTY");
+        std::env::remove_var(cmd_var);
+
+        assert!(
+            matches!(result, Err(ConfigError::EmptySecret { .. })),
+            "expected EmptySecret error, got {result:?}"
+        );
     }
 }
