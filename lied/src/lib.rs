@@ -7,7 +7,9 @@
 //! Postgres + MinIO (S3-compatible) clients.
 
 pub mod config;
+pub mod domain;
 pub mod error;
+pub mod pagination;
 pub mod routes;
 pub mod state;
 pub mod telemetry;
