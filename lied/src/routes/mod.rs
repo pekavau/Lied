@@ -15,6 +15,7 @@
 
 pub mod admin;
 pub mod infra;
+pub mod orgs;
 pub mod v1;
 pub mod webdav;
 

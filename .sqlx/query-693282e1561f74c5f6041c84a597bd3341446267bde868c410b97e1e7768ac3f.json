@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM part_assignment\n        WHERE collection_item_id IN (\n            SELECT ci.id FROM collection_item ci\n            JOIN collection c ON c.id = ci.collection_id\n            WHERE c.organization_id = $1\n        )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "693282e1561f74c5f6041c84a597bd3341446267bde868c410b97e1e7768ac3f"
+}

@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO membership\n            (id, user_id, organization_id, role, instrument_ids, is_principal, principal_instrument_ids, created_by)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)\n        RETURNING\n            id, user_id, organization_id, role,\n            instrument_ids, is_principal, principal_instrument_ids,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "role",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "instrument_ids",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_principal",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "principal_instrument_ids",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "UuidArray",
+        "Bool",
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d0d0802b055f6ded793ea4b9ab53d691881b17a89afa8a03313cf0d627fa504a"
+}

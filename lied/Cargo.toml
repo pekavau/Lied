@@ -56,6 +56,8 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 utoipa-rapidoc = { workspace = true }
 
+maud = { workspace = true }
+
 [dev-dependencies]
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }

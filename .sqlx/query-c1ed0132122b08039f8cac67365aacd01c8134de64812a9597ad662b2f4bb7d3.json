@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM collection_item\n        WHERE collection_id IN (SELECT id FROM collection WHERE organization_id = $1)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c1ed0132122b08039f8cac67365aacd01c8134de64812a9597ad662b2f4bb7d3"
+}
