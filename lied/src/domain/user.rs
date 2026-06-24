@@ -195,6 +195,115 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, sqlx::E
     }))
 }
 
+/// Sort allowlist for `GET /v1/users`. Default sort is `username:asc`.
+pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
+    ("username", "username"),
+    ("displayName", "display_name"),
+    ("createdAt", "created_at"),
+];
+
+/// Filter allowlist for `GET /v1/users`: `?filter[username]=` is a
+/// case-insensitive substring match (the column is `citext`, so a plain
+/// `LIKE` is already case-insensitive; `ILIKE` is used for parity with the
+/// other ILIKE filters in this codebase).
+pub const FILTER_ALLOWLIST: &[&str] = &["username"];
+
+/// Fetch one page of users plus the total row count, with an allowlisted
+/// sort and an optional `username` substring filter. System-admin-only
+/// endpoint (CLAUDE.md: instance-level user management); see
+/// [`crate::domain::organization::list`] for why the `format!`-built query
+/// around fixed, allowlisted fragments is safe.
+pub async fn list(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+    sort_column: &str,
+    sort_direction: crate::listing::SortDirection,
+    username_filter: Option<&str>,
+) -> Result<(Vec<User>, i64), sqlx::Error> {
+    let direction = sort_direction.as_sql();
+    // Runtime `sqlx::query` (dynamic allowlisted ORDER BY): aliases are plain
+    // SQL identifiers, not the `"name!: Type"` cast-annotation syntax (a
+    // `query!`-macro-only feature Postgres would reject). The `::text` casts on
+    // the citext columns remain — those are real SQL, needed so `try_get::<String>`
+    // can decode them.
+    let query = format!(
+        r#"
+        SELECT
+            id, slug, username::text as username, email::text as email,
+            display_name, is_system_admin,
+            created_at,
+            updated_at,
+            count(*) OVER() as total
+        FROM "user"
+        WHERE ($3::text IS NULL OR username ILIKE '%' || $3 || '%')
+        ORDER BY {sort_column} {direction}, id ASC
+        LIMIT $1 OFFSET $2
+        "#
+    );
+
+    let rows = sqlx::query(&query)
+        .bind(limit)
+        .bind(offset)
+        .bind(username_filter)
+        .fetch_all(pool)
+        .await?;
+
+    use sqlx::Row;
+    let total = match rows.first() {
+        Some(row) => row.try_get::<i64, _>("total")?,
+        None => {
+            let count_query = r#"SELECT count(*) FROM "user" WHERE ($1::text IS NULL OR username ILIKE '%' || $1 || '%')"#;
+            sqlx::query_scalar::<_, i64>(count_query)
+                .bind(username_filter)
+                .fetch_one(pool)
+                .await?
+        }
+    };
+
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            Ok(User {
+                id: row.try_get("id")?,
+                slug: row.try_get("slug")?,
+                username: row.try_get("username")?,
+                email: row.try_get("email")?,
+                display_name: row.try_get("display_name")?,
+                is_system_admin: row.try_get("is_system_admin")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+    Ok((items, total))
+}
+
+/// Hard-delete a user (CLAUDE.md: "user deletion is admin-gated hard delete
+/// with explicit reassignment-or-anonymization of PartAssignments,
+/// GlobalAnnotations, and audit log entries" — full reassignment/
+/// anonymization flows are a phase-2 concern per the entity doc, but this
+/// item still must not leave a dangling FK or silently 500). To keep the
+/// delete itself safe today without a full reassignment UI, the rows this
+/// user is referenced from are nulled/cleared rather than cascaded:
+/// - `membership.created_by`, `organization.created_by`, and other
+///   `created_by` audit columns are nullable and simply keep pointing at a
+///   (now-gone) id only via `ON DELETE` behavior already declared on the
+///   FK — *except* `membership.user_id`, `part_assignment.user_id`, and
+///   `global_annotation.author_id`, which are `NOT NULL` and have no
+///   `ON DELETE` clause, so a delete while those rows exist would violate
+///   the FK and error. Phase 1 accepts this as a hard stop (the caller sees
+///   a clear DB error) rather than silently deleting a user who still has
+///   active memberships/assignments/annotations — an explicit
+///   reassignment flow is the correct fix and is deferred, per CLAUDE.md.
+pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query!(r#"DELETE FROM "user" WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Returns `true` if any row in `"user"` has `is_system_admin = true`. Used
 /// by `create-admin` only to log an informational note when bootstrapping a
 /// second admin (not a hard guard — operators may legitimately want more

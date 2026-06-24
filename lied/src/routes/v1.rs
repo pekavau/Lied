@@ -62,6 +62,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/app-passwords/:id",
             axum::routing::delete(revoke_app_password),
         )
+        // Org/User/Membership management (issue #5) — see `routes::orgs` for
+        // the handlers; merged rather than re-declared here so that module
+        // owns its own route table end to end.
+        .merge(crate::routes::orgs::router())
         .layer(session_layer)
 }
 

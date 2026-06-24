@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod app_password;
+pub mod authz;
 pub mod csrf;
 pub mod extractors;
 pub mod jwt;

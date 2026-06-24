@@ -1,7 +1,11 @@
 //! `/admin/...` — HTMX admin UI tree. HTML fragments, session-cookie + CSRF
-//! auth. Entity CRUD lands in later phase-1 items; this item (issue #4)
-//! adds the login/logout flow plus the session + CSRF middleware that the
-//! rest of the admin tree will sit behind.
+//! auth. Issue #4 added the login/logout flow plus the session + CSRF
+//! middleware the rest of the admin tree sits behind; issue #5 adds the
+//! first real screens (`orgs` submodule: org/user/membership management),
+//! sharing the `layout` submodule's maud page shell.
+
+pub mod layout;
+pub mod orgs;
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -35,6 +39,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/", get(index))
         .route("/login", login_route)
         .route("/logout", post(logout_submit))
+        // Org/User/Membership screens (issue #5) — see `orgs` submodule.
+        .merge(orgs::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
@@ -44,11 +50,12 @@ pub fn router(state: &AppState) -> Router<AppState> {
 
 async fn index(auth: Option<AuthSession>) -> impl IntoResponse {
     match auth {
-        Some(AuthSession(user)) => Html(format!(
-            "<h1>Lied admin</h1><p>Logged in as {}.</p><form method=\"post\" action=\"/admin/logout\"><button type=\"submit\">Log out</button></form>",
-            html_escape(&user.display_name)
-        ))
-        .into_response(),
+        Some(AuthSession(user)) => {
+            let body = maud::html! {
+                p { "Use the nav above to manage organizations and users." }
+            };
+            Html(layout::page("Home", &user.display_name, body).into_string()).into_response()
+        }
         None => Redirect::to("/admin/login").into_response(),
     }
 }

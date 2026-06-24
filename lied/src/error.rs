@@ -35,6 +35,18 @@ pub enum AppError {
 
     #[error("too many requests")]
     TooManyRequests,
+
+    /// A write would violate a business invariant that isn't a simple
+    /// validation failure on the request body — e.g. demoting/removing the
+    /// last `owner` of an organization (CLAUDE.md: "every org keeps >=1
+    /// owner; demoting the last owner is rejected"). `409 Conflict` (rather
+    /// than `422`) was chosen because the request is syntactically and
+    /// semantically valid on its own; it only conflicts with the *current
+    /// state* of the membership set — the textbook 409 case per RFC 9110
+    /// ("the request could not be completed due to a conflict with the
+    /// current state of the target resource").
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 /// RFC 7807 Problem Details body.
@@ -61,6 +73,7 @@ impl AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -74,6 +87,7 @@ impl AppError {
             AppError::Unauthorized => "https://lied/errors/unauthorized",
             AppError::Forbidden => "https://lied/errors/forbidden",
             AppError::TooManyRequests => "https://lied/errors/too-many-requests",
+            AppError::Conflict(_) => "https://lied/errors/conflict",
         }
     }
 
@@ -87,6 +101,7 @@ impl AppError {
             AppError::Unauthorized => "Unauthorized",
             AppError::Forbidden => "Forbidden",
             AppError::TooManyRequests => "Too Many Requests",
+            AppError::Conflict(_) => "Conflict",
         }
     }
 }
@@ -171,5 +186,11 @@ mod tests {
     async fn precondition_failed_maps_to_412() {
         let response = AppError::PreconditionFailed.into_response();
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn conflict_maps_to_409() {
+        let response = AppError::Conflict("last owner".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

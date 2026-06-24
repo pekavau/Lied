@@ -19,6 +19,7 @@ ignore = [
     "RUSTSEC-2025-0111", # tokio-tar: PAX header file smuggling (testcontainers image extraction, dev-only)
     "RUSTSEC-2024-0436", # paste: unmaintained (transitive, no upstream replacement forced yet)
     "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained (transitive via testcontainers -> bollard, dev-only)
+    "RUSTSEC-2024-0370", # proc-macro-error: unmaintained (transitive via maud_macros 0.26; no syn-2 release yet, no functional impact — it's a proc-macro diagnostics helper, not exercised at runtime)
 ]
 
 [licenses]
