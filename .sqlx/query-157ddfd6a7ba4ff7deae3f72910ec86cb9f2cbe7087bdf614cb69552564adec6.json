@@ -1,0 +1,149 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE arrangement\n        SET title = $2, work_id = $3, instrumentation = $4, arranger = $5,\n            publisher = $6, purchase_date = $7::text::date, license_notes = $8,\n            copy_count_allowed = $9, status = $10, duration_seconds = $11,\n            difficulty = $12, difficulty_ratings = $13, difficulty_notes = $14,\n            updated_at = now()\n        WHERE id = $1 AND deleted_at IS NULL\n        RETURNING\n            id, organization_id, title, slug, work_id, instrumentation, arranger,\n            publisher,\n            purchase_date as \"purchase_date: NaiveDate\",\n            license_notes, copy_count_allowed, status,\n            duration_seconds, difficulty, difficulty_ratings, difficulty_notes,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "work_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "instrumentation",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "arranger",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "publisher",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "purchase_date: NaiveDate",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 9,
+        "name": "license_notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "copy_count_allowed",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "duration_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "difficulty",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 14,
+        "name": "difficulty_ratings",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 15,
+        "name": "difficulty_notes",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 19,
+        "name": "deleted_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Int4",
+        "Int2",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "157ddfd6a7ba4ff7deae3f72910ec86cb9f2cbe7087bdf614cb69552564adec6"
+}

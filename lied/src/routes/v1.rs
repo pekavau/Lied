@@ -66,6 +66,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         // the handlers; merged rather than re-declared here so that module
         // owns its own route table end to end.
         .merge(crate::routes::orgs::router())
+        // Work/Arrangement/Voice/Tag management (issue #6) — see
+        // `routes::arrangements`.
+        .merge(crate::routes::arrangements::router())
         .layer(session_layer)
 }
 
