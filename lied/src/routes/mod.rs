@@ -14,6 +14,7 @@
 //! since there are no entities/sessions yet to authenticate against.
 
 pub mod admin;
+pub mod arrangements;
 pub mod infra;
 pub mod orgs;
 pub mod v1;

@@ -430,6 +430,20 @@ pub async fn update(
     Ok(row.map(Row::into_membership))
 }
 
+/// Returns `true` if `user_id` holds at least one `Membership` in any
+/// organization. Used to gate Work creation (CLAUDE.md Decisions: "creating
+/// a Work is open to any authenticated user with at least one Membership in
+/// any org").
+pub async fn has_any_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar!(
+        r#"SELECT EXISTS(SELECT 1 FROM membership WHERE user_id = $1) as "exists!""#,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(exists)
+}
+
 /// Delete a membership. Enforces the last-owner invariant: deleting an
 /// `owner` membership is rejected unless at least one other owner remains.
 ///

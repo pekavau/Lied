@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM arrangement_tag WHERE arrangement_id = $1 AND tag_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7b7a24fcf835e5cc550d3e0d116f32aa4bbd80c8966c27b38332c79b97f6c6e7"
+}

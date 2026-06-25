@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE tag SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "138bdfc3d2b9d5efbe1a9f38f9b86e5fdbe744978614c019a145ae7657f24b0a"
+}

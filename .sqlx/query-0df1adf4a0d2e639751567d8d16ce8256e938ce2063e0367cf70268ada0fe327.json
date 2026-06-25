@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE arrangement SET deleted_at = NULL, updated_at = now() WHERE id = $1 AND deleted_at IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0df1adf4a0d2e639751567d8d16ce8256e938ce2063e0367cf70268ada0fe327"
+}
