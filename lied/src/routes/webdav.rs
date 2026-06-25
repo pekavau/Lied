@@ -24,7 +24,14 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/orgs/*path", any(stub))
         .route("/users", any(stub))
         .route("/users/*path", any(stub))
-        .layer(middleware::from_fn_with_state(
+        // `route_layer`, not `layer`: the app-password Basic challenge must
+        // apply ONLY to these matched WebDAV routes, never to the router's
+        // fallback. A plain `.layer()` also wraps the default fallback, and
+        // `.merge()`ing this router into the app tree then makes that
+        // auth-wrapped fallback the app-wide catch-all — so every unmatched
+        // path (favicon, `/admin/`, typos) would answer `401 WWW-Authenticate:
+        // Basic` instead of a clean 404 (issue #15, bug 1).
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             app_password_auth,
         ))

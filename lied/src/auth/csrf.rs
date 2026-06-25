@@ -26,6 +26,9 @@ use crate::state::AppState;
 pub const CSRF_SESSION_KEY: &str = "csrf_token";
 pub const CSRF_COOKIE_NAME: &str = "lied_csrf";
 pub const CSRF_HEADER_NAME: &str = "hx-csrf";
+/// Hidden form-field name carrying the token on server-rendered admin `<form>`
+/// submits (the JS-free double-submit half).
+pub const CSRF_FORM_FIELD: &str = "csrf_token";
 
 /// Generate a fresh CSRF token (32 random bytes, base64url, no padding).
 fn generate_token() -> String {
@@ -92,16 +95,45 @@ pub async fn csrf_middleware(
             }
         };
 
-        let presented = request
+        // Accept either double-submit half:
+        //  (a) the `HX-CSRF` request header (programmatic / future htmx use), or
+        //  (b) a `csrf_token` field in an `application/x-www-form-urlencoded`
+        //      body — the server-rendered admin `<form>`s. (b) is JS-free, so
+        //      it works whether or not any client-side script runs (issue #15:
+        //      the script-based header was never sent in practice).
+        let header_ok = request
             .headers()
             .get(CSRF_HEADER_NAME)
-            .and_then(|v| v.to_str().ok());
-
-        if presented != Some(expected.as_str()) {
-            return csrf_rejection("CSRF token mismatch or missing HX-CSRF header");
+            .and_then(|v| v.to_str().ok())
+            == Some(expected.as_str());
+        if header_ok {
+            return next.run(request).await;
         }
 
-        return next.run(request).await;
+        if is_form_urlencoded(&request) {
+            // Buffer the (size-bounded) form body to read the token, then
+            // rebuild the request so the handler's `Form` extractor still sees
+            // the body. Only urlencoded bodies are buffered; multipart uploads
+            // never arrive as one of these form posts, so streaming is
+            // unaffected.
+            let limit = state.config.max_request_bytes as usize;
+            let (parts, body) = request.into_parts();
+            let bytes = match axum::body::to_bytes(body, limit).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return csrf_rejection("request body unreadable or too large for CSRF check");
+                }
+            };
+            let field_ok =
+                form_field(&bytes, CSRF_FORM_FIELD).as_deref() == Some(expected.as_str());
+            let request = Request::from_parts(parts, Body::from(bytes));
+            if field_ok {
+                return next.run(request).await;
+            }
+            return csrf_rejection("CSRF token mismatch or missing csrf_token field");
+        }
+
+        return csrf_rejection("CSRF token mismatch or missing HX-CSRF header / csrf_token field");
     }
 
     // Safe method: make sure the session carries a token, then hand the
@@ -135,6 +167,67 @@ fn request_carries_csrf_cookie(request: &Request) -> bool {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|raw| raw.split(';'))
         .any(|pair| pair.trim().starts_with(&needle))
+}
+
+/// Whether the request body is an `application/x-www-form-urlencoded` form
+/// (the only body shape the CSRF middleware buffers to read its token field).
+fn is_form_urlencoded(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            ct.trim_start()
+                .starts_with("application/x-www-form-urlencoded")
+        })
+        .unwrap_or(false)
+}
+
+/// Extract a single field value from an `application/x-www-form-urlencoded`
+/// body. Returns the first match, percent/`+`-decoded.
+fn form_field(body: &[u8], name: &str) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    body.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (urldecode(key) == name).then(|| urldecode(value))
+    })
+}
+
+/// Minimal `application/x-www-form-urlencoded` value decoder: `+` → space and
+/// `%XX` escapes. Sufficient for reading the CSRF field; avoids a new
+/// dependency for one field.
+fn urldecode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                    16,
+                ) {
+                    Ok(decoded) => {
+                        out.push(decoded);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn csrf_rejection(detail: &str) -> Response {
