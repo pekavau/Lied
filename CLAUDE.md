@@ -756,3 +756,22 @@ Model supports these; phase 1 has no implementation.
 ### Trade-off accepted
 
 Phase 1 is unglamorous from the conductor's perspective (title ILIKE only, no tags, no fancy program planning aids) and from the format-conversion angle (you upload what you upload). It delivers the actual base value — getting parts from archivist to musician — and every later phase plugs in cleanly because the data model already accommodates it.
+
+<!-- code-graph-mcp:begin v2 -->
+## Code Graph (repo-wide AST index)
+
+AST + FTS + vector index of the whole repo — prefer over multi-round Grep/Read for
+structural queries (LSP only sees open files; this sees everything). Fastest path = Bash CLI:
+
+| Intent | Command |
+|--------|---------|
+| Who calls X / what X calls | `code-graph-mcp callgraph X` |
+| Impact before editing a fn | `code-graph-mcp impact X` |
+| Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
+| Symbol source / signature | `code-graph-mcp show X` |
+| Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
+| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
+
+Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
+Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
+<!-- code-graph-mcp:end -->

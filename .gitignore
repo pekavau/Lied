@@ -3,3 +3,8 @@
 /backup
 .env
 *.swp
+
+# Local agent / tooling artifacts (not part of the project source)
+.code-graph/
+.claude/settings.local.json
+.claude/plugin_code_graph_mcp.md
