@@ -10,6 +10,7 @@
 //! real axum router via `lied::routes::build_router`, requests driven with
 //! `tower::ServiceExt::oneshot`.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use lied::auth;
@@ -75,7 +76,9 @@ fn test_config() -> AppConfig {
         jwt_signing_key: Secret::from("test-signing-key-material-for-org-tests".to_string()),
         jwt_lifetime_days: 30,
         max_upload_bytes: 1,
-        max_request_bytes: 1,
+        // Realistic non-upload body cap (prod default): the CSRF middleware
+        // buffers urlencoded form bodies up to this size to read the token.
+        max_request_bytes: 256 * 1024,
         max_files_per_voice: 1,
         max_arrangements_per_org: None,
         max_page_size: 200,
@@ -773,4 +776,251 @@ async fn missing_credentials_on_members_route_returns_401() {
 
     let response = app.oneshot(request).await.expect("request should run");
     assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #15: the /admin HTMX UI must actually work in a real browser. These
+// drive the composed `build_router` through the session-cookie + CSRF +
+// hx-boost path a browser uses — the path the bearer-token tests above never
+// touched, which is exactly why the three browser-only defects merged green.
+// ---------------------------------------------------------------------------
+
+/// Attach a `ConnectInfo<SocketAddr>` so the login rate-limiter's
+/// `SmartIpKeyExtractor` can resolve a client IP under `oneshot` (production
+/// wires it via `into_make_service_with_connect_info`; `oneshot` does not, so
+/// `POST /admin/login` would otherwise 500 before reaching the handler).
+fn with_peer_ip<B>(mut request: axum::http::Request<B>) -> axum::http::Request<B> {
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            9000,
+        ))));
+    request
+}
+
+/// Read a `Set-Cookie` value by name from a response (the first `name=value`
+/// segment, before the attributes).
+fn cookie_value(response: &axum::response::Response, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|raw| {
+            raw.split(';')
+                .next()
+                .and_then(|first| first.trim().strip_prefix(&needle))
+                .map(str::to_string)
+        })
+}
+
+/// Drive the real `/admin/login` form flow exactly as a browser would and
+/// return `(session_cookie, csrf_token)` for authenticating later admin
+/// requests. Asserts the post-login redirect targets the slash-less `/admin`
+/// (issue #15 bug 2 regression).
+async fn admin_login(app: &axum::Router, username: &str, password: &str) -> (String, String) {
+    // 1. GET the login page: establishes the anon session + readable csrf cookie.
+    let get = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin/login")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(get).await.expect("login page");
+    let anon_session = cookie_value(&resp, "lied_session").expect("anon session cookie");
+    let csrf = cookie_value(&resp, "lied_csrf").expect("csrf cookie");
+
+    // 2. POST the form carrying that session (login is CSRF-exempt by design).
+    let post = with_peer_ip(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/admin/login")
+            .header(
+                axum::http::header::COOKIE,
+                format!("lied_session={anon_session}; lied_csrf={csrf}"),
+            )
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(axum::body::Body::from(format!(
+                "username={username}&password={password}"
+            )))
+            .unwrap(),
+    );
+    let resp = app.clone().oneshot(post).await.expect("login submit");
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "login should redirect on success"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/admin"),
+        "login must redirect to the slash-less /admin (issue #15 bug 2)"
+    );
+    // The session id is cycled on login (fixation defense) — use the new one.
+    let session = cookie_value(&resp, "lied_session").unwrap_or(anon_session);
+    (session, csrf)
+}
+
+#[tokio::test]
+async fn unmatched_path_returns_404_not_a_webdav_basic_challenge() {
+    // Bug 1: the WebDAV Basic-auth challenge must not leak onto the app-wide
+    // fallback. An unmatched path (here, a browser's favicon probe) must be a
+    // clean 404, never `401 WWW-Authenticate: Basic`.
+    let db = TestDb::create_and_migrate().await;
+    let (app, _state) = build_test_app(db.pool.clone()).await;
+
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/favicon.ico")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("request should run");
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .is_none(),
+        "an unmatched path must not emit a WWW-Authenticate: Basic challenge (issue #15 bug 1)"
+    );
+}
+
+#[tokio::test]
+async fn admin_login_redirects_to_slashless_admin_and_home_is_authed() {
+    // Bug 2: `nest(\"/admin\")` matches `/admin` but not `/admin/`; the login
+    // redirect must therefore target `/admin`, which must render when authed.
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "admin", "hunter2hunter2").await;
+    let (app, _state) = build_test_app(db.pool.clone()).await;
+
+    // admin_login asserts the redirect Location is exactly "/admin".
+    let (session, _csrf) = admin_login(&app, "admin", "hunter2hunter2").await;
+
+    let home = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin")
+        .header(
+            axum::http::header::COOKIE,
+            format!("lied_session={session}"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.oneshot(home).await.expect("request should run");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "/admin must serve the home page for an authed user (issue #15 bug 2)"
+    );
+}
+
+#[tokio::test]
+async fn admin_writes_are_csrf_protected_via_form_field() {
+    // Bug 3 (revised): the admin UI must not depend on client-side JS for CSRF.
+    // Every form embeds a hidden `csrf_token` field validated server-side. A
+    // native form POST carrying that field — exactly what a browser submits,
+    // no JS involved — must succeed; one without it (and without the HX-CSRF
+    // header) must be rejected. This is the path the earlier hx-boost/JS hook
+    // tests could never actually exercise.
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "admin", "hunter2hunter2").await;
+    let (app, _state) = build_test_app(db.pool.clone()).await;
+    let (session, csrf) = admin_login(&app, "admin", "hunter2hunter2").await;
+    let cookie = format!("lied_session={session}; lied_csrf={csrf}");
+
+    // The rendered form must embed the hidden CSRF field.
+    let list = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin/orgs")
+        .header(axum::http::header::COOKIE, &cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(list).await.expect("orgs page");
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains(r#"name="csrf_token""#),
+        "admin forms must embed a hidden csrf_token field (issue #15 bug 3)"
+    );
+
+    // A native <form> POST carrying the csrf_token field — what the browser
+    // actually sends, with NO HX-CSRF header and no JavaScript — must succeed.
+    let create = axum::http::Request::builder()
+        .method("POST")
+        .uri("/admin/orgs")
+        .header(axum::http::header::COOKIE, &cookie)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from(format!(
+            "name=Field Protected Orchestra&csrf_token={csrf}"
+        )))
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create)
+        .await
+        .expect("create org via field");
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "a native form POST carrying the csrf_token field must succeed, not 403 (issue #15 bug 3)"
+    );
+
+    // The HX-CSRF header path still works (programmatic / future htmx clients).
+    let create_header = axum::http::Request::builder()
+        .method("POST")
+        .uri("/admin/orgs")
+        .header(axum::http::header::COOKIE, &cookie)
+        .header("HX-CSRF", &csrf)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from("name=Header Protected Orchestra"))
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_header)
+        .await
+        .expect("create org via header");
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "the HX-CSRF header path must still work"
+    );
+
+    // Neither the field nor the header → rejected.
+    let create_none = axum::http::Request::builder()
+        .method("POST")
+        .uri("/admin/orgs")
+        .header(axum::http::header::COOKIE, &cookie)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from("name=Unprotected"))
+        .unwrap();
+    let resp = app
+        .oneshot(create_none)
+        .await
+        .expect("create org without csrf");
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "a write with no csrf_token field and no HX-CSRF header must be rejected"
+    );
 }

@@ -76,7 +76,7 @@ fn test_config() -> AppConfig {
         jwt_signing_key: Secret::from("test-signing-key-material-for-auth-tests".to_string()),
         jwt_lifetime_days: 30,
         max_upload_bytes: 1,
-        max_request_bytes: 1,
+        max_request_bytes: 256 * 1024,
         max_files_per_voice: 1,
         max_arrangements_per_org: None,
         max_page_size: 200,

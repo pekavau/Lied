@@ -113,7 +113,11 @@ async fn login_submit(
     )
     .await
     {
-        Ok(_user) => Redirect::to("/admin/").into_response(),
+        // Redirect to `/admin` WITHOUT a trailing slash: `nest("/admin", …)`
+        // matches `/admin` but not `/admin/` (axum 0.7 / matchit treats them
+        // as distinct paths; the inner `route("/")` only covers the bare
+        // prefix), so `/admin/` would fall through to a 404 (issue #15, bug 2).
+        Ok(_user) => Redirect::to("/admin").into_response(),
         Err(LoginError::InvalidCredentials) => (
             StatusCode::UNAUTHORIZED,
             Html("<p>Invalid username or password.</p>"),

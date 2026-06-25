@@ -17,9 +17,11 @@ use axum::routing::get;
 use axum::{Form, Router};
 use maud::html;
 use serde::Deserialize;
+use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::auth::authz::{require_org_role, require_system_admin};
+use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
@@ -82,10 +84,13 @@ fn app_error_fragment(err: AppError) -> Response {
 async fn list_orgs_page(
     AuthSession(actor): AuthSession,
     State(state): State<AppState>,
+    session: Session,
 ) -> Response {
     if let Err(err) = require_system_admin(&actor) {
         return app_error_fragment(err);
     }
+
+    let token = csrf::ensure_token(&session).await.unwrap_or_default();
 
     let (orgs, _total) =
         match organization::list(&state.db, 200, 0, "name", SortDirection::Asc, None).await {
@@ -101,6 +106,7 @@ async fn list_orgs_page(
 
     let body = html! {
         form method="post" action="/admin/orgs" {
+            (layout::csrf_field(&token))
             fieldset {
                 legend { "Create organization" }
                 label { "Name " input type="text" name="name" required; }
@@ -116,6 +122,7 @@ async fn list_orgs_page(
                         td { (org.slug) }
                         td {
                             form class="inline" method="post" action={"/admin/orgs/" (org.id) "/delete"} {
+                                (layout::csrf_field(&token))
                                 button type="submit" { "Delete" }
                             }
                         }
@@ -238,6 +245,7 @@ async fn delete_org_submit(
 async fn org_detail_page(
     AuthSession(actor): AuthSession,
     State(state): State<AppState>,
+    session: Session,
     Path(id): Path<Uuid>,
 ) -> Response {
     if let Err(err) = require_org_role(&state, &actor, id, Role::Musician).await {
@@ -246,6 +254,8 @@ async fn org_detail_page(
     let is_owner = require_org_role(&state, &actor, id, Role::Owner)
         .await
         .is_ok();
+
+    let token = csrf::ensure_token(&session).await.unwrap_or_default();
 
     let org = match organization::find_by_id(&state.db, id).await {
         Ok(Some(org)) => org,
@@ -298,6 +308,7 @@ async fn org_detail_page(
                         td {
                             @if is_owner {
                                 form class="inline" method="post" action={"/admin/orgs/" (id) "/members/" (m.id) "/role"} {
+                                    (layout::csrf_field(&token))
                                     select name="role" {
                                         @for role in [Role::Owner, Role::Archivist, Role::Conductor, Role::Musician] {
                                             option value=(role.as_str()) selected[role == m.role] { (role.as_str()) }
@@ -313,6 +324,7 @@ async fn org_detail_page(
                         td {
                             @if is_owner {
                                 form class="inline" method="post" action={"/admin/orgs/" (id) "/members/" (m.id) "/delete"} {
+                                    (layout::csrf_field(&token))
                                     button type="submit" { "Remove" }
                                 }
                             }
@@ -324,6 +336,7 @@ async fn org_detail_page(
         @if is_owner {
             h2 { "Add member" }
             form method="post" action={"/admin/orgs/" (id) "/members"} {
+                (layout::csrf_field(&token))
                 fieldset {
                     label { "User ID (UUID) " input type="text" name="user_id" required; }
                     label {
@@ -552,10 +565,13 @@ fn membership_error_fragment(err: membership::MembershipError) -> Response {
 async fn list_users_page(
     AuthSession(actor): AuthSession,
     State(state): State<AppState>,
+    session: Session,
 ) -> Response {
     if let Err(err) = require_system_admin(&actor) {
         return app_error_fragment(err);
     }
+
+    let token = csrf::ensure_token(&session).await.unwrap_or_default();
 
     let (users, _total) =
         match user::list(&state.db, 200, 0, "username", SortDirection::Asc, None).await {
@@ -568,6 +584,7 @@ async fn list_users_page(
 
     let body = html! {
         form method="post" action="/admin/users" {
+            (layout::csrf_field(&token))
             fieldset {
                 legend { "Create user" }
                 label { "Username " input type="text" name="username" required; }
@@ -588,6 +605,7 @@ async fn list_users_page(
                         td { @if u.is_system_admin { "yes" } @else { "no" } }
                         td {
                             form class="inline" method="post" action={"/admin/users/" (u.id) "/delete"} {
+                                (layout::csrf_field(&token))
                                 button type="submit" { "Delete" }
                             }
                         }
