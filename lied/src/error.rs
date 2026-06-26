@@ -47,6 +47,21 @@ pub enum AppError {
     /// current state of the target resource").
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// The request body exceeded an allowed size (e.g. `LIED_MAX_UPLOAD_BYTES`
+    /// on a file upload). `413 Payload Too Large`.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    /// The uploaded content type is not one Lied stores (not in the
+    /// format/mime lookup table). `415 Unsupported Media Type`.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
+    /// The `Range` header could not be satisfied (malformed or outside the
+    /// object). `416 Range Not Satisfiable`.
+    #[error("range not satisfiable: {0}")]
+    RangeNotSatisfiable(String),
 }
 
 /// RFC 7807 Problem Details body.
@@ -74,6 +89,9 @@ impl AppError {
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            AppError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            AppError::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
         }
     }
 
@@ -88,6 +106,9 @@ impl AppError {
             AppError::Forbidden => "https://lied/errors/forbidden",
             AppError::TooManyRequests => "https://lied/errors/too-many-requests",
             AppError::Conflict(_) => "https://lied/errors/conflict",
+            AppError::PayloadTooLarge(_) => "https://lied/errors/payload-too-large",
+            AppError::UnsupportedMediaType(_) => "https://lied/errors/unsupported-media-type",
+            AppError::RangeNotSatisfiable(_) => "https://lied/errors/range-not-satisfiable",
         }
     }
 
@@ -102,6 +123,9 @@ impl AppError {
             AppError::Forbidden => "Forbidden",
             AppError::TooManyRequests => "Too Many Requests",
             AppError::Conflict(_) => "Conflict",
+            AppError::PayloadTooLarge(_) => "Payload Too Large",
+            AppError::UnsupportedMediaType(_) => "Unsupported Media Type",
+            AppError::RangeNotSatisfiable(_) => "Range Not Satisfiable",
         }
     }
 }

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*) as \"count!\"\n        FROM file f\n        JOIN arrangement a ON a.id = f.arrangement_id\n        WHERE f.arrangement_id = $1\n          AND f.deleted_at IS NULL\n          AND a.deleted_at IS NULL\n          AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fea5b61a701906707f529199158605f63b75cb0bfea5f6b6ea98386797fa779d"
+}

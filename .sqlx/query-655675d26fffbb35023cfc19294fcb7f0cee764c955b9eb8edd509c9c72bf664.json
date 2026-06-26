@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT o.slug AS org_slug, a.slug AS arrangement_slug\n        FROM arrangement a\n        JOIN organization o ON o.id = a.organization_id\n        WHERE a.id = $1 AND a.deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "arrangement_slug",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "655675d26fffbb35023cfc19294fcb7f0cee764c955b9eb8edd509c9c72bf664"
+}
