@@ -20,6 +20,8 @@ governor = { workspace = true }
 async-trait = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
 
 sqlx = { workspace = true }
 
@@ -60,7 +62,7 @@ maud = { workspace = true }
 
 [dev-dependencies]
 testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+testcontainers-modules = { version = "0.11", features = ["postgres", "minio"] }
 insta = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tower = { workspace = true, features = ["util"] }

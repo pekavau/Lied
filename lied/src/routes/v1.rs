@@ -69,6 +69,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         // Work/Arrangement/Voice/Tag management (issue #6) — see
         // `routes::arrangements`.
         .merge(crate::routes::arrangements::router())
+        // File upload/download streamed to/from MinIO (issue #7) — see
+        // `routes::files`.
+        .merge(crate::routes::files::router())
         .layer(session_layer)
 }
 

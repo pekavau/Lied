@@ -11,6 +11,7 @@
 pub mod app_password;
 pub mod arrangement;
 pub mod audit_log;
+pub mod file;
 pub mod instrument;
 pub mod membership;
 pub mod organization;
