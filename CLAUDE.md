@@ -195,6 +195,33 @@ Musicians can use existing apps against the WebDAV interface:
 
 A purpose-built display/reader app is a future consideration, not an initial requirement.
 
+### MCP server (deferred — phase 2)
+
+An optional **Model Context Protocol server** is planned for phase 2, exposing the
+archive to LLM clients (Claude Desktop, Claude Code, etc.) as a fifth route tree
+(`/mcp`) alongside `/admin`, `/v1`, WebDAV, and infra. It is **not** a new domain
+layer — it is a thin adapter over the existing `/v1` surface and the
+domain/service functions, surfacing:
+- **Tools** — read-first: `search_arrangements`, `get_arrangement`,
+  `list_collections`, `coverage_check`, `get_part_assignments`; write tools
+  (create/upload/assign) later, carefully auth-scoped.
+- **Resources** — score / voice files exposed as fetchable MCP resources
+  (aligns with the "open protocols, music accessible without the app" principle).
+
+**What it needs (and why phase 1 doesn't have to change):** nothing in the
+phase-1 plan forecloses it, because its three prerequisites are already phase-1
+commitments —
+1. a **complete, accurate OpenAPI spec** as the source MCP tool schemas are
+   derived/generated from (see `docs/api-guidelines.md`; this is exactly why API
+   completeness is enforced);
+2. **business logic in `domain/*`, not in HTTP handlers**, so MCP tools call the
+   same service functions REST does — no logic duplication or HTTP self-proxying;
+3. **bearer-JWT auth with `org`-scoped claims** (issue #4), reused directly.
+
+Deferred on maturity grounds too: MCP's auth/transport story is still settling,
+and it adds nothing to the phase-1 archivist→musician payoff. Build it once `/v1`
+is finished and the spec is complete.
+
 ---
 
 ## Tech stack
