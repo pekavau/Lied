@@ -15,9 +15,10 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 use serde::Serialize;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::authz::require_org_role_v1;
@@ -27,53 +28,48 @@ use crate::domain::membership::Role;
 use crate::domain::{arrangement, file, voice};
 use crate::error::AppError;
 use crate::pagination::{Page, PageParams};
+use crate::routes::openapi::{
+    CommonErrors, Conflict409, Forbidden403, NotFound404, PayloadTooLarge413, Precondition412,
+    Range416, UnsupportedMedia415,
+};
 use crate::routes::RequestId;
 use crate::state::AppState;
 use crate::storage::{self, StorageError};
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        // Full-score files.
-        .route(
-            "/orgs/:org_id/arrangements/:arr_id/files",
-            get(list_score_files).post(upload_score_file),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arr_id/files/:file_id",
-            get(download_score_file)
-                .put(replace_score_file)
-                .delete(delete_score_file),
-        )
-        // Voice files.
-        .route(
-            "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files",
-            get(list_voice_files).post(upload_voice_file),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files/:file_id",
-            get(download_voice_file)
-                .put(replace_voice_file)
-                .delete(delete_voice_file),
-        )
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_score_files, upload_score_file))
+        .routes(routes!(
+            download_score_file,
+            replace_score_file,
+            delete_score_file
+        ))
+        .routes(routes!(list_voice_files, upload_voice_file))
+        .routes(routes!(
+            download_voice_file,
+            replace_voice_file,
+            delete_voice_file
+        ))
         // Uploads stream to MinIO with a manual byte ceiling, so the default
         // 2 MiB extractor limit must be lifted on these routes only.
         .layer(DefaultBodyLimit::disable())
 }
 
+/// Metadata about a stored file (score or voice).
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct FileResponse {
-    id: Uuid,
-    arrangement_id: Uuid,
-    voice_id: Option<Uuid>,
-    name: String,
-    format: String,
-    mime_type: String,
-    derived_from_file_id: Option<Uuid>,
-    conversion_quality: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct FileResponse {
+    pub id: Uuid,
+    pub arrangement_id: Uuid,
+    pub voice_id: Option<Uuid>,
+    pub name: String,
+    pub format: String,
+    pub mime_type: String,
+    pub derived_from_file_id: Option<Uuid>,
+    pub conversion_quality: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<file::File> for FileResponse {
@@ -92,6 +88,19 @@ impl From<file::File> for FileResponse {
             deleted_at: f.deleted_at,
         }
     }
+}
+
+/// Multipart upload body: a single `file` part with a `filename` and a
+/// recognised `Content-Type`.
+///
+/// Documented here as the OpenAPI `requestBody` schema for upload/replace
+/// endpoints; the actual extraction is done by axum's [`Multipart`] extractor.
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct UploadForm {
+    /// The file bytes (multipart part named `file`).
+    #[schema(format = Binary, content_media_type = "application/octet-stream")]
+    file: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +300,33 @@ async fn do_upload(
     )))
 }
 
+/// Upload a full-score file to an arrangement (owner/archivist only).
+///
+/// The request body must be `multipart/form-data` with a single part that
+/// carries a recognised `Content-Type` (see the format table in CLAUDE.md).
+/// The file is streamed directly to MinIO — server memory per upload is a
+/// fixed chunk buffer, not proportional to file size.
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{arrId}/files",
+    tag = "files",
+    summary = "Upload a full-score file",
+    params(
+        ("orgId"  = Uuid, Path, description = "Organization ID"),
+        ("arrId"  = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body(content = UploadForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "File uploaded", body = FileResponse),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        UnsupportedMedia415,
+        PayloadTooLarge413,
+    )
+)]
 async fn upload_score_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -301,6 +337,32 @@ async fn upload_score_file(
     do_upload(state, auth, request_id, org_id, arr_id, None, multipart).await
 }
 
+/// Upload a voice file (owner/archivist only).
+///
+/// The request body must be `multipart/form-data` with a single part that
+/// carries a recognised `Content-Type`.
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
+    tag = "files",
+    summary = "Upload a voice file",
+    params(
+        ("orgId"    = Uuid, Path, description = "Organization ID"),
+        ("arrId"    = Uuid, Path, description = "Arrangement ID"),
+        ("voiceId"  = Uuid, Path, description = "Voice ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body(content = UploadForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "File uploaded", body = FileResponse),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        UnsupportedMedia415,
+        PayloadTooLarge413,
+    )
+)]
 async fn upload_voice_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -390,6 +452,37 @@ async fn do_download(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")))
 }
 
+/// Download a full-score file (requires `musician` role). Supports HTTP `Range`.
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    tag = "files",
+    summary = "Download a full-score file",
+    params(
+        ("orgId"   = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"   = Uuid,   Path,   description = "Arrangement ID"),
+        ("fileId"  = Uuid,   Path,   description = "File ID"),
+        ("Range"   = Option<String>, Header,
+            description = "Byte-range request (e.g. `bytes=0-1023`). Returns 206 Partial Content."),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Full file body",
+            content_type = "application/octet-stream",
+            headers(
+                ("Content-Type"   = String,  description = "MIME type of the stored file"),
+                ("Accept-Ranges"  = String,  description = "Always `bytes`"),
+                ("Content-Length" = u64,     description = "File size in bytes"),
+            )),
+        (status = 206, description = "Partial content (Range satisfied)",
+            content_type = "application/octet-stream",
+            headers(("Content-Range" = String, description = "Satisfied byte range"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Range416,
+    )
+)]
 async fn download_score_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -399,6 +492,38 @@ async fn download_score_file(
     do_download(state, auth, org_id, arr_id, None, file_id, headers).await
 }
 
+/// Download a voice file (requires `musician` role). Supports HTTP `Range`.
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    tag = "files",
+    summary = "Download a voice file",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
+        ("fileId"   = Uuid,   Path,   description = "File ID"),
+        ("Range"    = Option<String>, Header,
+            description = "Byte-range request (e.g. `bytes=0-1023`). Returns 206 Partial Content."),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Full file body",
+            content_type = "application/octet-stream",
+            headers(
+                ("Content-Type"   = String, description = "MIME type of the stored file"),
+                ("Accept-Ranges"  = String, description = "Always `bytes`"),
+                ("Content-Length" = u64,    description = "File size in bytes"),
+            )),
+        (status = 206, description = "Partial content (Range satisfied)",
+            content_type = "application/octet-stream",
+            headers(("Content-Range" = String, description = "Satisfied byte range"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Range416,
+    )
+)]
 async fn download_voice_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -464,6 +589,27 @@ async fn do_list(
     }))
 }
 
+/// List full-score files for an arrangement (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{arrId}/files",
+    tag = "files",
+    summary = "List full-score files",
+    params(
+        ("orgId"  = Uuid, Path, description = "Organization ID"),
+        ("arrId"  = Uuid, Path, description = "Arrangement ID"),
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated file list",
+            body = inline(Page<FileResponse>)),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn list_score_files(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -473,6 +619,28 @@ async fn list_score_files(
     do_list(state, auth, org_id, arr_id, None, q).await
 }
 
+/// List voice files for a specific voice (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
+    tag = "files",
+    summary = "List voice files",
+    params(
+        ("orgId"    = Uuid, Path, description = "Organization ID"),
+        ("arrId"    = Uuid, Path, description = "Arrangement ID"),
+        ("voiceId"  = Uuid, Path, description = "Voice ID"),
+        ("limit"    = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset"   = Option<u32>, Query, description = "Page offset"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated file list",
+            body = inline(Page<FileResponse>)),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn list_voice_files(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -616,6 +784,35 @@ async fn do_replace(
     )))
 }
 
+/// Replace a full-score file in-place (owner/archivist; requires `If-Match`).
+///
+/// The replacement must carry the same `Content-Type` as the original. A
+/// format change requires uploading a new file instead. The MinIO object key
+/// is unchanged; MinIO versioning captures the content history.
+#[utoipa::path(
+    put,
+    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    tag = "files",
+    summary = "Replace a full-score file",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body(content = UploadForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "File replaced", body = FileResponse),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        Precondition412,
+        UnsupportedMedia415,
+        PayloadTooLarge413,
+    )
+)]
 async fn replace_score_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -629,6 +826,32 @@ async fn replace_score_file(
     .await
 }
 
+/// Replace a voice file in-place (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    put,
+    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    tag = "files",
+    summary = "Replace a voice file",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
+        ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body(content = UploadForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "File replaced", body = FileResponse),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        Precondition412,
+        UnsupportedMedia415,
+        PayloadTooLarge413,
+    )
+)]
 async fn replace_voice_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -694,6 +917,30 @@ async fn do_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Soft-delete a full-score file (owner/archivist; requires `If-Match`).
+///
+/// The MinIO object is retained; the DB row is hidden from listings. The
+/// object can be recovered via a future admin hard-delete / undelete path.
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    tag = "files",
+    summary = "Soft-delete a full-score file",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("fileId"   = Uuid,   Path,   description = "File ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "File soft-deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_score_file(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -703,6 +950,28 @@ async fn delete_score_file(
     do_delete(state, auth, request_id, org_id, arr_id, None, file_id).await
 }
 
+/// Soft-delete a voice file (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    tag = "files",
+    summary = "Soft-delete a voice file",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
+        ("fileId"   = Uuid,   Path,   description = "File ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "File soft-deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_voice_file(
     auth: BearerOrSession,
     State(state): State<AppState>,

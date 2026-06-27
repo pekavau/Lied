@@ -8,10 +8,10 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
 use axum::Json;
-use axum::Router;
 use serde::{Deserialize, Serialize};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::app_password::generate as generate_app_password;
@@ -23,69 +23,52 @@ use crate::domain::user;
 use crate::domain::{app_password, instrument};
 use crate::error::AppError;
 use crate::pagination::{Page, PageParams};
+use crate::routes::openapi::{CommonErrors, Conflict409, NotFound404};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
-#[derive(Serialize)]
+// ── API version ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct VersionInfo {
     api_version: &'static str,
 }
 
-pub fn router(state: AppState) -> Router<AppState> {
-    // The `/v1` tree accepts session-cookie *or* bearer auth (CLAUDE.md
-    // "Route-tree boundary"), so it needs the same `SessionManagerLayer` the
-    // `/admin` tree carries: without it the bare `Session` extractor in
-    // `mint_token` 500s, and `BearerOrSession` can never resolve a session
-    // cookie (it would silently fall through to bearer-only). The layer
-    // shares the store + cookie name with `/admin`, so a cookie set by
-    // `/admin/login` authenticates `/v1` calls too.
-    let session_layer =
-        crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
-
-    Router::new()
-        .route("/", get(version))
-        .route("/instruments", get(list_instruments))
-        // `POST /v1/tokens` runs the same `find_by_username` + `verify_password`
-        // as `/admin/login`, so it is the same brute-force surface and gets
-        // the same per-IP login rate-limit bucket (CLAUDE.md: login/password
-        // endpoints 10/min). Scoped to this route only, not the whole tree.
-        .route(
-            "/tokens",
-            post(mint_token).layer(login_rate_limit_layer(state.config.ratelimit_login_per_min)),
-        )
-        .route(
-            "/app-passwords",
-            get(list_app_passwords).post(create_app_password),
-        )
-        .route(
-            "/app-passwords/:id",
-            axum::routing::delete(revoke_app_password),
-        )
-        // Org/User/Membership management (issue #5) — see `routes::orgs` for
-        // the handlers; merged rather than re-declared here so that module
-        // owns its own route table end to end.
-        .merge(crate::routes::orgs::router())
-        // Work/Arrangement/Voice/Tag management (issue #6) — see
-        // `routes::arrangements`.
-        .merge(crate::routes::arrangements::router())
-        // File upload/download streamed to/from MinIO (issue #7) — see
-        // `routes::files`.
-        .merge(crate::routes::files::router())
-        .layer(session_layer)
-}
-
+/// Return the current API version string.
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "meta",
+    summary = "API version",
+    security(),
+    responses(
+        (status = 200, description = "Current API version", body = VersionInfo),
+    )
+)]
 async fn version() -> Json<VersionInfo> {
     Json(VersionInfo { api_version: "v1" })
 }
 
-/// `GET /v1/instruments?limit=&offset=` — paginated list of the
-/// instance-wide instrument vocabulary, ordered by display name.
-///
-/// Auth-gated as of issue #4: any authenticated identity (session or
-/// bearer) may read it — reads remain low-sensitivity (a static controlled
-/// vocabulary), but "authenticated" is now actually enforced rather than
-/// left open.
+// ── Instruments ─────────────────────────────────────────────────────────────
+
+/// List the instance-wide instrument controlled vocabulary, ordered by display name.
+#[utoipa::path(
+    get,
+    path = "/instruments",
+    tag = "instruments",
+    summary = "List instruments",
+    params(
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated instrument list",
+            body = inline(Page<instrument::Instrument>)),
+        CommonErrors,
+    )
+)]
 async fn list_instruments(
     _auth: BearerOrSession,
     State(state): State<AppState>,
@@ -104,7 +87,10 @@ async fn list_instruments(
     }))
 }
 
-#[derive(Deserialize)]
+// ── Token minting ────────────────────────────────────────────────────────────
+
+/// Request body for `POST /v1/tokens`.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct MintTokenRequest {
     /// Optional active org id to scope the token to (CLAUDE.md JWT claims:
@@ -112,27 +98,37 @@ struct MintTokenRequest {
     /// org-scoping enforcement is a later authorization concern; minting
     /// just records the claim.
     org: Option<Uuid>,
-    /// When the caller has no session (a pure programmatic client),
-    /// username+password authenticates the mint request directly. Ignored
-    /// if a valid session cookie is already present.
+    /// Login identifier. Required when no session cookie is present.
     username: Option<String>,
+    /// User's password. Required when no session cookie is present.
     password: Option<String>,
 }
 
-#[derive(Serialize)]
+/// Bearer JWT returned by `POST /v1/tokens`.
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct MintTokenResponse {
     token: String,
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// `POST /v1/tokens` — mint a fresh bearer JWT (CLAUDE.md demo: "obtain a
-/// bearer token and hit `/v1/instruments`"). Authenticated either by an
-/// existing session cookie (the common "I'm logged into the admin UI and
-/// want a token for a script" path) or by username+password in the request
-/// body (the pure-programmatic path, with no prior session). Chosen over a
-/// `/admin/...` location because this is a `/v1` JSON contract a
-/// programmatic client should be able to discover via OpenAPI.
+/// Mint a fresh bearer JWT from an existing session cookie or username/password.
+#[utoipa::path(
+    post,
+    path = "/tokens",
+    tag = "auth",
+    summary = "Mint a bearer token",
+    description = "Authenticate via an existing session cookie (common path: logged into admin UI) \
+                   or via `username`+`password` in the body (programmatic path). \
+                   The returned token is valid for the configured lifetime (default 30 days).",
+    security(),
+    request_body = MintTokenRequest,
+    responses(
+        (status = 200, description = "Bearer JWT minted", body = MintTokenResponse),
+        (status = 401, description = "Bad credentials"),
+        (status = 429, description = "Login rate limit exceeded"),
+    )
+)]
 async fn mint_token(
     State(state): State<AppState>,
     session: tower_sessions::Session,
@@ -217,30 +213,56 @@ async fn mint_token(
     }))
 }
 
-#[derive(Deserialize)]
+// ── App passwords ────────────────────────────────────────────────────────────
+
+/// Request body for `POST /v1/app-passwords`.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateAppPasswordRequest {
+    /// Human-readable label (e.g. "iPad in rehearsal room"). Must be unique
+    /// per user.
     name: String,
 }
 
-#[derive(Serialize)]
+/// Response from `POST /v1/app-passwords` — includes the plaintext token
+/// shown exactly once.
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateAppPasswordResponse {
     #[serde(flatten)]
     summary: app_password::AppPasswordSummary,
-    /// Shown exactly once, at creation (CLAUDE.md: "the plaintext is shown
-    /// to the user once and discarded server-side").
+    /// Plaintext token shown exactly once at creation.
+    ///
+    /// Format: `lied_<base64url(32 bytes)>`. Store it now — it cannot be
+    /// retrieved again.
     token: String,
 }
 
-/// `POST /v1/app-passwords` — create a new WebDAV app password for the
-/// authenticated user. Returns the plaintext token once.
+/// Create a new WebDAV app password for the authenticated user.
+///
+/// Returns the plaintext token exactly once; the server stores only an
+/// argon2id hash. Use the token as the password in
+/// `Authorization: Basic base64(username:token)` for WebDAV clients.
+#[utoipa::path(
+    post,
+    path = "/app-passwords",
+    tag = "app-passwords",
+    summary = "Create a WebDAV app password",
+    security(("bearer" = []), ("session" = [])),
+    request_body = CreateAppPasswordRequest,
+    responses(
+        (status = 201, description = "App password created; token shown once",
+            body = CreateAppPasswordResponse),
+        CommonErrors,
+        Conflict409,
+    )
+)]
 async fn create_app_password(
     auth: BearerOrSession,
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Json(body): Json<CreateAppPasswordRequest>,
-) -> Result<Json<CreateAppPasswordResponse>, AppError> {
+) -> Result<(StatusCode, Json<CreateAppPasswordResponse>), AppError> {
     let generated = generate_app_password()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to generate app password")))?;
 
@@ -273,14 +295,28 @@ async fn create_app_password(
     )
     .await;
 
-    Ok(Json(CreateAppPasswordResponse {
-        summary,
-        token: generated.plaintext,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateAppPasswordResponse {
+            summary,
+            token: generated.plaintext,
+        }),
+    ))
 }
 
-/// `GET /v1/app-passwords` — list the authenticated user's own app
-/// passwords (metadata only — never a hash or plaintext).
+/// List the authenticated user's own app passwords (metadata only — no hashes or plaintext).
+#[utoipa::path(
+    get,
+    path = "/app-passwords",
+    tag = "app-passwords",
+    summary = "List app passwords",
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "App password list",
+            body = Vec<app_password::AppPasswordSummary>),
+        CommonErrors,
+    )
+)]
 async fn list_app_passwords(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -289,9 +325,25 @@ async fn list_app_passwords(
     Ok(Json(items))
 }
 
-/// `DELETE /v1/app-passwords/{id}` — revoke one of the authenticated
-/// user's own app passwords. Revoking does not end any web session or
-/// invalidate any bearer token (the three auth paths are independent).
+/// Revoke one of the authenticated user's own app passwords.
+///
+/// Revoking does not end any web session or invalidate any bearer token —
+/// the three auth paths are independent.
+#[utoipa::path(
+    delete,
+    path = "/app-passwords/{id}",
+    tag = "app-passwords",
+    summary = "Revoke an app password",
+    params(
+        ("id" = Uuid, Path, description = "App password ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "App password revoked"),
+        CommonErrors,
+        NotFound404,
+    )
+)]
 async fn revoke_app_password(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -318,4 +370,44 @@ async fn revoke_app_password(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Router ───────────────────────────────────────────────────────────────────
+
+pub fn router(state: AppState) -> OpenApiRouter<AppState> {
+    // The `/v1` tree accepts session-cookie *or* bearer auth (CLAUDE.md
+    // "Route-tree boundary"), so it needs the same `SessionManagerLayer` the
+    // `/admin` tree carries: without it the bare `Session` extractor in
+    // `mint_token` 500s, and `BearerOrSession` can never resolve a session
+    // cookie (it would silently fall through to bearer-only). The layer
+    // shares the store + cookie name with `/admin`, so a cookie set by
+    // `/admin/login` authenticates `/v1` calls too.
+    let session_layer =
+        crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
+
+    // `POST /v1/tokens` runs the same `find_by_username` + `verify_password`
+    // as `/admin/login`, so it is the same brute-force surface and gets
+    // the same per-IP login rate-limit bucket (CLAUDE.md: login/password
+    // endpoints 10/min). Scoped to this route only, not the whole tree.
+    let token_router = OpenApiRouter::new()
+        .routes(routes!(mint_token))
+        .layer(login_rate_limit_layer(state.config.ratelimit_login_per_min));
+
+    OpenApiRouter::new()
+        .routes(routes!(version))
+        .routes(routes!(list_instruments))
+        .merge(token_router)
+        .routes(routes!(list_app_passwords, create_app_password))
+        .routes(routes!(revoke_app_password))
+        // Org/User/Membership management (issue #5) — see `routes::orgs` for
+        // the handlers; merged rather than re-declared here so that module
+        // owns its own route table end to end.
+        .merge(crate::routes::orgs::router())
+        // Work/Arrangement/Voice/Tag management (issue #6) — see
+        // `routes::arrangements`.
+        .merge(crate::routes::arrangements::router())
+        // File upload/download streamed to/from MinIO (issue #7) — see
+        // `routes::files`.
+        .merge(crate::routes::files::router())
+        .layer(session_layer)
 }

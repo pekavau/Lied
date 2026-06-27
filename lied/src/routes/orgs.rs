@@ -12,10 +12,10 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
 use axum::Json;
-use axum::Router;
 use serde::{Deserialize, Serialize};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::authz::{require_org_role_v1, require_system_admin};
@@ -26,26 +26,20 @@ use crate::domain::{organization, user};
 use crate::error::AppError;
 use crate::listing::{self, SortDirection};
 use crate::pagination::Page;
+use crate::routes::openapi::{
+    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/orgs", get(list_orgs).post(create_org))
-        .route(
-            "/orgs/:id",
-            get(get_org).patch(update_org).delete(delete_org),
-        )
-        .route(
-            "/orgs/:org_id/members",
-            get(list_members).post(create_member),
-        )
-        .route(
-            "/orgs/:org_id/members/:id",
-            get(get_member).patch(update_member).delete(delete_member),
-        )
-        .route("/users", get(list_users).post(create_user))
-        .route("/users/:id", get(get_user).delete(delete_user))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_orgs, create_org))
+        .routes(routes!(get_org, update_org, delete_org))
+        .routes(routes!(list_members, create_member))
+        .routes(routes!(get_member, update_member, delete_member))
+        .routes(routes!(list_users, create_user))
+        .routes(routes!(get_user, delete_user))
 }
 
 // ---------------------------------------------------------------------------
@@ -79,12 +73,12 @@ fn validation_error(report: garde::Report) -> AppError {
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct OrganizationResponse {
-    id: Uuid,
-    name: String,
-    slug: String,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct OrganizationResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<organization::Organization> for OrganizationResponse {
@@ -99,10 +93,43 @@ impl From<organization::Organization> for OrganizationResponse {
     }
 }
 
-/// `GET /v1/orgs?limit=&offset=&sort=&filter[name]=` — paginated, sorted,
-/// filtered organization listing. Open to any authenticated identity:
-/// browsing the org directory is low-sensitivity (CLAUDE.md's trust
-/// assumption is "every org in one instance trusts the other orgs").
+/// Request body for `POST /v1/orgs`.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct CreateOrgRequest {
+    name: String,
+}
+
+/// Request body for `PATCH /v1/orgs/{id}`.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateOrgRequest {
+    name: String,
+}
+
+/// List organizations (any authenticated identity; federation trust model).
+#[utoipa::path(
+    get,
+    path = "/orgs",
+    tag = "organizations",
+    summary = "List organizations",
+    params(
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction, e.g. `name:asc` (default). \
+                           Allowed fields: `name`, `created_at`."),
+        ("filter[name]" = Option<String>, Query,
+            description = "ILIKE filter on organization name"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated organization list",
+            body = inline(Page<OrganizationResponse>)),
+        CommonErrors,
+        Validation400,
+    )
+)]
 async fn list_orgs(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -149,14 +176,23 @@ async fn list_orgs(
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateOrgRequest {
-    name: String,
-}
-
-/// `POST /v1/orgs` — system-admin-only org provisioning (CLAUDE.md scope:
-/// "System-admin: create/delete Organizations").
+/// Provision a new organization (system-admin only).
+#[utoipa::path(
+    post,
+    path = "/orgs",
+    tag = "organizations",
+    summary = "Create an organization",
+    security(("bearer" = []), ("session" = [])),
+    request_body = CreateOrgRequest,
+    responses(
+        (status = 201, description = "Organization created", body = OrganizationResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+    )
+)]
 async fn create_org(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -202,8 +238,23 @@ async fn create_org(
     Ok((StatusCode::CREATED, Json(created.into())))
 }
 
-/// `GET /v1/orgs/{id}` — fetch one organization. Sets `ETag` from
-/// `updated_at` (CLAUDE.md optimistic concurrency).
+/// Fetch one organization by ID.
+#[utoipa::path(
+    get,
+    path = "/orgs/{id}",
+    tag = "organizations",
+    summary = "Get an organization",
+    params(
+        ("id" = Uuid, Path, description = "Organization ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Organization", body = OrganizationResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        NotFound404,
+    )
+)]
 async fn get_org(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -224,20 +275,28 @@ async fn get_org(
     Ok(response)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateOrgRequest {
-    name: String,
-}
-
-/// `PATCH /v1/orgs/{id}` — rename an organization. System-admin-gated:
-/// CLAUDE.md's Permission matrix lists "Org settings" as `owner`-only, but
-/// renaming the *organization itself* (vs. an in-org setting) sits above any
-/// single org's membership, so phase 1 keeps it at the instance-admin tier
-/// rather than introducing a separate self-service rename path; `slug` stays
-/// immutable (a dedicated, audited slug-rename op is a later/explicit
-/// operation per CLAUDE.md, not implemented here). Requires `If-Match`;
-/// stale or missing -> `412`.
+/// Rename an organization (system-admin only; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/orgs/{id}",
+    tag = "organizations",
+    summary = "Update an organization",
+    params(
+        ("id"       = Uuid,   Path,   description = "Organization ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = UpdateOrgRequest,
+    responses(
+        (status = 200, description = "Updated organization", body = OrganizationResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Precondition412,
+    )
+)]
 async fn update_org(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -279,9 +338,25 @@ async fn update_org(
     Ok(Json(updated.into()))
 }
 
-/// `DELETE /v1/orgs/{id}` — system-admin-only hard delete, cascading per
-/// CLAUDE.md's documented order (see [`organization::delete`]). Requires
-/// `If-Match`; stale or missing -> `412`.
+/// Hard-delete an organization and all its data (system-admin only; requires `If-Match`).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{id}",
+    tag = "organizations",
+    summary = "Delete an organization",
+    params(
+        ("id"       = Uuid,   Path,   description = "Organization ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Organization deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_org(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -301,12 +376,6 @@ async fn delete_org(
     listing::check_if_match(if_match, current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    // Audit BEFORE the delete so the org's name/slug are still readable for
-    // the payload. `audit_log.org_id` carries no FK to organization (migration
-    // 0020), so the row is "retained with their org_id ... after the org is
-    // gone" (CLAUDE.md) — the org_id value persists verbatim once the cascade
-    // removes the org, keeping it distinct from instance-wide events (which use
-    // a NULL org_id).
     audit(
         &state.db,
         &AuditContext {
@@ -334,7 +403,8 @@ async fn delete_org(
 // `deleted_at` on User, deletion is admin-gated hard delete).
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+/// Request body for `POST /v1/users`.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateUserRequest {
     username: String,
@@ -344,10 +414,30 @@ struct CreateUserRequest {
     is_system_admin: Option<bool>,
 }
 
-/// `GET /v1/users?limit=&offset=&sort=&filter[username]=` — paginated user
-/// listing. System-admin-only: a user directory is more sensitive than the
-/// org directory (emails, system-admin flags), and instance-level user
-/// management is the system-admin's job per CLAUDE.md scope.
+/// List users (system-admin only).
+#[utoipa::path(
+    get,
+    path = "/users",
+    tag = "users",
+    summary = "List users",
+    params(
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction, e.g. `username:asc` (default). \
+                           Allowed fields: `username`, `created_at`."),
+        ("filter[username]" = Option<String>, Query,
+            description = "ILIKE filter on username"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated user list",
+            body = inline(Page<user::User>)),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+    )
+)]
 async fn list_users(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -395,8 +485,23 @@ async fn list_users(
     }))
 }
 
-/// `POST /v1/users` — system-admin-only user provisioning (CLAUDE.md scope:
-/// "System-admin: create/delete ... Users").
+/// Provision a new user account (system-admin only).
+#[utoipa::path(
+    post,
+    path = "/users",
+    tag = "users",
+    summary = "Create a user",
+    security(("bearer" = []), ("session" = [])),
+    request_body = CreateUserRequest,
+    responses(
+        (status = 201, description = "User created", body = user::User,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+    )
+)]
 async fn create_user(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -463,8 +568,24 @@ async fn create_user(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// `GET /v1/users/{id}` — fetch one user. System-admin-only (see
-/// [`list_users`]). Sets `ETag` from `updated_at`.
+/// Fetch one user by ID (system-admin only).
+#[utoipa::path(
+    get,
+    path = "/users/{id}",
+    tag = "users",
+    summary = "Get a user",
+    params(
+        ("id" = Uuid, Path, description = "User ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "User", body = user::User,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn get_user(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -486,12 +607,29 @@ async fn get_user(
     Ok(response)
 }
 
-/// `DELETE /v1/users/{id}` — system-admin-only hard delete. Requires
-/// `If-Match`; stale or missing -> `412`. A user still referenced by a
-/// `NOT NULL` FK (active Membership, PartAssignment, GlobalAnnotation
-/// authorship) surfaces as a `409` rather than the raw DB FK-violation `500`
-/// — see [`user::delete`] doc comment for why phase 1 stops here instead of
-/// auto-reassigning/anonymizing those references.
+/// Hard-delete a user (system-admin only; requires `If-Match`).
+///
+/// Fails with `409` if the user is still referenced by a membership, part
+/// assignment, or annotation — reassign or remove those first.
+#[utoipa::path(
+    delete,
+    path = "/users/{id}",
+    tag = "users",
+    summary = "Delete a user",
+    params(
+        ("id"       = Uuid,   Path,   description = "User ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "User deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn delete_user(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -544,24 +682,21 @@ async fn delete_user(
 
 // ---------------------------------------------------------------------------
 // Memberships — owner-gated manage; member listing requires at least
-// `musician` (i.e. any member of the org) to read (CLAUDE.md Permission
-// matrix: "Read assigned parts" is everyone, and knowing who's in your own
-// org's roster is a reasonable extension of that — not a separate matrix row
-// in phase 1, since there is no narrower "read members" capability listed).
+// `musician` (i.e. any member of the org) to read.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct MembershipResponse {
-    id: Uuid,
-    user_id: Uuid,
-    organization_id: Uuid,
-    role: Role,
-    instrument_ids: Vec<Uuid>,
-    is_principal: bool,
-    principal_instrument_ids: Vec<Uuid>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+pub(crate) struct MembershipResponse {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub organization_id: Uuid,
+    pub role: Role,
+    pub instrument_ids: Vec<Uuid>,
+    pub is_principal: bool,
+    pub principal_instrument_ids: Vec<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<membership::Membership> for MembershipResponse {
@@ -580,8 +715,51 @@ impl From<membership::Membership> for MembershipResponse {
     }
 }
 
-/// `GET /v1/orgs/{orgId}/members?limit=&offset=&sort=&filter[role]=` —
-/// requires at least `musician` membership in the org (or system admin).
+/// Request body for `POST /v1/orgs/{orgId}/members`.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct CreateMemberRequest {
+    user_id: Uuid,
+    role: String,
+    instrument_ids: Option<Vec<Uuid>>,
+    is_principal: Option<bool>,
+    principal_instrument_ids: Option<Vec<Uuid>>,
+}
+
+/// Request body for `PATCH /v1/orgs/{orgId}/members/{id}`.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateMemberRequest {
+    role: String,
+    instrument_ids: Option<Vec<Uuid>>,
+    is_principal: Option<bool>,
+    principal_instrument_ids: Option<Vec<Uuid>>,
+}
+
+/// List memberships in an organization (requires `musician` role or system-admin).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/members",
+    tag = "members",
+    summary = "List members",
+    params(
+        ("orgId"  = Uuid, Path, description = "Organization ID"),
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction. Allowed: `created_at` (default), `role`."),
+        ("filter[role]" = Option<String>, Query,
+            description = "Filter by role: `owner`, `archivist`, `conductor`, `musician`"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated membership list",
+            body = inline(Page<MembershipResponse>)),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+    )
+)]
 async fn list_members(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -631,29 +809,27 @@ async fn list_members(
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateMemberRequest {
-    user_id: Uuid,
-    role: String,
-    instrument_ids: Option<Vec<Uuid>>,
-    is_principal: Option<bool>,
-    principal_instrument_ids: Option<Vec<Uuid>>,
-}
-
-fn parse_role_or_validation_error(raw: &str) -> Result<Role, AppError> {
-    Role::parse(raw).ok_or_else(|| {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("role"),
-            garde::Error::new("role must be one of: owner, archivist, conductor, musician"),
-        );
-        AppError::Validation(report)
-    })
-}
-
-/// `POST /v1/orgs/{orgId}/members` — owner-only (CLAUDE.md Permission
-/// matrix: "Manage members & roles" is owner-only).
+/// Add a user to an organization (owner only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/members",
+    tag = "members",
+    summary = "Add a member",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = CreateMemberRequest,
+    responses(
+        (status = 201, description = "Membership created", body = MembershipResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+        NotFound404,
+    )
+)]
 async fn create_member(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -737,6 +913,17 @@ fn membership_error_to_app_error(err: membership::MembershipError) -> AppError {
     }
 }
 
+fn parse_role_or_validation_error(raw: &str) -> Result<Role, AppError> {
+    Role::parse(raw).ok_or_else(|| {
+        let mut report = garde::Report::new();
+        report.append(
+            garde::Path::new("role"),
+            garde::Error::new("role must be one of: owner, archivist, conductor, musician"),
+        );
+        AppError::Validation(report)
+    })
+}
+
 /// Look up a membership and verify it belongs to `org_id` (path scoping
 /// consistency — a membership id from a different org must 404, not leak
 /// cross-org existence via a 200/403 split).
@@ -754,8 +941,25 @@ async fn find_member_scoped(
     Ok(found)
 }
 
-/// `GET /v1/orgs/{orgId}/members/{id}` — requires at least `musician`
-/// membership in the org. Sets `ETag` from `updated_at`.
+/// Fetch one membership by ID (requires `musician` role or system-admin).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/members/{id}",
+    tag = "members",
+    summary = "Get a member",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Membership ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Membership", body = MembershipResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn get_member(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -774,18 +978,30 @@ async fn get_member(
     Ok(response)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateMemberRequest {
-    role: String,
-    instrument_ids: Option<Vec<Uuid>>,
-    is_principal: Option<bool>,
-    principal_instrument_ids: Option<Vec<Uuid>>,
-}
-
-/// `PATCH /v1/orgs/{orgId}/members/{id}` — owner-only. Requires `If-Match`;
-/// stale or missing -> `412`. Demoting the org's last `owner` -> `409`
-/// (CLAUDE.md invariant).
+/// Update a member's role or instruments (owner only; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/orgs/{orgId}/members/{id}",
+    tag = "members",
+    summary = "Update a member",
+    params(
+        ("orgId"   = Uuid,   Path,   description = "Organization ID"),
+        ("id"      = Uuid,   Path,   description = "Membership ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = UpdateMemberRequest,
+    responses(
+        (status = 200, description = "Updated membership", body = MembershipResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn update_member(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -865,9 +1081,29 @@ async fn update_member(
     Ok(Json(updated.into()))
 }
 
-/// `DELETE /v1/orgs/{orgId}/members/{id}` — owner-only. Requires `If-Match`;
-/// stale or missing -> `412`. Removing the org's last `owner` -> `409`
-/// (CLAUDE.md invariant).
+/// Remove a member from an organization (owner only; requires `If-Match`).
+///
+/// Fails with `409` if this is the org's last owner.
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/members/{id}",
+    tag = "members",
+    summary = "Remove a member",
+    params(
+        ("orgId"   = Uuid,   Path,   description = "Organization ID"),
+        ("id"      = Uuid,   Path,   description = "Membership ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Member removed"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn delete_member(
     auth: BearerOrSession,
     State(state): State<AppState>,

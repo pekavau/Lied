@@ -1,6 +1,13 @@
 //! Infra tree: `/healthz`, `/readyz`, `/metrics`, `/openapi.json`, `/docs`.
 //!
 //! Unauthenticated by design (see CLAUDE.md "Route-tree boundary").
+//!
+//! `router(api)` takes the fully-populated [`utoipa::openapi::OpenApi`] built
+//! by `routes/mod.rs` via `OpenApiRouter::split_for_parts()` and serves it at
+//! `/openapi.json`. The stub `ApiDoc` that previously lived here has been
+//! removed; the real document is now assembled from the per-handler
+//! `#[utoipa::path]` annotations and the `routes!` macro across the whole `/v1`
+//! tree (see `routes/openapi.rs` for the base `ApiDoc` seed).
 
 use std::time::Duration;
 
@@ -8,8 +15,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
-use utoipa::OpenApi;
+use axum::{Json, Router};
 use utoipa_rapidoc::RapiDoc;
 
 use crate::state::AppState;
@@ -20,16 +26,16 @@ use crate::state::AppState;
 /// seconds) instead of returning a prompt 503.
 const READYZ_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(OpenApi)]
-#[openapi(info(title = "Lied API", version = "0.1.0"))]
-struct ApiDoc;
-
-pub fn router() -> Router<AppState> {
+/// Build the infra router. `api` is the fully-populated `OpenApi` document
+/// produced by `OpenApiRouter::split_for_parts()` after all `/v1` handlers
+/// have been registered; it replaces the empty stub that used to live here.
+pub fn router(api: utoipa::openapi::OpenApi) -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .route("/openapi.json", get(openapi_json))
+        // Serve the real, fully-populated spec (not the stub).
+        .route("/openapi.json", get(move || async move { Json(api) }))
         .route("/docs", get(docs))
 }
 
@@ -88,10 +94,6 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         Some(handle) => (StatusCode::OK, handle.render()),
         None => (StatusCode::NOT_FOUND, String::new()),
     }
-}
-
-async fn openapi_json() -> impl IntoResponse {
-    axum::Json(ApiDoc::openapi())
 }
 
 /// Gate for the RapiDoc UI: 404 when `LIED_DOCS_ENABLED=false`. The

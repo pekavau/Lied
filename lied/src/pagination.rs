@@ -29,9 +29,9 @@ impl PageParams {
 }
 
 /// The `{ items, total, limit, offset }` response envelope.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Page<T> {
+pub struct Page<T: utoipa::ToSchema> {
     pub items: Vec<T>,
     pub total: i64,
     pub limit: u32,

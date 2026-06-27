@@ -3,28 +3,14 @@
 //! `/v1/orgs/{orgId}/arrangements/{id}/tags`, `/v1/orgs/{orgId}/tags` —
 //! issue #6 (Arrangement metadata management: Works, Arrangements, Voices,
 //! Tags — the catalog backbone).
-//!
-//! Follows the conventions established in [`crate::routes::orgs`]:
-//! allowlisted sort/filter (`crate::listing`), ETag/`If-Match` optimistic
-//! concurrency, RFC 7807 errors via [`AppError`], and an `audit()` call on
-//! every write.
-//!
-//! **Undelete REST shape.** No existing entity in this codebase has a
-//! soft-delete + undelete pair yet exposed over `/v1` (Organization/User are
-//! hard-delete-only). This module establishes the convention:
-//! `POST /v1/.../{id}/undelete` — a dedicated action sub-resource, mirroring
-//! how `/v1/app-passwords/{id}` uses `DELETE` for revoke (a state transition,
-//! not a representation replacement). `DELETE` soft-deletes (still requires
-//! `If-Match`, like every other mutating verb); `POST .../undelete` reverses
-//! it. Both are audited.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
 use axum::Json;
-use axum::Router;
 use serde::{Deserialize, Serialize};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::authz::require_org_role_v1;
@@ -35,57 +21,36 @@ use crate::domain::{arrangement, tag, voice, work};
 use crate::error::AppError;
 use crate::listing::{self, SortDirection};
 use crate::pagination::Page;
+use crate::routes::openapi::{
+    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/works", get(list_works).post(create_work))
-        .route(
-            "/works/:id",
-            get(get_work).patch(update_work).delete(delete_work),
-        )
-        .route(
-            "/orgs/:org_id/arrangements",
-            get(list_arrangements).post(create_arrangement),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:id",
-            get(get_arrangement)
-                .patch(update_arrangement)
-                .delete(delete_arrangement),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:id/undelete",
-            post(undelete_arrangement),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:id/voices",
-            get(list_voices).post(create_voice),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arrangement_id/voices/:id",
-            get(get_voice).patch(update_voice).delete(delete_voice),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arrangement_id/voices/:id/undelete",
-            post(undelete_voice),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:id/tags",
-            get(list_arrangement_tags).post(attach_tag),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arrangement_id/tags/:tag_id",
-            axum::routing::delete(detach_tag),
-        )
-        .route("/orgs/:org_id/tags", get(list_tags).post(create_tag))
-        .route(
-            "/orgs/:org_id/tags/:id",
-            get(get_tag).patch(update_tag).delete(delete_tag),
-        )
-        .route("/orgs/:org_id/tags/:id/undelete", post(undelete_tag))
+pub fn router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(list_works, create_work))
+        .routes(routes!(get_work, update_work, delete_work))
+        .routes(routes!(list_arrangements, create_arrangement))
+        .routes(routes!(
+            get_arrangement,
+            update_arrangement,
+            delete_arrangement
+        ))
+        .routes(routes!(undelete_arrangement))
+        .routes(routes!(list_voices, create_voice))
+        .routes(routes!(get_voice, update_voice, delete_voice))
+        .routes(routes!(undelete_voice))
+        .routes(routes!(list_arrangement_tags, attach_tag))
+        .routes(routes!(detach_tag))
+        .routes(routes!(list_tags, create_tag))
+        .routes(routes!(get_tag, update_tag, delete_tag))
+        .routes(routes!(undelete_tag))
 }
+
+// ---------------------------------------------------------------------------
+// Shared helpers.
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct ListQuery {
@@ -120,12 +85,47 @@ fn etag_response<T: Serialize>(
 }
 
 // ---------------------------------------------------------------------------
-// Work — instance-wide. Create: any authenticated user with >= 1 Membership
-// in any org. Edit/delete: creator or system admin (CLAUDE.md Decisions).
+// Work — instance-wide.
 // ---------------------------------------------------------------------------
 
-/// `GET /v1/works?limit=&offset=&sort=&filter[title]=&filter[composer]=` —
-/// open to any authenticated identity (instance-wide catalog browsing).
+/// Request/response body for works.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorkRequest {
+    title: String,
+    composer: Option<String>,
+}
+
+/// Request body for `PATCH /v1/works/{id}`.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateWorkRequest {
+    title: String,
+    composer: Option<String>,
+}
+
+/// List abstract musical works (any authenticated identity).
+#[utoipa::path(
+    get,
+    path = "/works",
+    tag = "works",
+    summary = "List works",
+    params(
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction. Allowed: `title` (default asc), `created_at`."),
+        ("filter[title]"    = Option<String>, Query, description = "ILIKE filter on title"),
+        ("filter[composer]" = Option<String>, Query, description = "ILIKE filter on composer"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated work list",
+            body = inline(Page<work::Work>)),
+        CommonErrors,
+        Validation400,
+    )
+)]
 async fn list_works(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -177,16 +177,22 @@ async fn list_works(
     }))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateWorkRequest {
-    title: String,
-    composer: Option<String>,
-}
-
-/// `POST /v1/works` — open to any authenticated user holding at least one
-/// `Membership` (in any org). CLAUDE.md Decisions: "creating a Work is open
-/// to any authenticated user with at least one Membership in any org."
+/// Create an abstract work (any authenticated user with at least one membership).
+#[utoipa::path(
+    post,
+    path = "/works",
+    tag = "works",
+    summary = "Create a work",
+    security(("bearer" = []), ("session" = [])),
+    request_body = CreateWorkRequest,
+    responses(
+        (status = 201, description = "Work created", body = work::Work,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+    )
+)]
 async fn create_work(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -235,7 +241,23 @@ async fn create_work(
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// `GET /v1/works/{id}` — open to any authenticated identity. Sets `ETag`.
+/// Fetch one work by ID.
+#[utoipa::path(
+    get,
+    path = "/works/{id}",
+    tag = "works",
+    summary = "Get a work",
+    params(
+        ("id" = Uuid, Path, description = "Work ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Work", body = work::Work,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        NotFound404,
+    )
+)]
 async fn get_work(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -248,15 +270,28 @@ async fn get_work(
     Ok(etag_response(found.clone(), found.updated_at))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateWorkRequest {
-    title: String,
-    composer: Option<String>,
-}
-
-/// `PATCH /v1/works/{id}` — creator or system admin only. Requires
-/// `If-Match`; stale or missing -> `412`.
+/// Update a work's title or composer (creator or system-admin only; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/works/{id}",
+    tag = "works",
+    summary = "Update a work",
+    params(
+        ("id"       = Uuid,   Path,   description = "Work ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = UpdateWorkRequest,
+    responses(
+        (status = 200, description = "Updated work", body = work::Work,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Precondition412,
+    )
+)]
 async fn update_work(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -309,10 +344,28 @@ async fn update_work(
     Ok(Json(updated))
 }
 
-/// `DELETE /v1/works/{id}` — creator or system admin only. Hard delete (no
-/// `deleted_at` on Work). Requires `If-Match`; stale or missing -> `412`. A
-/// Work still referenced by a live Arrangement -> `409` (FK violation,
-/// mapped cleanly; see [`work::delete`] doc comment).
+/// Hard-delete a work (creator or system-admin; requires `If-Match`).
+///
+/// Fails with `409` if the work is still referenced by a live arrangement.
+#[utoipa::path(
+    delete,
+    path = "/works/{id}",
+    tag = "works",
+    summary = "Delete a work",
+    params(
+        ("id"       = Uuid,   Path,   description = "Work ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Work deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn delete_work(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -364,32 +417,31 @@ async fn delete_work(
 }
 
 // ---------------------------------------------------------------------------
-// Arrangement — org-scoped. owner/archivist gated (CLAUDE.md Permission
-// matrix: "Upload/edit arrangements & files").
+// Arrangement — org-scoped.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct ArrangementResponse {
-    id: Uuid,
-    organization_id: Uuid,
-    title: String,
-    slug: String,
-    work_id: Option<Uuid>,
-    instrumentation: Option<String>,
-    arranger: Option<String>,
-    publisher: Option<String>,
-    purchase_date: Option<chrono::NaiveDate>,
-    license_notes: Option<String>,
-    copy_count_allowed: Option<i32>,
-    status: String,
-    duration_seconds: Option<i32>,
-    difficulty: Option<i16>,
-    difficulty_ratings: Option<serde_json::Value>,
-    difficulty_notes: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct ArrangementResponse {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub title: String,
+    pub slug: String,
+    pub work_id: Option<Uuid>,
+    pub instrumentation: Option<String>,
+    pub arranger: Option<String>,
+    pub publisher: Option<String>,
+    pub purchase_date: Option<chrono::NaiveDate>,
+    pub license_notes: Option<String>,
+    pub copy_count_allowed: Option<i32>,
+    pub status: String,
+    pub duration_seconds: Option<i32>,
+    pub difficulty: Option<i16>,
+    pub difficulty_ratings: Option<serde_json::Value>,
+    pub difficulty_notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<arrangement::Arrangement> for ArrangementResponse {
@@ -418,7 +470,8 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
     }
 }
 
-#[derive(Deserialize)]
+/// Request body for creating or updating an arrangement.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ArrangementRequest {
     title: String,
@@ -454,11 +507,32 @@ fn arrangement_error_to_app_error(err: arrangement::ArrangementError) -> AppErro
     }
 }
 
-/// `GET /v1/orgs/{orgId}/arrangements?limit=&offset=&sort=&filter[status]=&q=`
-/// — requires at least `musician` membership (read access; CLAUDE.md
-/// Permission matrix: "Read assigned parts" extends to browsing the org's
-/// own catalog). `q` performs the phase-1 ILIKE search across
-/// `Arrangement.title` and `Work.composer`.
+/// List arrangements in an organization (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements",
+    tag = "arrangements",
+    summary = "List arrangements",
+    params(
+        ("orgId"  = Uuid, Path, description = "Organization ID"),
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction. Allowed: `title` (default asc), `created_at`, `status`."),
+        ("filter[status]" = Option<String>, Query,
+            description = "Filter by status: `active` or `archived`"),
+        ("q" = Option<String>, Query,
+            description = "ILIKE search across title and composer"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated arrangement list",
+            body = inline(Page<ArrangementResponse>)),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+    )
+)]
 async fn list_arrangements(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -509,7 +583,27 @@ async fn list_arrangements(
     }))
 }
 
-/// `POST /v1/orgs/{orgId}/arrangements` — owner/archivist only.
+/// Add an arrangement to an organization's archive (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements",
+    tag = "arrangements",
+    summary = "Create an arrangement",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = ArrangementRequest,
+    responses(
+        (status = 201, description = "Arrangement created", body = ArrangementResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+        NotFound404,
+    )
+)]
 async fn create_arrangement(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -574,8 +668,6 @@ async fn create_arrangement(
     Ok((StatusCode::CREATED, Json(created.into())))
 }
 
-/// Look up an arrangement and verify it belongs to `org_id` (path-scoping
-/// consistency, same as `find_member_scoped` in `routes::orgs`).
 async fn find_arrangement_scoped(
     state: &AppState,
     org_id: Uuid,
@@ -590,8 +682,6 @@ async fn find_arrangement_scoped(
     Ok(found)
 }
 
-/// Same as [`find_arrangement_scoped`] but also returns soft-deleted rows —
-/// used by `undelete`.
 async fn find_arrangement_scoped_including_deleted(
     state: &AppState,
     org_id: Uuid,
@@ -606,7 +696,25 @@ async fn find_arrangement_scoped_including_deleted(
     Ok(found)
 }
 
-/// `GET /v1/orgs/{orgId}/arrangements/{id}` — requires at least `musician`.
+/// Fetch one arrangement by ID (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{id}",
+    tag = "arrangements",
+    summary = "Get an arrangement",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Arrangement", body = ArrangementResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn get_arrangement(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -618,9 +726,30 @@ async fn get_arrangement(
     Ok(etag_response(ArrangementResponse::from(found), updated_at))
 }
 
-/// `PATCH /v1/orgs/{orgId}/arrangements/{id}` — owner/archivist only. `slug`
-/// and `organizationId` are immutable; not accepted in the body. Requires
-/// `If-Match`; stale or missing -> `412`.
+/// Update arrangement metadata (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/orgs/{orgId}/arrangements/{id}",
+    tag = "arrangements",
+    summary = "Update an arrangement",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("id"       = Uuid,   Path,   description = "Arrangement ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = ArrangementRequest,
+    responses(
+        (status = 200, description = "Updated arrangement", body = ArrangementResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn update_arrangement(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -690,10 +819,26 @@ async fn update_arrangement(
     Ok(Json(updated.into()))
 }
 
-/// `DELETE /v1/orgs/{orgId}/arrangements/{id}` — owner/archivist only.
-/// Soft-delete only (`deleted_at` set on this row, not its Voices —
-/// CLAUDE.md hide-with-references). Requires `If-Match`; stale or missing
-/// -> `412`.
+/// Soft-delete an arrangement (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/arrangements/{id}",
+    tag = "arrangements",
+    summary = "Soft-delete an arrangement",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("id"       = Uuid,   Path,   description = "Arrangement ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Arrangement soft-deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_arrangement(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -730,8 +875,24 @@ async fn delete_arrangement(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /v1/orgs/{orgId}/arrangements/{id}/undelete` — owner/archivist
-/// only. Clears `deleted_at`.
+/// Restore a soft-deleted arrangement (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{id}/undelete",
+    tag = "arrangements",
+    summary = "Undelete an arrangement",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Arrangement restored"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn undelete_arrangement(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -765,21 +926,20 @@ async fn undelete_arrangement(
 }
 
 // ---------------------------------------------------------------------------
-// Voice — under an Arrangement. owner/archivist gated (same matrix row as
-// Arrangement).
+// Voice — under an Arrangement.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct VoiceResponse {
-    id: Uuid,
-    arrangement_id: Uuid,
-    name: String,
-    slug: String,
-    instrument_id: Uuid,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct VoiceResponse {
+    pub id: Uuid,
+    pub arrangement_id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub instrument_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<voice::Voice> for VoiceResponse {
@@ -797,7 +957,8 @@ impl From<voice::Voice> for VoiceResponse {
     }
 }
 
-#[derive(Deserialize)]
+/// Request body for creating or updating a voice.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct VoiceRequest {
     name: String,
@@ -829,8 +990,32 @@ struct VoiceListQuery {
     sort: Option<String>,
 }
 
-/// `GET /v1/orgs/{orgId}/arrangements/{id}/voices?limit=&offset=&sort=&filter[instrumentId]=`
-/// — requires at least `musician`.
+/// List voices in an arrangement (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{id}/voices",
+    tag = "voices",
+    summary = "List voices",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction. Allowed: `name` (default asc), `created_at`."),
+        ("filter[instrumentId]" = Option<String>, Query,
+            description = "Filter by instrument UUID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated voice list",
+            body = inline(Page<VoiceResponse>)),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        NotFound404,
+    )
+)]
 async fn list_voices(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -840,9 +1025,6 @@ async fn list_voices(
 ) -> Result<Json<Page<VoiceResponse>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
-    // Confirm the arrangement exists (and is in this org / not deleted)
-    // before listing its voices, so an unknown arrangement id 404s instead
-    // of silently returning an empty page.
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
 
     let (limit, offset) = crate::pagination::PageParams {
@@ -892,7 +1074,28 @@ async fn list_voices(
     }))
 }
 
-/// `POST /v1/orgs/{orgId}/arrangements/{id}/voices` — owner/archivist only.
+/// Add a voice (instrument part) to an arrangement (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{id}/voices",
+    tag = "voices",
+    summary = "Create a voice",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = VoiceRequest,
+    responses(
+        (status = 201, description = "Voice created", body = VoiceResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+        NotFound404,
+    )
+)]
 async fn create_voice(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -945,10 +1148,6 @@ async fn create_voice(
     Ok((StatusCode::CREATED, Json(created.into())))
 }
 
-/// Resolve a voice and verify it belongs to `arrangement_id` **and** that the
-/// arrangement belongs to `org_id`. A Voice has no `organization_id` of its
-/// own, so the org check must go through the parent — without it, a caller
-/// with a role in *any* org could read/modify another org's voices by id.
 async fn find_voice_scoped(
     state: &AppState,
     org_id: Uuid,
@@ -965,9 +1164,6 @@ async fn find_voice_scoped(
     Ok(found)
 }
 
-/// Same as [`find_voice_scoped`] but tolerates a soft-deleted voice (and a
-/// soft-deleted parent arrangement) — used by `undelete`. The org-ownership
-/// check still applies.
 async fn find_voice_scoped_including_deleted(
     state: &AppState,
     org_id: Uuid,
@@ -984,8 +1180,26 @@ async fn find_voice_scoped_including_deleted(
     Ok(found)
 }
 
-/// `GET /v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}` —
-/// requires at least `musician`.
+/// Fetch one voice by ID (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    tag = "voices",
+    summary = "Get a voice",
+    params(
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
+        ("id"            = Uuid, Path, description = "Voice ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Voice", body = VoiceResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn get_voice(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -997,8 +1211,31 @@ async fn get_voice(
     Ok(etag_response(VoiceResponse::from(found), updated_at))
 }
 
-/// `PATCH /v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}` —
-/// owner/archivist only. `slug` is immutable. Requires `If-Match`.
+/// Update a voice's name or instrument (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    tag = "voices",
+    summary = "Update a voice",
+    params(
+        ("orgId"         = Uuid,   Path,   description = "Organization ID"),
+        ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
+        ("id"            = Uuid,   Path,   description = "Voice ID"),
+        ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = VoiceRequest,
+    responses(
+        (status = 200, description = "Updated voice", body = VoiceResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn update_voice(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1048,8 +1285,27 @@ async fn update_voice(
     Ok(Json(updated.into()))
 }
 
-/// `DELETE /v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}` —
-/// owner/archivist only. Soft-delete. Requires `If-Match`.
+/// Soft-delete a voice (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    tag = "voices",
+    summary = "Soft-delete a voice",
+    params(
+        ("orgId"         = Uuid,   Path,   description = "Organization ID"),
+        ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
+        ("id"            = Uuid,   Path,   description = "Voice ID"),
+        ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Voice soft-deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_voice(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1086,8 +1342,25 @@ async fn delete_voice(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}/undelete`
-/// — owner/archivist only.
+/// Restore a soft-deleted voice (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}/undelete",
+    tag = "voices",
+    summary = "Undelete a voice",
+    params(
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
+        ("id"            = Uuid, Path, description = "Voice ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Voice restored"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn undelete_voice(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1121,20 +1394,19 @@ async fn undelete_voice(
 }
 
 // ---------------------------------------------------------------------------
-// Tag + ArrangementTag — owner/archivist gated (CLAUDE.md Permission
-// matrix: "Manage tags").
+// Tag + ArrangementTag — owner/archivist gated.
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct TagResponse {
-    id: Uuid,
-    organization_id: Uuid,
-    name: String,
-    kind: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+pub(crate) struct TagResponse {
+    pub id: Uuid,
+    pub organization_id: Uuid,
+    pub name: String,
+    pub kind: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl From<tag::Tag> for TagResponse {
@@ -1151,7 +1423,8 @@ impl From<tag::Tag> for TagResponse {
     }
 }
 
-#[derive(Deserialize)]
+/// Request body for creating or updating a tag.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct TagRequest {
     name: String,
@@ -1174,8 +1447,30 @@ struct TagListQuery {
     sort: Option<String>,
 }
 
-/// `GET /v1/orgs/{orgId}/tags?limit=&offset=&sort=&filter[kind]=` — requires
-/// at least `musician`.
+/// List tags in an organization (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/tags",
+    tag = "tags",
+    summary = "List tags",
+    params(
+        ("orgId"  = Uuid, Path, description = "Organization ID"),
+        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>, Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query,
+            description = "Sort field and direction. Allowed: `name` (default asc), `kind`, `created_at`."),
+        ("filter[kind]" = Option<String>, Query,
+            description = "Filter by tag kind, e.g. `theme`, `mood`, `era`"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Paginated tag list",
+            body = inline(Page<TagResponse>)),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+    )
+)]
 async fn list_tags(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1225,7 +1520,26 @@ async fn list_tags(
     }))
 }
 
-/// `POST /v1/orgs/{orgId}/tags` — owner/archivist only.
+/// Create a tag in an organization (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/tags",
+    tag = "tags",
+    summary = "Create a tag",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = TagRequest,
+    responses(
+        (status = 201, description = "Tag created", body = TagResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        Validation400,
+        Conflict409,
+    )
+)]
 async fn create_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1283,7 +1597,25 @@ async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag
     Ok(found)
 }
 
-/// `GET /v1/orgs/{orgId}/tags/{id}` — requires at least `musician`.
+/// Fetch one tag by ID (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/tags/{id}",
+    tag = "tags",
+    summary = "Get a tag",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Tag ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Tag", body = TagResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn get_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1295,8 +1627,30 @@ async fn get_tag(
     Ok(etag_response(TagResponse::from(found), updated_at))
 }
 
-/// `PATCH /v1/orgs/{orgId}/tags/{id}` — owner/archivist only. Requires
-/// `If-Match`.
+/// Update a tag's name or kind (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    patch,
+    path = "/orgs/{orgId}/tags/{id}",
+    tag = "tags",
+    summary = "Update a tag",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("id"       = Uuid,   Path,   description = "Tag ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = TagRequest,
+    responses(
+        (status = 200, description = "Updated tag", body = TagResponse,
+            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Validation400,
+        Conflict409,
+        Precondition412,
+    )
+)]
 async fn update_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1346,8 +1700,26 @@ async fn update_tag(
     Ok(Json(updated.into()))
 }
 
-/// `DELETE /v1/orgs/{orgId}/tags/{id}` — owner/archivist only. Soft-delete.
-/// Requires `If-Match`.
+/// Soft-delete a tag (owner/archivist; requires `If-Match`).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/tags/{id}",
+    tag = "tags",
+    summary = "Soft-delete a tag",
+    params(
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("id"       = Uuid,   Path,   description = "Tag ID"),
+        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Tag soft-deleted"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Precondition412,
+    )
+)]
 async fn delete_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1384,7 +1756,24 @@ async fn delete_tag(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /v1/orgs/{orgId}/tags/{id}/undelete` — owner/archivist only.
+/// Restore a soft-deleted tag (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/tags/{id}/undelete",
+    tag = "tags",
+    summary = "Undelete a tag",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Tag ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Tag restored"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn undelete_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1393,11 +1782,9 @@ async fn undelete_tag(
 ) -> Result<StatusCode, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
-    // tag::find_by_id hides soft-deleted rows; resolve via a direct check so
-    // undelete can find the very row we're restoring. Tag has no
-    // "_including_deleted" finder yet (only needed here), so query it inline.
-    let found = sqlx::query_as!(
-        TagRow,
+    // Fetch the tag (including soft-deleted) to verify org scope and gather
+    // audit fields. `tag::find_by_id` filters deleted rows, so we query directly.
+    let row = sqlx::query!(
         r#"SELECT organization_id, name, kind FROM tag WHERE id = $1"#,
         id,
     )
@@ -1405,7 +1792,7 @@ async fn undelete_tag(
     .await
     .map_err(AppError::Database)?
     .ok_or(AppError::NotFound)?;
-    if found.organization_id != org_id {
+    if row.organization_id != org_id {
         return Err(AppError::NotFound);
     }
 
@@ -1424,21 +1811,36 @@ async fn undelete_tag(
         "tag.undelete",
         "tag",
         Some(id),
-        serde_json::json!({ "name": found.name, "kind": found.kind }),
+        serde_json::json!({ "name": row.name, "kind": row.kind }),
     )
     .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-struct TagRow {
-    organization_id: Uuid,
-    name: String,
-    kind: Option<String>,
-}
+// ---------------------------------------------------------------------------
+// ArrangementTag — tag-to-arrangement attach/detach/list.
+// ---------------------------------------------------------------------------
 
-/// `GET /v1/orgs/{orgId}/arrangements/{id}/tags` — list tags attached to an
-/// arrangement. Requires at least `musician`.
+/// List tags attached to a specific arrangement (requires `musician` role).
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/arrangements/{id}/tags",
+    tag = "tags",
+    summary = "List arrangement tags",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Tags attached to the arrangement",
+            body = Vec<TagResponse>),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn list_arrangement_tags(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1451,14 +1853,33 @@ async fn list_arrangement_tags(
     Ok(Json(tags.into_iter().map(TagResponse::from).collect()))
 }
 
-#[derive(Deserialize)]
+/// Request body for attaching a tag to an arrangement.
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AttachTagRequest {
     tag_id: Uuid,
 }
 
-/// `POST /v1/orgs/{orgId}/arrangements/{id}/tags` — owner/archivist only.
-/// Attaches an existing tag to the arrangement.
+/// Attach an existing tag to an arrangement (owner/archivist only).
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/arrangements/{id}/tags",
+    tag = "tags",
+    summary = "Attach a tag to an arrangement",
+    params(
+        ("orgId" = Uuid, Path, description = "Organization ID"),
+        ("id"    = Uuid, Path, description = "Arrangement ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = AttachTagRequest,
+    responses(
+        (status = 201, description = "Tag attached"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+    )
+)]
 async fn attach_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,
@@ -1498,8 +1919,25 @@ async fn attach_tag(
     Ok(StatusCode::CREATED)
 }
 
-/// `DELETE /v1/orgs/{orgId}/arrangements/{arrangementId}/tags/{tagId}` —
-/// owner/archivist only. Detaches a tag from the arrangement.
+/// Detach a tag from an arrangement (owner/archivist only).
+#[utoipa::path(
+    delete,
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/tags/{tagId}",
+    tag = "tags",
+    summary = "Detach a tag from an arrangement",
+    params(
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
+        ("tagId"         = Uuid, Path, description = "Tag ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 204, description = "Tag detached"),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
 async fn detach_tag(
     auth: BearerOrSession,
     State(state): State<AppState>,

@@ -17,6 +17,7 @@ pub mod admin;
 pub mod arrangements;
 pub mod files;
 pub mod infra;
+pub mod openapi;
 pub mod orgs;
 pub mod v1;
 pub mod webdav;
@@ -27,6 +28,8 @@ use axum::http::{HeaderName, Request};
 use axum::Router;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -74,10 +77,18 @@ pub fn request_id_from_parts(parts: &Parts) -> Uuid {
 pub fn build_router(state: AppState) -> Router {
     let header_name = HeaderName::from_static(REQUEST_ID_HEADER);
 
-    Router::new()
-        .merge(infra::router())
-        .nest("/admin", admin::router(&state))
+    // Build the `/v1` tree via `OpenApiRouter` so every `#[utoipa::path]`
+    // annotation is registered automatically; `split_for_parts()` yields
+    // the standard axum router (for composition) and the fully-populated
+    // `OpenApi` document (for serving at `/openapi.json`).
+    let (v1_router, api) = OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .nest("/v1", v1::router(state.clone()))
+        .split_for_parts();
+
+    Router::new()
+        .merge(infra::router(api))
+        .nest("/admin", admin::router(&state))
+        .merge(v1_router)
         .merge(webdav::router(&state))
         .with_state(state)
         .layer(
