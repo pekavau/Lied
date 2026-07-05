@@ -437,3 +437,213 @@ async fn musician_annotation_put_is_audited() {
     .expect("count");
     assert_eq!(audited, 1, "annotation create must be audited");
 }
+
+#[tokio::test]
+async fn conductor_cannot_write_files() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let _voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    // Conductor is "staff" for reads but must NOT write files — only
+    // owner/archivist may (CLAUDE.md permission matrix).
+    let cond = seed_user(&ctx.pool, org, "connie", Some("conductor")).await;
+
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf";
+    let (status, _) = send(
+        &ctx.app,
+        request("PUT", uri, &basic(&cond), b"%PDF x".to_vec()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "conductor file PUT must be 403"
+    );
+}
+
+#[tokio::test]
+async fn musician_cannot_write_voice_file() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let muso = seed_user(&ctx.pool, org, "muso", Some("musician")).await;
+    assign(&ctx.pool, org, arr, voice, muso.id).await; // assigned → path is visible
+
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf";
+    let (status, _) = send(
+        &ctx.app,
+        request("PUT", uri, &basic(&muso), b"%PDF x".to_vec()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "musician file PUT must be 403"
+    );
+}
+
+#[tokio::test]
+async fn full_score_is_hidden_from_a_musician() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let muso = seed_user(&ctx.pool, org, "muso", Some("musician")).await;
+    assign(&ctx.pool, org, arr, voice, muso.id).await;
+
+    // Archivist uploads a full score.
+    let score_uri = "/orgs/acme/arrangements/bolero/score/full.pdf";
+    let (s, _) = send(
+        &ctx.app,
+        request("PUT", score_uri, &basic(&arch), b"%PDF score".to_vec()),
+    )
+    .await;
+    assert!(s.is_success(), "archivist score PUT should succeed");
+
+    // The `score` dir is absent from the musician's arrangement listing...
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/arrangements/bolero",
+            &basic(&muso),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("/score"),
+        "musician must not see the score dir:\n{body}"
+    );
+    assert!(
+        body.contains("/voices"),
+        "musician should see the voices dir"
+    );
+
+    // ...and a direct GET of a score file is 404 (hidden, not 403).
+    let (status, _) = send(&ctx.app, request("GET", score_uri, &basic(&muso), vec![])).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn non_author_cannot_write_another_users_annotation() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let _alice = seed_user(&ctx.pool, org, "alice", Some("musician")).await;
+    let bob = seed_user(&ctx.pool, org, "bob", Some("musician")).await;
+    assign(&ctx.pool, org, arr, voice, bob.id).await; // bob may see the voice
+
+    // Bob writes into ALICE's annotations dir → 403 (author-only-writable).
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/annotations/alice/x.pdf";
+    let (status, _) = send(
+        &ctx.app,
+        request("PUT", uri, &basic(&bob), b"%PDF x".to_vec()),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn guest_with_assignment_but_no_membership_can_read() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let guest = seed_user(&ctx.pool, org, "guest", None).await; // NO membership
+    assign(&ctx.pool, org, arr, voice, guest.id).await;
+
+    // Archivist uploads the part.
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf";
+    let pdf = b"%PDF guest part".to_vec();
+    let (s, _) = send(&ctx.app, request("PUT", uri, &basic(&arch), pdf.clone())).await;
+    assert!(s.is_success());
+
+    // The guest (part assignment only, no membership) can read the part...
+    let (status, body) = send(&ctx.app, request("GET", uri, &basic(&guest), vec![])).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, pdf);
+
+    // ...and sees the arrangement at the root.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/arrangements",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    assert!(String::from_utf8_lossy(&body).contains("bolero"));
+}
+
+#[tokio::test]
+async fn soft_deleting_the_collection_revokes_guest_access() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let guest = seed_user(&ctx.pool, org, "guest", None).await;
+    assign(&ctx.pool, org, arr, voice, guest.id).await;
+
+    // Before deletion: the guest sees the assigned arrangement.
+    let (_s, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/arrangements",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert!(String::from_utf8_lossy(&body).contains("bolero"));
+
+    // Soft-delete the collection carrying the guest's assignment.
+    sqlx::query!(
+        r#"UPDATE collection SET deleted_at = now() WHERE organization_id = $1"#,
+        org
+    )
+    .execute(&ctx.pool)
+    .await
+    .expect("soft-delete collection");
+
+    // Access reached only through the soft-deleted collection is now gone
+    // (hide-with-references): the arrangement disappears from the listing...
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/arrangements",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    assert!(
+        !String::from_utf8_lossy(&body).contains("bolero"),
+        "guest must lose access through a soft-deleted collection"
+    );
+
+    // ...and the voice file is no longer reachable.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}

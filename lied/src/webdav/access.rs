@@ -112,9 +112,13 @@ pub async fn visible_arrangement_slugs(
                  AND EXISTS (
                      SELECT 1 FROM part_assignment pa
                      JOIN voice v ON v.id = pa.voice_id
+                     JOIN collection_item ci ON ci.id = pa.collection_item_id
+                     JOIN collection c ON c.id = ci.collection_id
                      WHERE pa.user_id = $2
                        AND v.arrangement_id = a.id
                        AND v.deleted_at IS NULL
+                       AND ci.deleted_at IS NULL
+                       AND c.deleted_at IS NULL
                  )
                ORDER BY a.slug"#,
             org_id,
@@ -137,9 +141,13 @@ pub async fn has_assignment_on_arrangement(
         r#"SELECT EXISTS (
              SELECT 1 FROM part_assignment pa
              JOIN voice v ON v.id = pa.voice_id
+             JOIN collection_item ci ON ci.id = pa.collection_item_id
+             JOIN collection c ON c.id = ci.collection_id
              WHERE pa.user_id = $1
                AND v.arrangement_id = $2
                AND v.deleted_at IS NULL
+               AND ci.deleted_at IS NULL
+               AND c.deleted_at IS NULL
            ) AS "exists!""#,
         user_id,
         arrangement_id,
@@ -159,8 +167,11 @@ pub async fn has_assignment_on_voice(
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar!(
         r#"SELECT EXISTS (
-             SELECT 1 FROM part_assignment
-             WHERE user_id = $1 AND voice_id = $2
+             SELECT 1 FROM part_assignment pa
+             JOIN collection_item ci ON ci.id = pa.collection_item_id
+             JOIN collection c ON c.id = ci.collection_id
+             WHERE pa.user_id = $1 AND pa.voice_id = $2
+               AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
            ) AS "exists!""#,
         user_id,
         voice_id,
@@ -184,7 +195,10 @@ pub async fn visible_org_slugs(pool: &PgPool, user_id: Uuid) -> Result<Vec<Strin
             SELECT 1 FROM part_assignment pa
             JOIN voice v ON v.id = pa.voice_id
             JOIN arrangement a ON a.id = v.arrangement_id
+            JOIN collection_item ci ON ci.id = pa.collection_item_id
+            JOIN collection c ON c.id = ci.collection_id
             WHERE pa.user_id = $1 AND a.organization_id = o.id
+              AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
         )
         ORDER BY o.slug
         "#,
