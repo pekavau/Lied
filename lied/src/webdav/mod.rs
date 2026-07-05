@@ -10,44 +10,25 @@
 //!
 //! # Implementation plan (issue #8)
 //!
-//! Foundation done: [`path::ResolvedPath`] (parser + tests). Remaining, in the
-//! order the task list tracks them:
+//! Foundation done: [`path::ResolvedPath`] (parser + tests) and
+//! [`access`] (per-role visibility queries + tests). Remaining, in task order —
+//! each bullet is one step:
 //!
-//! 1. **`fs.rs` — `LiedFs: DavFileSystem`.** Built per request carrying the
-//!    authenticated user + `AppState`. Required methods: `metadata`, `read_dir`,
-//!    `open`; plus `create_dir`/`remove_file` for writes. Pattern (from
-//!    `dav_server::memfs`): `async move { … }.boxed()` for `FsFuture`;
-//!    `read_dir` returns `Box::pin(futures_util::stream::iter(v).map(Ok))`.
-//!    Leaf types implement `DavMetaData` (`len`/`modified`/`is_dir`),
-//!    `DavDirEntry` (`name`/`metadata`), `DavFile`
-//!    (`read_bytes`/`write_bytes`/`write_buf`/`seek`/`flush`/`metadata`).
-//!    Map DB/absent → `FsError::{NotFound,Forbidden,Exists,GeneralFailure}`.
-//! 2. **Role + listing queries.** Resolve org/arr/voice slug→id (soft-delete
-//!    aware); `read_dir` honors per-role visibility: staff
-//!    (owner/archivist/conductor) see all; a musician/guest sees only
-//!    arrangements with ≥1 `part_assignment` for them (query the table directly
-//!    — no domain module until #10), and never the full score. Reuse
-//!    [`crate::domain::file::list`] / voice listing.
-//! 3. **GET/PUT ↔ `File` rows.** `open` read → [`crate::storage::get_object`]
-//!    streamed through a `DavFile`; write → buffer then
-//!    [`crate::storage::upload_streaming`] to [`crate::domain::file::derived_key`]
-//!    + [`crate::domain::file::create`]/`replace`. `format`/`mime` via
-//!    [`crate::domain::file::format_and_ext_for_mime`] (unknown ext → 415-ish
-//!    `Forbidden`). Audit each write.
-//! 4. **Personal annotations** (`AnnotationFile`): straight to MinIO, no `File`
-//!    row; author-only-writable, org-readable; audit `personal_annotation.<action>`.
-//! 5. **User library** (`LibraryEntry`): free-form MinIO objects under
-//!    `users/<user>/library/…`, private to that user.
+//! - **`fs.rs` — `LiedFs: DavFileSystem`.** Built per request carrying the authenticated user + `AppState`. Required methods `metadata`/`read_dir`/`open`, plus `create_dir`/`remove_file` for writes. Pattern (from `dav_server::memfs`): `async move { … }.boxed()` for `FsFuture`; `read_dir` returns `Box::pin(futures_util::stream::iter(v).map(Ok))`. Leaf types impl `DavMetaData` (`len`/`modified`/`is_dir`), `DavDirEntry` (`name`/`metadata`), `DavFile` (`read_bytes`/`write_bytes`/`write_buf`/`seek`/`flush`/`metadata`). Map DB/absent → `FsError::{NotFound,Forbidden,Exists,GeneralFailure}`.
+//! - **Role + listing queries (step 2, done in [`access`]).** `read_dir` honors per-role visibility via [`access::visible_arrangement_slugs`]; extend with voice/file listing that reuses [`crate::domain::file::list`]. A restricted user never sees the full score.
+//! - **GET/PUT ↔ `File` rows (step 3).** `open` read → [`crate::storage::get_object`] streamed through a `DavFile`; write → buffer then [`crate::storage::upload_streaming`] to [`crate::domain::file::derived_key`] + [`crate::domain::file::create`]/`replace`. `format`/`mime` via [`crate::domain::file::format_and_ext_for_mime`] (unknown ext → `Forbidden`). Audit each write.
+//! - **Personal annotations (step 4, `AnnotationFile`).** Straight to MinIO, no `File` row; author-only-writable, org-readable; audit `personal_annotation.<action>`.
+//! - **User library (step 5, `LibraryEntry`).** Free-form MinIO objects under `users/<user>/library/…`, private to that user.
 //!
 //! ## Router wiring ([`crate::routes::webdav`])
 //!
 //! `DavHandler::handle(req)` accepts an axum `Request` directly (axum's body
 //! satisfies `http_body::Body`) and returns `Response<dav_server::body::Body>`;
 //! wrap the body with `axum::body::Body::new(..)` to return an axum `Response`.
-//! Build the handler per request:
-//! `DavHandler::builder().filesystem(Box::new(LiedFs::new(state, user))).locksystem(Box::new(dav_server::fakels::FakeLs::new())).build_handler()`.
-//! Replace the `stub` handlers; keep the existing app-password `route_layer`.
+//! Build the handler per request via `DavHandler::builder().filesystem(..).locksystem(Box::new(dav_server::fakels::FakeLs::new())).build_handler()`,
+//! replacing the `stub` handlers and keeping the existing app-password `route_layer`.
 
+pub mod access;
 pub mod path;
 
 pub use path::ResolvedPath;
