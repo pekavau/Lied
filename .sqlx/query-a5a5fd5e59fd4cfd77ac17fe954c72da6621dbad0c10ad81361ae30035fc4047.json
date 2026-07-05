@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT a.slug FROM arrangement a\n               WHERE a.organization_id = $1 AND a.deleted_at IS NULL\n                 AND EXISTS (\n                     SELECT 1 FROM part_assignment pa\n                     JOIN voice v ON v.id = pa.voice_id\n                     WHERE pa.user_id = $2\n                       AND v.arrangement_id = a.id\n                       AND v.deleted_at IS NULL\n                 )\n               ORDER BY a.slug",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a5a5fd5e59fd4cfd77ac17fe954c72da6621dbad0c10ad81361ae30035fc4047"
+}
