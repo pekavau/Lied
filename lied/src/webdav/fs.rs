@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::file;
+use crate::domain::membership::Role;
 use crate::state::AppState;
 use crate::storage;
 use crate::webdav::access::{self, Visibility};
@@ -60,9 +61,17 @@ impl LiedFs {
 
 /// Map a database error to a generic WebDAV failure (500). Not-found is handled
 /// at the call site via `Option`, so a bubbled `sqlx::Error` is always a real
-/// failure.
-fn db_err(_e: sqlx::Error) -> FsError {
+/// failure — trace it (WebDAV has no Problem Details body to carry detail).
+fn db_err(e: sqlx::Error) -> FsError {
+    tracing::error!(error = %e, "webdav database error");
     FsError::GeneralFailure
+}
+
+/// Stable synthetic mtime for directory nodes (2020-01-01Z). Directories in the
+/// entity tree have no meaningful modification time; a fixed value keeps
+/// sync-style clients from seeing the whole tree "change" on every PROPFIND.
+fn dir_mtime() -> SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
 }
 
 fn parse_path(path: &DavPath) -> FsResult<ResolvedPath> {
@@ -84,7 +93,7 @@ impl LiedMeta {
         LiedMeta {
             is_dir: true,
             len: 0,
-            modified: SystemTime::now(),
+            modified: dir_mtime(),
         }
     }
     fn file(len: u64, modified: Option<SystemTime>) -> LiedMeta {
@@ -155,6 +164,22 @@ impl LiedFs {
         Ok((org_id, arr_id, vis))
     }
 
+    /// Resolve an arrangement for a *file-writing* op. Only `owner`/`archivist`
+    /// may upload/edit arrangement files (CLAUDE.md permission matrix). Note
+    /// this is stricter than [`Visibility::Staff`], which also covers
+    /// `conductor` — a conductor has read + collections but not file writes, so
+    /// visibility (a read concept) must not be reused to authorize writes.
+    async fn resolve_arr_for_write(&self, org: &str, arr: &str) -> FsResult<(Uuid, Uuid)> {
+        let (org_id, arr_id, _vis) = self.resolve_arr(org, arr).await?;
+        let role = access::role_in_org(&self.state.db, org_id, self.user_id)
+            .await
+            .map_err(db_err)?;
+        if !matches!(role, Some(Role::Owner | Role::Archivist)) {
+            return Err(FsError::Forbidden);
+        }
+        Ok((org_id, arr_id))
+    }
+
     /// Resolve a voice to `(org_id, arr_id, voice_id, visibility)`, enforcing
     /// that a restricted user is assigned to *that voice*.
     async fn resolve_voice(
@@ -223,7 +248,10 @@ impl LiedFs {
             sqlx::query!(
                 r#"SELECT DISTINCT v.id, v.slug FROM voice v
                    JOIN part_assignment pa ON pa.voice_id = v.id
+                   JOIN collection_item ci ON ci.id = pa.collection_item_id
+                   JOIN collection c ON c.id = ci.collection_id
                    WHERE v.arrangement_id = $1 AND v.deleted_at IS NULL AND pa.user_id = $2
+                     AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
                    ORDER BY v.slug"#,
                 arr_id,
                 self.user_id,
@@ -358,15 +386,24 @@ impl LiedFs {
             LibraryEntry { user, rel } => {
                 self.require_own_library(user)?;
                 let key = library_key(user, rel);
-                // A library path is a file if an object exists at the key, else
-                // a directory if anything lives under `key/`.
+                // A library path is a file if an object exists at the key.
                 if let Ok(head) = storage::head_object(&self.state.s3, self.bucket(), &key).await {
                     return Ok(LiedMeta::file(head.size, head.modified));
                 }
-                let listing =
-                    storage::list_objects(&self.state.s3, self.bucket(), &format!("{key}/"))
-                        .await
-                        .map_err(|_| FsError::GeneralFailure)?;
+                // Otherwise it is a directory if it has a directory marker
+                // (an empty dir freshly created by MKCOL — the `key/` object
+                // itself, which `list_objects` filters out of a listing) or if
+                // anything lives under `key/`.
+                let marker = format!("{key}/");
+                if storage::head_object(&self.state.s3, self.bucket(), &marker)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(LiedMeta::dir());
+                }
+                let listing = storage::list_objects(&self.state.s3, self.bucket(), &marker)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
                 if listing.objects.is_empty() && listing.dirs.is_empty() {
                     Err(FsError::NotFound)
                 } else {
@@ -708,17 +745,10 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
             mime,
             key,
         } => {
-            storage::upload_bytes(
-                &fs.state.s3,
-                fs.bucket(),
-                key,
-                mime,
-                fs.state.config.max_upload_bytes,
-                data,
-            )
-            .await
-            .map_err(map_storage_write)?;
-
+            // DB identity first, object bytes second (mirrors the REST path in
+            // routes::files): the safe failure mode is a DB row referencing a
+            // not-yet-uploaded object (a detectable 404), never a mutated object
+            // with a stale/duplicate row. On upload failure we compensate.
             let existing = file::find_by_location(&fs.state.db, *arr_id, *voice_id, name, format)
                 .await
                 .map_err(db_err)?;
@@ -733,7 +763,8 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
                 conversion_quality: None,
                 created_by: Some(fs.user_id),
             };
-            let action = match existing {
+            let old_id = existing.as_ref().map(|f| f.id);
+            let action = match &existing {
                 Some(old) => {
                     file::replace(&fs.state.db, old.id, new_id, new)
                         .await
@@ -747,6 +778,29 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
                     "file.create"
                 }
             };
+
+            if let Err(e) = storage::upload_bytes(
+                &fs.state.s3,
+                fs.bucket(),
+                key,
+                mime,
+                fs.state.config.max_upload_bytes,
+                data,
+            )
+            .await
+            {
+                // Roll the DB back to the pre-write state so we never leave a
+                // live row pointing at a missing object.
+                match old_id {
+                    Some(old) => {
+                        let _ = file::restore_replaced(&fs.state.db, old, new_id).await;
+                    }
+                    None => {
+                        let _ = file::soft_delete(&fs.state.db, new_id).await;
+                    }
+                }
+                return Err(map_storage_write(e));
+            }
             audit(
                 &fs.state.db,
                 &AuditContext {
@@ -804,6 +858,11 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
             Ok(())
         }
         WriteTarget::Library { key, mime } => {
+            // Deliberately unaudited: `/users/<user>/library/` is a private
+            // personal area, not an org-scoped persistent entity. The audit log
+            // tracks org content and auth events; private-library writes are
+            // outside that scope (unlike personal annotations, which live under
+            // an org's arrangement tree and are audited).
             storage::upload_bytes(
                 &fs.state.s3,
                 fs.bucket(),
@@ -916,10 +975,7 @@ impl LiedFs {
         use ResolvedPath::*;
         match rp {
             ScoreFile { org, arr, file } => {
-                let (org_id, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
-                    return Err(FsError::Forbidden);
-                }
+                let (org_id, arr_id) = self.resolve_arr_for_write(org, arr).await?;
                 self.org_write_target(org_id, org, arr, None, arr_id, None, file)
             }
             VoiceFile {
@@ -928,10 +984,7 @@ impl LiedFs {
                 voice,
                 file,
             } => {
-                let (org_id, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
-                    return Err(FsError::Forbidden);
-                }
+                let (org_id, arr_id) = self.resolve_arr_for_write(org, arr).await?;
                 let voice_id = self
                     .voice_id_by_slug(arr_id, voice)
                     .await?
@@ -1014,10 +1067,7 @@ impl LiedFs {
         use ResolvedPath::*;
         match rp {
             ScoreFile { org, arr, file } => {
-                let (org_id, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
-                    return Err(FsError::Forbidden);
-                }
+                let (org_id, arr_id) = self.resolve_arr_for_write(org, arr).await?;
                 self.remove_org_file(org_id, arr_id, None, file).await
             }
             VoiceFile {
@@ -1026,10 +1076,7 @@ impl LiedFs {
                 voice,
                 file,
             } => {
-                let (org_id, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
-                    return Err(FsError::Forbidden);
-                }
+                let (org_id, arr_id) = self.resolve_arr_for_write(org, arr).await?;
                 let voice_id = self
                     .voice_id_by_slug(arr_id, voice)
                     .await?
@@ -1278,8 +1325,17 @@ impl DavFileSystem for LiedFs {
                     Ok(())
                 }
                 // The annotations author dir is implicit; accept MKCOL as a
-                // no-op for the owner so clients can create it before PUT.
-                ResolvedPath::AnnotationsUserDir { user, .. } if user == &self.user_slug => Ok(()),
+                // no-op for the owner (once the voice is confirmed to exist and
+                // be visible) so clients can create it before PUT.
+                ResolvedPath::AnnotationsUserDir {
+                    org,
+                    arr,
+                    voice,
+                    user,
+                } if user == &self.user_slug => {
+                    self.resolve_voice(org, arr, voice).await?;
+                    Ok(())
+                }
                 _ => Err(FsError::Forbidden),
             }
         }

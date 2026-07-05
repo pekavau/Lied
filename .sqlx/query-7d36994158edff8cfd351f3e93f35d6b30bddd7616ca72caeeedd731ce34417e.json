@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT v.id, v.slug FROM voice v\n                   JOIN part_assignment pa ON pa.voice_id = v.id\n                   JOIN collection_item ci ON ci.id = pa.collection_item_id\n                   JOIN collection c ON c.id = ci.collection_id\n                   WHERE v.arrangement_id = $1 AND v.deleted_at IS NULL AND pa.user_id = $2\n                     AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n                   ORDER BY v.slug",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "slug",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7d36994158edff8cfd351f3e93f35d6b30bddd7616ca72caeeedd731ce34417e"
+}
