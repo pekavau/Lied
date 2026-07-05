@@ -1,12 +1,11 @@
 //! WebDAV tree: `/orgs/<org-slug>/...` and `/users/<user-slug>/library/...`.
 //! App-password (HTTP Basic) auth.
 //!
-//! Real `dav-server` wiring (org/user-scoped filesystem backends honoring
-//! soft-delete and per-role visibility) lands once Organization/User/Voice/
-//! File CRUD exists. This item (issue #4) wires the *authentication*
-//! middleware in front of the tree: a request with a valid app password
-//! reaches the (still-stub) handler; without one, it gets `401` +
-//! `WWW-Authenticate: Basic` before the handler ever runs.
+//! [`app_password_auth`] authenticates every request (401 +
+//! `WWW-Authenticate: Basic` on failure, before any handler runs); the [`dav`]
+//! handler then builds a per-request [`LiedFs`] scoped to that identity and
+//! drives the request through `dav-server`, honoring soft-delete and per-role
+//! visibility (issue #8). The filesystem backend lives in [`crate::webdav`].
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};

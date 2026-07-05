@@ -388,6 +388,10 @@ async fn webdav_request_with_valid_app_password_reaches_the_handler() {
     let request = axum::http::Request::builder()
         .method("PROPFIND")
         .uri("/orgs")
+        // Real WebDAV clients send a finite Depth; dav-server correctly refuses
+        // infinite-depth PROPFIND on a collection with 403, so a missing Depth
+        // header is not a meaningful "reaches the handler" signal.
+        .header("Depth", "1")
         .header(
             axum::http::header::AUTHORIZATION,
             format!("Basic {credentials}"),
@@ -401,6 +405,8 @@ async fn webdav_request_with_valid_app_password_reaches_the_handler() {
         axum::http::StatusCode::UNAUTHORIZED,
         "a valid app password must not be rejected"
     );
+    // 207 Multi-Status: the request authenticated and reached the real DavFs
+    // (the `/orgs` collection lists, empty here since this user has no orgs).
     assert_eq!(response.status().as_u16(), 207);
 }
 
