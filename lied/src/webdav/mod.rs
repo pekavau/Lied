@@ -29,6 +29,8 @@
 //! replacing the `stub` handlers and keeping the existing app-password `route_layer`.
 
 pub mod access;
+pub mod fs;
 pub mod path;
 
+pub use fs::LiedFs;
 pub use path::ResolvedPath;

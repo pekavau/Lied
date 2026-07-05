@@ -82,6 +82,45 @@ pub fn format_and_ext_for_mime(mime: &str) -> Option<(&'static str, &'static str
     Some(pair)
 }
 
+/// Map a lowercase file extension to its canonical MIME type — the reverse of
+/// [`format_and_ext_for_mime`], used on WebDAV `PUT` where the client provides
+/// a filename (with extension) but rarely a reliable `Content-Type`. Returns
+/// `None` for an unsupported extension (caller maps to a WebDAV `403`).
+pub fn mime_for_ext(ext: &str) -> Option<&'static str> {
+    let e = ext.to_ascii_lowercase();
+    let mime = match e.as_str() {
+        "ly" => "application/x-lilypond",
+        "musicxml" => "application/vnd.recordare.musicxml+xml",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "tif" | "tiff" => "image/tiff",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => return None,
+    };
+    Some(mime)
+}
+
+/// Split a WebDAV filename into `(stem, extension)` on the last `.`. Returns
+/// `None` if there is no extension (a File row always has a format/extension).
+pub fn split_filename(filename: &str) -> Option<(&str, &str)> {
+    let (stem, ext) = filename.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    Some((stem, ext))
+}
+
+/// Build the WebDAV filename (`<name>.<ext>`) for a stored file, deriving the
+/// extension from its `mime_type`. Returns `None` if the mime is unrecognized
+/// (which would be a stored-data bug, since it passed the same table on write).
+pub fn webdav_filename(name: &str, mime_type: &str) -> Option<String> {
+    let (_format, ext) = format_and_ext_for_mime(mime_type)?;
+    Some(format!("{name}.{ext}"))
+}
+
 /// Compute the derived MinIO object key from the entity-tree slugs. `voice`
 /// is `Some` for a voice file, `None` for a full-score file.
 pub fn derived_key(
@@ -218,6 +257,41 @@ pub async fn create(pool: &PgPool, id: Uuid, new: NewFile<'_>) -> Result<File, F
     .map_err(map_write_error)?;
 
     Ok(row)
+}
+
+/// Find a live file by its logical location `(arrangement, voice, name,
+/// format)` — the natural key WebDAV addresses a file by (score files have
+/// `voice_id = None`). Returns `None` if absent or soft-deleted.
+pub async fn find_by_location(
+    pool: &PgPool,
+    arrangement_id: Uuid,
+    voice_id: Option<Uuid>,
+    name: &str,
+    format: &str,
+) -> Result<Option<File>, sqlx::Error> {
+    sqlx::query_as!(
+        File,
+        r#"
+        SELECT
+            id, arrangement_id, voice_id, name, format, mime_type,
+            derived_from_file_id, conversion_quality,
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>",
+            created_by,
+            deleted_at as "deleted_at: DateTime<Utc>"
+        FROM file
+        WHERE arrangement_id = $1
+          AND ($2::uuid IS NULL AND voice_id IS NULL OR voice_id = $2)
+          AND name = $3 AND format = $4
+          AND deleted_at IS NULL
+        "#,
+        arrangement_id,
+        voice_id,
+        name,
+        format,
+    )
+    .fetch_optional(pool)
+    .await
 }
 
 /// Look up a live file by id.
