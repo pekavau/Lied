@@ -11,11 +11,12 @@
 
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use utoipa_rapidoc::RapiDoc;
 
 use crate::state::AppState;
@@ -30,12 +31,27 @@ const READYZ_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// produced by `OpenApiRouter::split_for_parts()` after all `/v1` handlers
 /// have been registered; it replaces the empty stub that used to live here.
 pub fn router(api: utoipa::openapi::OpenApi) -> Router<AppState> {
+    // Serialize the spec once at startup, not on every request. `/openapi.json`
+    // is unauthenticated and outside the rate limiter, so re-cloning and
+    // re-serializing the whole `OpenApi` per hit would be needless work on a
+    // publicly reachable endpoint. `Bytes` clones are a refcount bump (the
+    // buffer is shared), so the per-request cost is just building the response.
+    let openapi_bytes = Bytes::from(
+        serde_json::to_vec(&api).expect("OpenAPI document serializes to JSON at startup"),
+    );
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        // Serve the real, fully-populated spec (not the stub).
-        .route("/openapi.json", get(move || async move { Json(api) }))
+        // Serve the real, fully-populated spec (not the stub), pre-serialized.
+        .route(
+            "/openapi.json",
+            get(move || {
+                let body = openapi_bytes.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        )
         .route("/docs", get(docs))
 }
 

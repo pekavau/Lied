@@ -278,7 +278,14 @@ async fn create_app_password(
     )
     .await
     .map_err(|err| match err {
-        app_password::AppPasswordError::DuplicateName => AppError::PreconditionFailed,
+        // A clash on the `(user_id, name)` unique index is a conflict with
+        // current state, not an `If-Match` precondition failure — RFC 7807 §4.1
+        // maps a unique-constraint clash to `409`. (The endpoint has no
+        // precondition semantics; `412` was wrong.)
+        app_password::AppPasswordError::DuplicateName => AppError::Conflict(format!(
+            "an app password named '{}' already exists",
+            body.name
+        )),
         app_password::AppPasswordError::Database(e) => AppError::Database(e),
     })?;
 

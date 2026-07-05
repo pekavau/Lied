@@ -564,6 +564,65 @@ async fn post_v1_tokens_with_bad_password_returns_401() {
     assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
 }
 
+/// Creating two app passwords with the same name for one user clashes on the
+/// `(user_id, name)` unique index. The contract (API guidelines §4.1, and the
+/// `#[utoipa::path]` on the handler) is `409 Conflict` with an RFC 7807 body —
+/// not `412`, which is reserved for `If-Match` preconditions this endpoint
+/// doesn't have. Regression guard for the spec-vs-behavior drift fixed here.
+#[tokio::test]
+async fn creating_a_duplicate_app_password_name_returns_409() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "ivan", "correct horse battery staple").await;
+
+    let config = test_config();
+    let keyring = auth::jwt::Keyring::from_single_key(
+        config.jwt_signing_key.expose(),
+        config.jwt_lifetime_days,
+    );
+    let (token, _claims) = keyring.mint(admin.id, None).expect("mint token");
+
+    let app = build_test_app(db.pool.clone()).await;
+
+    let make_request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/app-passwords")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"iPad in rehearsal room"}"#,
+            ))
+            .unwrap()
+    };
+
+    // First creation succeeds.
+    let first = app
+        .clone()
+        .oneshot(make_request())
+        .await
+        .expect("first request should run");
+    assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+
+    // Second creation with the same name clashes → 409 Conflict, problem+json.
+    let second = app
+        .oneshot(make_request())
+        .await
+        .expect("second request should run");
+    assert_eq!(
+        second.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a duplicate app-password name must be 409, not 412"
+    );
+    assert_eq!(
+        second
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+        "error body must be RFC 7807 Problem Details"
+    );
+}
+
 #[tokio::test]
 async fn missing_credentials_on_v1_instruments_returns_401() {
     let db = TestDb::create_and_migrate().await;

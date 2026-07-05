@@ -167,20 +167,32 @@ fn path_set_matches_expected_exactly() {
 #[test]
 fn no_v1_route_bypasses_openapi_registration() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    // The modules whose `router()` composes the `/v1` tree.
-    let modules = ["v1.rs", "orgs.rs", "arrangements.rs", "files.rs"];
+    let routes_dir = format!("{manifest}/src/routes");
+
+    // The non-`/v1` route trees legitimately use bare `.route(` — they are
+    // plain `axum::Router`s, not `OpenApiRouter`s: the infra/admin/webdav trees
+    // (`admin` is a subdirectory, skipped by the `.rs` filter), plus the module
+    // root and the OpenAPI base doc. *Every other* `.rs` file under
+    // `src/routes/` composes the `/v1` tree, so a newly added `/v1` module is
+    // covered by this lint automatically without editing the test.
+    let non_v1 = ["mod.rs", "openapi.rs", "infra.rs", "webdav.rs"];
 
     let mut offenders = Vec::new();
-    for module in modules {
-        let path = format!("{manifest}/src/routes/{module}");
-        let src = std::fs::read_to_string(&path).expect("route module readable");
+    for entry in std::fs::read_dir(&routes_dir).expect("routes dir readable") {
+        let entry = entry.expect("dir entry");
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.ends_with(".rs") || non_v1.contains(&name.as_ref()) {
+            continue;
+        }
+        let src = std::fs::read_to_string(entry.path()).expect("route module readable");
         for (n, line) in src.lines().enumerate() {
             // Ignore comment lines so doc-comments mentioning `.route(` don't
             // trip the lint. `.routes(`, `.route_layer(`, `.route_service(`
             // are all fine — only the bare `.route(` bypass is forbidden.
             let code = line.split("//").next().unwrap_or("");
             if code.contains(".route(") {
-                offenders.push(format!("{module}:{}: {}", n + 1, line.trim()));
+                offenders.push(format!("{name}:{}: {}", n + 1, line.trim()));
             }
         }
     }
