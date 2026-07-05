@@ -94,11 +94,21 @@ of the empty `ApiDoc::openapi()` stub.
 - **Structural:** a handler with no `#[utoipa::path]` cannot be passed to
   `routes!` (it reads `path()`/`operation()`/`methods()` off the macro), so the
   ordinary way of adding a route already forces the annotation.
-- **CI gate:** a test in `tests/openapi.rs` builds the composed spec and asserts
-  the set of `(method, path)` pairs in the `axum::Router` equals the set in the
-  `OpenApi.paths`, and that every operation has a non-empty `summary`, at least
-  one `2xx` response, and the standard error set for its class (§4). A new
-  endpoint that skips documentation fails this test.
+- **CI gate:** a test in `tests/openapi.rs` builds the composed spec (from the
+  same `v1::api_router` production uses) and enforces the machine-checkable
+  guidelines. Because axum's `Router` is not introspectable, the served route
+  set is pinned two ways rather than compared to the router directly:
+  1. the documented `OpenApi.paths` set must equal a reviewed `EXPECTED_PATHS`
+     list **exactly** (both directions) — a new or renamed endpoint fails until
+     the list is updated, a deliberate review checkpoint; and
+  2. a source-lint forbids the bare `.route(` escape hatch anywhere in a `/v1`
+     route module, so no endpoint can reach the router while skipping the
+     `routes!`-driven OpenAPI registration.
+
+  The test also asserts every operation has a non-empty `summary`, at least one
+  `2xx` response, the `CommonErrors` triple on every authenticated operation,
+  `412` on every `PATCH`, an RFC 7807 `ProblemDetails` body on every `4xx`/`5xx`
+  response, and `camelCase` on every component-schema property.
 
 Operation **summary** comes from the handler's first `///` doc-comment line;
 the rest of the doc comment becomes the **description**. Write them for the API
@@ -224,10 +234,13 @@ Most of this is already in CLAUDE.md; recorded here as the OpenAPI encoding.
 - **Casing.** Wire JSON is `camelCase`; structs are `snake_case` +
   `#[serde(rename_all = "camelCase")]`; `ToSchema` reflects the same. Response
   DTOs and `Page<T>` already follow this.
-- **Pagination envelope.** `Page<T>` is a generic `#[derive(ToSchema)]`. utoipa
-  generics need concrete **aliases** — declare one per item type:
-  `#[aliases(PageOfArrangement = Page<ArrangementResponse>, PageOfVoice = Page<VoiceResponse>, …)]`
-  and reference the alias in the list operation's `200` body.
+- **Pagination envelope.** `Page<T>` is a generic `#[derive(ToSchema)]` with a
+  `T: ToSchema` bound. List operations reference it inline —
+  `body = inline(Page<ArrangementResponse>)` — which materializes the concrete
+  schema at the use site with no separate alias bookkeeping. (utoipa also
+  supports named `#[aliases(...)]` for generics; `inline` is preferred here so
+  the item type lives next to the operation and there is no alias table to keep
+  in sync.)
 - **ETag / If-Match.**
   - GET-by-id and mutation success responses document an `ETag` **response
     header** (`responses((status = 200, body = T, headers(("ETag" = String, description = "updated_at ms-epoch, quoted")))))`).
