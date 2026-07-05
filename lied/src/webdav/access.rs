@@ -148,6 +148,52 @@ pub async fn has_assignment_on_arrangement(
     .await
 }
 
+/// Whether a user holds a part assignment on a specific voice. Restricted
+/// users may only see voices (and their files) they are assigned to
+/// (CLAUDE.md: "musician sees only the files for voices where they have a
+/// PartAssignment").
+pub async fn has_assignment_on_voice(
+    pool: &PgPool,
+    voice_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM part_assignment
+             WHERE user_id = $1 AND voice_id = $2
+           ) AS "exists!""#,
+        user_id,
+        voice_id,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Org slugs a user has any relationship with — a membership, or a part
+/// assignment (guest/substitute). Used to scope the `/orgs` root listing so it
+/// does not enumerate every org on the instance. Ordered by slug.
+pub async fn visible_org_slugs(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT o.slug FROM organization o
+        WHERE EXISTS (
+            SELECT 1 FROM membership m
+            WHERE m.organization_id = o.id AND m.user_id = $1
+        )
+        OR EXISTS (
+            SELECT 1 FROM part_assignment pa
+            JOIN voice v ON v.id = pa.voice_id
+            JOIN arrangement a ON a.id = v.arrangement_id
+            WHERE pa.user_id = $1 AND a.organization_id = o.id
+        )
+        ORDER BY o.slug
+        "#,
+        user_id,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

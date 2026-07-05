@@ -9,6 +9,8 @@
 //!   - **Download** returns the `GetObject` `ByteStream` piped straight into
 //!     the response body, honoring HTTP `Range` for tablet seeking.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client as S3Client;
@@ -207,6 +209,146 @@ pub async fn get_object(
         content_length: out.content_length(),
         body: out.body,
     })
+}
+
+/// Metadata about a stored object, from a `HeadObject`.
+pub struct ObjectHead {
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// `HeadObject` for size + last-modified, used to fill WebDAV
+/// `getcontentlength`/`getlastmodified` without downloading the body.
+pub async fn head_object(
+    s3: &S3Client,
+    bucket: &str,
+    key: &str,
+) -> Result<ObjectHead, StorageError> {
+    let out = s3
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| {
+            let svc = e.into_service_error();
+            if svc.is_not_found() {
+                StorageError::NotFound
+            } else {
+                StorageError::S3(format!("head_object: {svc}"))
+            }
+        })?;
+    Ok(ObjectHead {
+        size: out.content_length().unwrap_or(0).max(0) as u64,
+        modified: out.last_modified().and_then(|d| {
+            let secs = d.secs();
+            if secs < 0 {
+                None
+            } else {
+                Some(UNIX_EPOCH + Duration::new(secs as u64, d.subsec_nanos()))
+            }
+        }),
+    })
+}
+
+/// A single object in a directory listing.
+pub struct ListedObject {
+    /// Full object key.
+    pub key: String,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// One level of a "directory" listing under `prefix` (which must end in `/`,
+/// or be empty): immediate child objects plus the immediate sub-directory
+/// prefixes (via the `/` delimiter). Used for the files-by-convention trees
+/// (personal annotations, user libraries) that have no DB rows.
+pub struct DirListing {
+    pub objects: Vec<ListedObject>,
+    /// Immediate child directory prefixes (each ends in `/`).
+    pub dirs: Vec<String>,
+}
+
+/// List one level under `prefix` using the `/` delimiter. Non-recursive.
+pub async fn list_objects(
+    s3: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<DirListing, StorageError> {
+    let mut objects = Vec::new();
+    let mut dirs = Vec::new();
+    let mut continuation: Option<String> = None;
+
+    loop {
+        let mut req = s3
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter("/");
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let out = req
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("list_objects_v2: {e}")))?;
+
+        for cp in out.common_prefixes() {
+            if let Some(p) = cp.prefix() {
+                dirs.push(p.to_string());
+            }
+        }
+        for obj in out.contents() {
+            if let Some(key) = obj.key() {
+                // S3 has no real directories; a zero-length key equal to the
+                // prefix (a "directory marker") is not a real file — skip it.
+                if key == prefix {
+                    continue;
+                }
+                objects.push(ListedObject {
+                    key: key.to_string(),
+                    size: obj.size().unwrap_or(0).max(0) as u64,
+                    modified: obj.last_modified().and_then(|d| {
+                        let secs = d.secs();
+                        (secs >= 0)
+                            .then(|| UNIX_EPOCH + Duration::new(secs as u64, d.subsec_nanos()))
+                    }),
+                });
+            }
+        }
+
+        if out.is_truncated().unwrap_or(false) {
+            continuation = out.next_continuation_token().map(str::to_string);
+            if continuation.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(DirListing { objects, dirs })
+}
+
+/// Upload an in-memory buffer to `bucket/key`, enforcing `max_bytes`. A
+/// convenience over [`upload_streaming`] for the files-by-convention writes
+/// (annotations, library) where the whole body is already buffered by the
+/// WebDAV `DavFile` before flush.
+pub async fn upload_bytes(
+    s3: &S3Client,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+    max_bytes: u64,
+    data: Bytes,
+) -> Result<u64, StorageError> {
+    struct Once(Option<Bytes>);
+    impl ChunkSource for Once {
+        async fn next_chunk(&mut self) -> Result<Option<Bytes>, StorageError> {
+            Ok(self.0.take())
+        }
+    }
+    upload_streaming(s3, bucket, key, content_type, max_bytes, Once(Some(data))).await
 }
 
 /// Best-effort delete of every version of an object (hard delete only).

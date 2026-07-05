@@ -14,16 +14,18 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
+use dav_server::DavHandler;
 
-use crate::auth::webdav::authenticate;
+use crate::auth::webdav::{authenticate, AuthenticatedWebDavUser};
 use crate::state::AppState;
+use crate::webdav::LiedFs;
 
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .route("/orgs", any(stub))
-        .route("/orgs/*path", any(stub))
-        .route("/users", any(stub))
-        .route("/users/*path", any(stub))
+        .route("/orgs", any(dav))
+        .route("/orgs/*path", any(dav))
+        .route("/users", any(dav))
+        .route("/users/*path", any(dav))
         // `route_layer`, not `layer`: the app-password Basic challenge must
         // apply ONLY to these matched WebDAV routes, never to the router's
         // fallback. A plain `.layer()` also wraps the default fallback, and
@@ -82,12 +84,46 @@ fn unauthorized_response() -> Response {
     response
 }
 
-/// Stub handler reached only after successful app-password auth. Returns
-/// `207 Multi-Status` (the expected PROPFIND response code) so the
-/// auth-only acceptance criterion ("PROPFIND with a valid app password →
-/// 207 / non-401") is satisfiable today; actual WebDAV semantics (real
-/// PROPFIND XML bodies, GET/PUT file content, directory listings honoring
-/// soft-delete and per-role visibility) are later items.
-async fn stub() -> impl IntoResponse {
-    StatusCode::from_u16(207).unwrap_or(StatusCode::OK)
+/// The real WebDAV handler, reached only after successful app-password auth
+/// (the [`AuthenticatedWebDavUser`] is in the request extensions). Builds a
+/// per-request [`LiedFs`] scoped to that identity and drives the request
+/// through `dav-server`, honoring soft-delete and per-role visibility.
+async fn dav(State(state): State<AppState>, request: Request) -> Response {
+    let Some(user) = request
+        .extensions()
+        .get::<AuthenticatedWebDavUser>()
+        .cloned()
+    else {
+        // The auth middleware runs as a `route_layer` in front of this handler,
+        // so a missing extension is an internal wiring error, not a client one.
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    let request_id = request
+        .headers()
+        .get(crate::routes::REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+
+    // The WebDAV `/users/<slug>/library` tree is keyed by user slug; resolve it
+    // once for the private-library ownership check.
+    let user_slug =
+        match sqlx::query_scalar!(r#"SELECT slug FROM "user" WHERE id = $1"#, user.user_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(Some(slug)) => slug,
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+    let fs = LiedFs::new(state.clone(), user.user_id, user_slug, request_id);
+    let handler = DavHandler::builder()
+        .filesystem(Box::new(fs))
+        .locksystem(dav_server::fakels::FakeLs::new())
+        .build_handler();
+
+    let response = handler.handle(request).await;
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, axum::body::Body::new(body))
 }

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT o.slug FROM organization o\n        WHERE EXISTS (\n            SELECT 1 FROM membership m\n            WHERE m.organization_id = o.id AND m.user_id = $1\n        )\n        OR EXISTS (\n            SELECT 1 FROM part_assignment pa\n            JOIN voice v ON v.id = pa.voice_id\n            JOIN arrangement a ON a.id = v.arrangement_id\n            WHERE pa.user_id = $1 AND a.organization_id = o.id\n        )\n        ORDER BY o.slug\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "aa0224aebee98d1e4c9ed5052a60c96dc43733189f5c5c601233d2e7714a3f57"
+}

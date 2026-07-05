@@ -29,6 +29,7 @@ aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 
 dav-server = { workspace = true }
+futures-util = { workspace = true }
 
 argon2 = { workspace = true }
 jsonwebtoken = { workspace = true }
