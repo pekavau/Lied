@@ -16,3 +16,4 @@ pub mod routes;
 pub mod state;
 pub mod storage;
 pub mod telemetry;
+pub mod webdav;
