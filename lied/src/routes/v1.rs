@@ -125,8 +125,9 @@ struct MintTokenResponse {
     request_body = MintTokenRequest,
     responses(
         (status = 200, description = "Bearer JWT minted", body = MintTokenResponse),
-        (status = 401, description = "Bad credentials"),
-        (status = 429, description = "Login rate limit exceeded"),
+        // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
+        // RFC 7807 ProblemDetails bodies (API guidelines §4).
+        CommonErrors,
     )
 )]
 async fn mint_token(
@@ -374,24 +375,24 @@ async fn revoke_app_password(
 
 // ── Router ───────────────────────────────────────────────────────────────────
 
-pub fn router(state: AppState) -> OpenApiRouter<AppState> {
-    // The `/v1` tree accepts session-cookie *or* bearer auth (CLAUDE.md
-    // "Route-tree boundary"), so it needs the same `SessionManagerLayer` the
-    // `/admin` tree carries: without it the bare `Session` extractor in
-    // `mint_token` 500s, and `BearerOrSession` can never resolve a session
-    // cookie (it would silently fall through to bearer-only). The layer
-    // shares the store + cookie name with `/admin`, so a cookie set by
-    // `/admin/login` authenticates `/v1` calls too.
-    let session_layer =
-        crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
-
+/// Compose the full `/v1` route tree with its OpenAPI annotations, but **no
+/// state-dependent middleware**. This is the single source of truth for the
+/// `/v1` surface: [`router`] wraps it with the session layer for production,
+/// and the OpenAPI CI gate (`tests/openapi.rs`) builds the served spec from it
+/// directly — so the documented spec cannot drift from the mounted routes.
+///
+/// `login_per_min` scopes the brute-force rate-limit bucket to
+/// `POST /v1/tokens` only; it affects middleware, not the emitted spec (any
+/// value produces the same paths), which is why the spec test can pass an
+/// arbitrary number.
+pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
     // `POST /v1/tokens` runs the same `find_by_username` + `verify_password`
     // as `/admin/login`, so it is the same brute-force surface and gets
     // the same per-IP login rate-limit bucket (CLAUDE.md: login/password
     // endpoints 10/min). Scoped to this route only, not the whole tree.
     let token_router = OpenApiRouter::new()
         .routes(routes!(mint_token))
-        .layer(login_rate_limit_layer(state.config.ratelimit_login_per_min));
+        .layer(login_rate_limit_layer(login_per_min));
 
     OpenApiRouter::new()
         .routes(routes!(version))
@@ -409,5 +410,18 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
         // File upload/download streamed to/from MinIO (issue #7) — see
         // `routes::files`.
         .merge(crate::routes::files::router())
-        .layer(session_layer)
+}
+
+pub fn router(state: AppState) -> OpenApiRouter<AppState> {
+    // The `/v1` tree accepts session-cookie *or* bearer auth (CLAUDE.md
+    // "Route-tree boundary"), so it needs the same `SessionManagerLayer` the
+    // `/admin` tree carries: without it the bare `Session` extractor in
+    // `mint_token` 500s, and `BearerOrSession` can never resolve a session
+    // cookie (it would silently fall through to bearer-only). The layer
+    // shares the store + cookie name with `/admin`, so a cookie set by
+    // `/admin/login` authenticates `/v1` calls too.
+    let session_layer =
+        crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
+
+    api_router(state.config.ratelimit_login_per_min).layer(session_layer)
 }
