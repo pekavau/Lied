@@ -253,12 +253,7 @@ mod tests {
         assert_eq!(p(""), Some(Root));
         assert_eq!(p("/orgs"), Some(OrgsRoot));
         assert_eq!(p("/orgs/"), Some(OrgsRoot));
-        assert_eq!(
-            p("/orgs/acme"),
-            Some(Org {
-                org: "acme".into()
-            })
-        );
+        assert_eq!(p("/orgs/acme"), Some(Org { org: "acme".into() }));
         assert_eq!(
             p("/orgs/acme/arrangements"),
             Some(ArrangementsRoot { org: "acme".into() })
