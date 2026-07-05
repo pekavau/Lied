@@ -53,6 +53,8 @@ pub enum CollectionItemError {
     DuplicateIndex,
     #[error("the referenced collection or arrangement does not exist")]
     UnknownReference,
+    #[error("the item order must be exactly the collection's current live items")]
+    InvalidReorder,
 }
 
 fn map_write_error(err: sqlx::Error) -> CollectionItemError {
@@ -225,15 +227,39 @@ pub async fn update_index(
 }
 
 /// Reassign a whole collection's indices to `1..=n` in the order given by
-/// `ordered_ids`, atomically. Indices are first shifted out of range so the
-/// per-row updates never transiently collide on the unique `(collection_id,
-/// index)` index. `ordered_ids` should list all of the collection's live items.
+/// `ordered_ids`, atomically. `ordered_ids` must be *exactly* a permutation of
+/// the collection's current live item ids — no missing, extra, foreign, or
+/// duplicate ids — else [`CollectionItemError::InvalidReorder`] and the
+/// transaction rolls back (a partial list would otherwise silently corrupt the
+/// order). Indices are parked out of range first so the per-row updates never
+/// transiently collide on the unique `(collection_id, index)` index.
 pub async fn reorder(
     pool: &PgPool,
     collection_id: Uuid,
     ordered_ids: &[Uuid],
 ) -> Result<(), CollectionItemError> {
+    use std::collections::HashSet;
+
     let mut tx = pool.begin().await?;
+
+    // Lock the collection's live items and confirm `ordered_ids` is a
+    // permutation of them before touching any index.
+    let live: Vec<Uuid> = sqlx::query_scalar!(
+        r#"SELECT id FROM collection_item
+           WHERE collection_id = $1 AND deleted_at IS NULL
+           FOR UPDATE"#,
+        collection_id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let live_set: HashSet<Uuid> = live.iter().copied().collect();
+    let ordered_set: HashSet<Uuid> = ordered_ids.iter().copied().collect();
+    if ordered_ids.len() != live.len() || ordered_set != live_set {
+        // Duplicates (len mismatch after dedupe), missing, or foreign ids.
+        tx.rollback().await?;
+        return Err(CollectionItemError::InvalidReorder);
+    }
 
     // Park every live item's index far out of range to clear the space.
     sqlx::query!(

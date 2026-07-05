@@ -275,15 +275,18 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 }
 
 /// Undelete: clears `deleted_at`. Returns `false` if no soft-deleted row
-/// matched.
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+/// matched. Can fail with [`CollectionError::DuplicateSlug`] if the slug was
+/// reused by a new live collection while this one was soft-deleted (the partial
+/// unique index only covers live rows).
+pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, CollectionError> {
     let result = sqlx::query!(
         r#"UPDATE collection SET deleted_at = NULL, updated_at = now()
            WHERE id = $1 AND deleted_at IS NOT NULL"#,
         id,
     )
     .execute(pool)
-    .await?;
+    .await
+    .map_err(map_write_error)?;
     Ok(result.rows_affected() > 0)
 }
 

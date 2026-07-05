@@ -148,8 +148,8 @@ async fn create_arrangement(pool: &PgPool, org_id: Uuid, slug: &str) -> Uuid {
     id
 }
 
-fn token(state: &AppState, user_id: Uuid) -> String {
-    state.jwt_keyring.mint(user_id, None).expect("mint").0
+fn token(keyring: &lied::auth::jwt::Keyring, user_id: Uuid) -> String {
+    keyring.mint(user_id, None).expect("mint").0
 }
 
 fn req(
@@ -194,6 +194,14 @@ struct Ctx {
     app: axum::Router,
     pool: PgPool,
     org: Uuid,
+    keyring: std::sync::Arc<lied::auth::jwt::Keyring>,
+}
+
+impl Ctx {
+    /// Mint a bearer token for `user_id` against the app's own keyring.
+    fn token_for(&self, user_id: Uuid) -> String {
+        token(&self.keyring, user_id)
+    }
 }
 
 async fn setup(role: membership::Role) -> (Ctx, String) {
@@ -202,7 +210,8 @@ async fn setup(role: membership::Role) -> (Ctx, String) {
     let org = create_org(&db.pool, "Acme").await;
     let user = create_user(&db.pool, "actor").await;
     add_member(&db.pool, org, user, role).await;
-    let tok = token(&state, user);
+    let keyring = state.jwt_keyring.clone();
+    let tok = token(&keyring, user);
     let app = lied::routes::build_router(state);
     let pool = db.pool.clone();
     (
@@ -211,6 +220,7 @@ async fn setup(role: membership::Role) -> (Ctx, String) {
             app,
             pool,
             org,
+            keyring,
         },
         tok,
     )
@@ -436,4 +446,285 @@ async fn collection_writes_are_audited() {
     .await
     .expect("count");
     assert_eq!(audited, 1, "collection.create must be audited");
+}
+
+/// Helper: create a collection and return its id.
+async fn make_collection(ctx: &Ctx, tok: &str, name: &str, kind: &str) -> String {
+    let (_s, coll) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("/v1/orgs/{}/collections", ctx.org),
+            tok,
+            Some(serde_json::json!({ "name": name, "type": kind })),
+        ),
+    )
+    .await;
+    coll["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn reorder_rejects_an_incomplete_id_set() {
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let a1 = create_arrangement(&ctx.pool, ctx.org, "alpha").await;
+    let a2 = create_arrangement(&ctx.pool, ctx.org, "beta").await;
+    let coll = make_collection(&ctx, &tok, "Spring", "program").await;
+    let items_url = format!("/v1/orgs/{}/collections/{}/items", ctx.org, coll);
+    let (_s, i1) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &items_url,
+            &tok,
+            Some(serde_json::json!({ "arrangementId": a1, "index": 1 })),
+        ),
+    )
+    .await;
+    send(
+        &ctx.app,
+        req(
+            "POST",
+            &items_url,
+            &tok,
+            Some(serde_json::json!({ "arrangementId": a2, "index": 2 })),
+        ),
+    )
+    .await;
+    let id1 = i1["id"].as_str().unwrap();
+
+    // A partial list (only one of two live items) is rejected — no silent
+    // corruption.
+    let (status, _) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("/v1/orgs/{}/collections/{}/reorder", ctx.org, coll),
+            &tok,
+            Some(serde_json::json!({ "orderedIds": [id1] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+    // The original order survived (indices still 1,2 — not parked at +1000000).
+    let (_s, list) = send(&ctx.app, req("GET", &items_url, &tok, None)).await;
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr[0]["index"], 1);
+    assert_eq!(arr[1]["index"], 2);
+}
+
+#[tokio::test]
+async fn undelete_collection_with_a_reused_slug_returns_409() {
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let base = format!("/v1/orgs/{}/collections", ctx.org);
+
+    // Create, soft-delete, then re-create a collection with the same slug.
+    let coll = make_collection(&ctx, &tok, "Spring", "program").await;
+    let etag_resp = ctx
+        .app
+        .clone()
+        .oneshot(req("GET", &format!("{base}/{coll}"), &tok, None))
+        .await
+        .unwrap();
+    let etag = etag_resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let del = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(format!("{base}/{coll}"))
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header(axum::http::header::IF_MATCH, &etag)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (ds, _) = send(&ctx.app, del).await;
+    assert_eq!(ds, axum::http::StatusCode::NO_CONTENT);
+
+    make_collection(&ctx, &tok, "Spring", "program").await; // same slug, now live
+
+    // Undeleting the first now clashes on the live-rows-only unique slug → 409.
+    let (status, _) = send(
+        &ctx.app,
+        req("POST", &format!("{base}/{coll}/undelete"), &tok, None),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn if_match_is_enforced_on_collection_update() {
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let base = format!("/v1/orgs/{}/collections", ctx.org);
+    let coll = make_collection(&ctx, &tok, "Spring", "program").await;
+    let url = format!("{base}/{coll}");
+    let patch_body = serde_json::json!({ "name": "Spring Renamed", "type": "program" });
+
+    // Missing If-Match → 412.
+    let (missing, _) = send(&ctx.app, req("PATCH", &url, &tok, Some(patch_body.clone()))).await;
+    assert_eq!(missing, axum::http::StatusCode::PRECONDITION_FAILED);
+
+    // Stale If-Match → 412.
+    let stale = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&url)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header(axum::http::header::IF_MATCH, "\"1\"")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(patch_body.to_string()))
+        .unwrap();
+    let (stale_status, _) = send(&ctx.app, stale).await;
+    assert_eq!(stale_status, axum::http::StatusCode::PRECONDITION_FAILED);
+
+    // A fresh ETag from GET (create now emits it too) lets the PATCH through.
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(req("GET", &url, &tok, None))
+        .await
+        .unwrap();
+    let etag = get
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let ok = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(&url)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header(axum::http::header::IF_MATCH, &etag)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(patch_body.to_string()))
+        .unwrap();
+    let (ok_status, _) = send(&ctx.app, ok).await;
+    assert_eq!(ok_status, axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_musician_can_read_but_not_write() {
+    let (ctx, editor) = setup(membership::Role::Archivist).await;
+    let coll = make_collection(&ctx, &editor, "Spring", "program").await;
+
+    // A second user in the same org, as a musician.
+    let muso = create_user(&ctx.pool, "muso").await;
+    add_member(&ctx.pool, ctx.org, muso, membership::Role::Musician).await;
+    let muso_tok = ctx.token_for(muso);
+
+    // Musician can list and get.
+    let (list_status, _) = send(
+        &ctx.app,
+        req(
+            "GET",
+            &format!("/v1/orgs/{}/collections", ctx.org),
+            &muso_tok,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(list_status, axum::http::StatusCode::OK);
+    let (get_status, _) = send(
+        &ctx.app,
+        req(
+            "GET",
+            &format!("/v1/orgs/{}/collections/{}", ctx.org, coll),
+            &muso_tok,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(get_status, axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_out_of_range_index_is_rejected() {
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let arr = create_arrangement(&ctx.pool, ctx.org, "alpha").await;
+    let coll = make_collection(&ctx, &tok, "Spring", "program").await;
+    let items_url = format!("/v1/orgs/{}/collections/{}/items", ctx.org, coll);
+
+    for bad in [0, -1, 1_000_000] {
+        let (status, _) = send(
+            &ctx.app,
+            req(
+                "POST",
+                &items_url,
+                &tok,
+                Some(serde_json::json!({ "arrangementId": arr, "index": bad })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "index {bad} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collections_are_isolated_across_orgs() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    // A collection in org A.
+    let coll_a = {
+        let a_tok = {
+            // The setup actor is an archivist in ctx.org (org A).
+            let actor = create_user(&ctx.pool, "a-editor").await;
+            add_member(&ctx.pool, ctx.org, actor, membership::Role::Archivist).await;
+            ctx.token_for(actor)
+        };
+        make_collection(&ctx, &a_tok, "Program A", "program").await
+    };
+
+    // A second org B with its own editor.
+    let org_b = create_org(&ctx.pool, "Beta Org").await;
+    let b_editor = create_user(&ctx.pool, "b-editor").await;
+    add_member(&ctx.pool, org_b, b_editor, membership::Role::Archivist).await;
+    let b_tok = ctx.token_for(b_editor);
+
+    // Org B's editor is not a member of org A → 403 on A's collection.
+    let (status, _) = send(
+        &ctx.app,
+        req(
+            "GET",
+            &format!("/v1/orgs/{}/collections/{}", ctx.org, coll_a),
+            &b_tok,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // Adding an arrangement from org A to a collection in org B → 404.
+    let arr_a = create_arrangement(&ctx.pool, ctx.org, "a-piece").await;
+    let coll_b = make_collection_in(&ctx, &b_tok, org_b, "Program B", "program").await;
+    let (add_status, _) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("/v1/orgs/{}/collections/{}/items", org_b, coll_b),
+            &b_tok,
+            Some(serde_json::json!({ "arrangementId": arr_a, "index": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(add_status, axum::http::StatusCode::NOT_FOUND);
+}
+
+/// Like `make_collection` but in an explicit org.
+async fn make_collection_in(ctx: &Ctx, tok: &str, org: Uuid, name: &str, kind: &str) -> String {
+    let (_s, coll) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("/v1/orgs/{org}/collections"),
+            tok,
+            Some(serde_json::json!({ "name": name, "type": kind })),
+        ),
+    )
+    .await;
+    coll["id"].as_str().unwrap().to_string()
 }
