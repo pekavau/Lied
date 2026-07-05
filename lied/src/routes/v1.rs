@@ -417,6 +417,8 @@ pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
         // File upload/download streamed to/from MinIO (issue #7) — see
         // `routes::files`.
         .merge(crate::routes::files::router())
+        // Collections + CollectionItems (issue #9) — see `routes::collections`.
+        .merge(crate::routes::collections::router())
 }
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {

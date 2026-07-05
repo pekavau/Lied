@@ -104,6 +104,29 @@ pub async fn require_org_role_v1(
     require_org_role(state, &auth.user, organization_id, minimum).await
 }
 
+/// Require the caller to be able to **build/edit collections** in the org
+/// (CLAUDE.md Permission matrix: `owner`, `archivist`, *or* `conductor`). This
+/// is not a single `at_least` threshold — archivist and conductor are
+/// incomparable — so it matches the matrix row directly with a `matches!`.
+/// `is_system_admin` short-circuits, as with [`require_org_role`]. Returns
+/// `403 Forbidden` otherwise (e.g. a `musician`).
+pub async fn require_collection_editor_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+) -> Result<(), AppError> {
+    if auth.user.is_system_admin {
+        return Ok(());
+    }
+    let found = membership::find_by_user_and_org(&state.db, auth.user.id, organization_id)
+        .await
+        .map_err(AppError::from)?;
+    match found {
+        Some(m) if matches!(m.role, Role::Owner | Role::Archivist | Role::Conductor) => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
 /// Convenience wrapper over [`require_org_role`] for `/admin` handlers
 /// already holding an [`AuthSession`].
 pub async fn require_org_role_admin(

@@ -126,6 +126,15 @@ const EXPECTED_PATHS: &[&str] = &[
     // Voice files
     "/v1/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
     "/v1/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    // Collections
+    "/v1/orgs/{orgId}/collections",
+    "/v1/orgs/{orgId}/collections/{id}",
+    "/v1/orgs/{orgId}/collections/{id}/undelete",
+    "/v1/orgs/{orgId}/collections/{id}/reorder",
+    // Collection items
+    "/v1/orgs/{orgId}/collections/{id}/items",
+    "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
+    "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete",
 ];
 
 /// §2 completeness: the documented path set equals `EXPECTED_PATHS` exactly.
