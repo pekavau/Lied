@@ -63,14 +63,37 @@ fn etag_response<T: Serialize>(
     body: T,
     updated_at: chrono::DateTime<chrono::Utc>,
 ) -> axum::response::Response {
+    etag_response_status(StatusCode::OK, body, updated_at)
+}
+
+/// Like [`etag_response`] but with an explicit status (e.g. `201` on create),
+/// so the `ETag` response header the OpenAPI spec declares is actually emitted.
+fn etag_response_status<T: Serialize>(
+    status: StatusCode,
+    body: T,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> axum::response::Response {
     let etag = listing::etag_for(updated_at);
     let mut response = Json(body).into_response();
+    *response.status_mut() = status;
     response.headers_mut().insert(
         axum::http::header::ETAG,
         axum::http::HeaderValue::from_str(&etag)
             .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"0\"")),
     );
     response
+}
+
+/// Piece numbers are 1-based and bounded well below the reorder parking offset
+/// (1,000,000) so index arithmetic can't overflow or collide (review #4).
+const MAX_INDEX: i32 = 999_999;
+
+fn validate_index(index: i32) -> Result<(), AppError> {
+    if (1..=MAX_INDEX).contains(&index) {
+        Ok(())
+    } else {
+        Err(empty_field("index", "index must be between 1 and 999999"))
+    }
 }
 
 fn empty_field(field: &str, msg: &str) -> AppError {
@@ -95,6 +118,9 @@ fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppErro
         }
         collection_item::CollectionItemError::UnknownReference => {
             AppError::Conflict("the referenced arrangement does not exist".into())
+        }
+        collection_item::CollectionItemError::InvalidReorder => {
+            AppError::Conflict("orderedIds must be exactly the collection's current items".into())
         }
         collection_item::CollectionItemError::Database(e) => AppError::Database(e),
     }
@@ -174,7 +200,7 @@ struct CollectionRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `name` (default asc), `created_at`."),
+            description = "Sort field and direction. Allowed: `name` (default asc), `createdAt`."),
         ("filter[type]" = Option<String>, Query, description = "Filter by type: `program` or `standing`"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -259,7 +285,7 @@ async fn create_collection(
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
     Json(body): Json<CollectionRequest>,
-) -> Result<(StatusCode, Json<collection::Collection>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
     if body.name.trim().is_empty() {
@@ -297,7 +323,12 @@ async fn create_collection(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 /// Fetch one collection (requires org membership).
@@ -361,7 +392,7 @@ async fn update_collection(
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(body): Json<CollectionRequest>,
-) -> Result<Json<collection::Collection>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
     let current = find_collection_scoped(&state, org_id, id).await?;
@@ -397,7 +428,8 @@ async fn update_collection(
     )
     .await;
 
-    Ok(Json(updated))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(updated, updated_at))
 }
 
 /// Soft-delete a collection (owner/archivist/conductor; requires `If-Match`).
@@ -470,6 +502,7 @@ async fn delete_collection(
         CommonErrors,
         Forbidden403,
         NotFound404,
+        Conflict409,
     )
 )]
 async fn undelete_collection(
@@ -481,7 +514,10 @@ async fn undelete_collection(
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
     let current = find_collection_scoped_including_deleted(&state, org_id, id).await?;
-    if !collection::undelete(&state.db, id).await? {
+    if !collection::undelete(&state.db, id)
+        .await
+        .map_err(collection_error_to_app_error)?
+    {
         return Err(AppError::NotFound);
     }
 
@@ -621,6 +657,7 @@ struct AddItemRequest {
         CommonErrors,
         Forbidden403,
         NotFound404,
+        Validation400,
         Conflict409,
     )
 )]
@@ -630,9 +667,10 @@ async fn add_item(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     Json(body): Json<AddItemRequest>,
-) -> Result<(StatusCode, Json<collection_item::CollectionItem>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, id).await?;
+    validate_index(body.index)?;
 
     // The arrangement must live in the same org (else 404, not a leaked FK).
     let arr = crate::domain::arrangement::find_by_id(&state.db, body.arrangement_id).await?;
@@ -667,7 +705,12 @@ async fn add_item(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 /// Fetch one collection item (requires org membership).
@@ -728,6 +771,7 @@ struct UpdateItemRequest {
         CommonErrors,
         Forbidden403,
         NotFound404,
+        Validation400,
         Conflict409,
         Precondition412,
     )
@@ -739,11 +783,12 @@ async fn update_item(
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
     Json(body): Json<UpdateItemRequest>,
-) -> Result<Json<collection_item::CollectionItem>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     let current = find_item_scoped(&state, org_id, collection_id, item_id, false).await?;
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
+    validate_index(body.index)?;
 
     let updated = collection_item::update_index(&state.db, item_id, body.index)
         .await
@@ -764,7 +809,8 @@ async fn update_item(
     )
     .await;
 
-    Ok(Json(updated))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(updated, updated_at))
 }
 
 /// Remove a collection item (owner/archivist/conductor; requires `If-Match`).
