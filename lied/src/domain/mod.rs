@@ -11,6 +11,8 @@
 pub mod app_password;
 pub mod arrangement;
 pub mod audit_log;
+pub mod collection;
+pub mod collection_item;
 pub mod file;
 pub mod instrument;
 pub mod membership;

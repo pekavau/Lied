@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.index,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n        ORDER BY ci.index ASC, ci.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "deleted_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "arrangement_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "arrangement_removed!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "518d8577f51a11262e3c803114cfbe3abf284ea30309ce3a304598d0f32e53e7"
+}
