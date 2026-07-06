@@ -267,6 +267,51 @@ async fn assign(pool: &PgPool, org_id: Uuid, arr_id: Uuid, voice_id: Uuid, user_
     .expect("part_assignment");
 }
 
+async fn seed_collection(pool: &PgPool, org_id: Uuid, slug: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query!(
+        r#"INSERT INTO collection (id, organization_id, name, slug, type)
+           VALUES ($1, $2, $3, $3, 'program')"#,
+        id,
+        org_id,
+        slug,
+    )
+    .execute(pool)
+    .await
+    .expect("collection");
+    id
+}
+
+async fn seed_item(pool: &PgPool, coll_id: Uuid, arr_id: Uuid, index: i32) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query!(
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, index)
+           VALUES ($1, $2, $3, $4)"#,
+        id,
+        coll_id,
+        arr_id,
+        index,
+    )
+    .execute(pool)
+    .await
+    .expect("item");
+    id
+}
+
+async fn seed_part_assignment(pool: &PgPool, item_id: Uuid, voice_id: Uuid, user_id: Uuid) {
+    sqlx::query!(
+        r#"INSERT INTO part_assignment (id, collection_item_id, user_id, voice_id)
+           VALUES ($1, $2, $3, $4)"#,
+        Uuid::now_v7(),
+        item_id,
+        user_id,
+        voice_id,
+    )
+    .execute(pool)
+    .await
+    .expect("part_assignment");
+}
+
 // ── request helpers ──────────────────────────────────────────────────────────
 
 fn basic(u: &SeededUser) -> String {
@@ -646,4 +691,477 @@ async fn soft_deleting_the_collection_revokes_guest_access() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+// ── collections subtree (issue #10, the phase-1 payoff demo) ────────────────
+
+#[tokio::test]
+async fn staff_sees_the_full_collection_tree_in_index_order_including_score() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let alpha = seed_arr(&ctx.pool, org, "alpha").await;
+    let alpha_voice = seed_voice(&ctx.pool, alpha, "flute-1").await;
+    let beta = seed_arr(&ctx.pool, org, "beta").await;
+    let beta_voice = seed_voice(&ctx.pool, beta, "oboe-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+
+    // Upload score + voice files for both arrangements via the arrangements tree.
+    for (arr_slug, voice_slug) in [("alpha", "flute-1"), ("beta", "oboe-1")] {
+        let score_uri = format!("/orgs/acme/arrangements/{arr_slug}/score/full.pdf");
+        let (s, _) = send(
+            &ctx.app,
+            request(
+                "PUT",
+                &score_uri,
+                &basic(&arch),
+                format!("%PDF score {arr_slug}").into_bytes(),
+            ),
+        )
+        .await;
+        assert!(s.is_success(), "score PUT for {arr_slug}");
+        let voice_uri = format!("/orgs/acme/arrangements/{arr_slug}/voices/{voice_slug}/part.pdf");
+        let (s, _) = send(
+            &ctx.app,
+            request(
+                "PUT",
+                &voice_uri,
+                &basic(&arch),
+                format!("%PDF part {arr_slug}").into_bytes(),
+            ),
+        )
+        .await;
+        assert!(s.is_success(), "voice PUT for {arr_slug}");
+    }
+
+    // A program with beta inserted first (index 2) and alpha second (index 1),
+    // out of insertion order, to prove the listing sorts by index, not
+    // creation order.
+    let coll = seed_collection(&ctx.pool, org, "spring").await;
+    let _beta_item = seed_item(&ctx.pool, coll, beta, 2).await;
+    let _alpha_item = seed_item(&ctx.pool, coll, alpha, 1).await;
+    let _ = (alpha_voice, beta_voice);
+
+    // The collections root is visible under the org.
+    let (status, body) = send(
+        &ctx.app,
+        request("PROPFIND", "/orgs/acme", &basic(&arch), vec![]),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    assert!(String::from_utf8_lossy(&body).contains("collections"));
+
+    // The collection appears at /orgs/acme/collections.
+    let (status, body) = send(
+        &ctx.app,
+        request("PROPFIND", "/orgs/acme/collections", &basic(&arch), vec![]),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    assert!(String::from_utf8_lossy(&body).contains("spring"));
+
+    // Both items appear, named `<index>-<arrangement-slug>`, in index order.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("1-alpha"), "item 1 present:\n{body}");
+    assert!(body.contains("2-beta"), "item 2 present:\n{body}");
+    let pos_alpha = body.find("1-alpha").unwrap();
+    let pos_beta = body.find("2-beta").unwrap();
+    assert!(
+        pos_alpha < pos_beta,
+        "items must be listed in index order:\n{body}"
+    );
+
+    // Staff sees both score and voices under an item.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring/1-alpha",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("/score"), "staff sees score:\n{body}");
+    assert!(body.contains("/voices"), "staff sees voices:\n{body}");
+
+    // The score file is readable through the collections tree.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-alpha/score/full.pdf",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, b"%PDF score alpha");
+
+    // As is the voice file.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-alpha/voices/flute-1/part.pdf",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, b"%PDF part alpha");
+}
+
+#[tokio::test]
+async fn guest_with_assignment_sees_only_their_assigned_voice_no_score() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let flute = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let _clarinet = seed_voice(&ctx.pool, arr, "clarinet-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let guest = seed_user(&ctx.pool, org, "guest", None).await; // NO membership
+
+    let (s, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/score/full.pdf",
+            &basic(&arch),
+            b"%PDF score".to_vec(),
+        ),
+    )
+    .await;
+    assert!(s.is_success());
+    let (s, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            b"%PDF flute part".to_vec(),
+        ),
+    )
+    .await;
+    assert!(s.is_success());
+    let (s, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/voices/clarinet-1/part.pdf",
+            &basic(&arch),
+            b"%PDF clarinet part".to_vec(),
+        ),
+    )
+    .await;
+    assert!(s.is_success());
+
+    let coll = seed_collection(&ctx.pool, org, "spring").await;
+    let item = seed_item(&ctx.pool, coll, arr, 1).await;
+    seed_part_assignment(&ctx.pool, item, flute, guest.id).await;
+
+    // The guest sees the collection and the item (in order).
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    assert!(String::from_utf8_lossy(&body).contains("1-bolero"));
+
+    // No score dir in the item listing.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring/1-bolero",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("/score"),
+        "guest must not see score:\n{body}"
+    );
+    assert!(body.contains("/voices"), "guest sees voices dir:\n{body}");
+
+    // Only the assigned voice appears in the voices listing.
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring/1-bolero/voices",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("flute-1"), "assigned voice visible:\n{body}");
+    assert!(
+        !body.contains("clarinet-1"),
+        "unassigned voice hidden:\n{body}"
+    );
+
+    // Direct GET of the score is 404 (hidden, not 403).
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-bolero/score/full.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    // The assigned voice's part is readable...
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-bolero/voices/flute-1/part.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, b"%PDF flute part");
+
+    // ...but the unassigned voice's part is not.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-bolero/voices/clarinet-1/part.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn musician_member_sees_only_assigned_voice_no_score_in_collections_tree() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let flute = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let _clarinet = seed_voice(&ctx.pool, arr, "clarinet-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let muso = seed_user(&ctx.pool, org, "muso", Some("musician")).await;
+
+    send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/score/full.pdf",
+            &basic(&arch),
+            b"%PDF score".to_vec(),
+        ),
+    )
+    .await;
+    send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            b"%PDF flute part".to_vec(),
+        ),
+    )
+    .await;
+
+    let coll = seed_collection(&ctx.pool, org, "spring").await;
+    let item = seed_item(&ctx.pool, coll, arr, 1).await;
+    seed_part_assignment(&ctx.pool, item, flute, muso.id).await;
+
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring/1-bolero",
+            &basic(&muso),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("/score"),
+        "musician must not see full score:\n{body}"
+    );
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-bolero/voices/flute-1/part.pdf",
+            &basic(&muso),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn collections_subtree_is_read_only() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+
+    send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            b"%PDF x".to_vec(),
+        ),
+    )
+    .await;
+
+    let coll = seed_collection(&ctx.pool, org, "spring").await;
+    let item = seed_item(&ctx.pool, coll, arr, 1).await;
+    seed_part_assignment(&ctx.pool, item, voice, arch.id).await;
+
+    // Archivist (staff, write-capable on the arrangements tree) still cannot
+    // write through the read-only collections view.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/collections/spring/1-bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            b"%PDF replacement".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "PUT rejected");
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "DELETE",
+            "/orgs/acme/collections/spring/1-bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "DELETE rejected");
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "MKCOL",
+            "/orgs/acme/collections/spring/1-bolero/voices/new-voice",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "MKCOL rejected");
+}
+
+#[tokio::test]
+async fn assignment_visibility_is_scoped_to_the_specific_item_not_the_whole_arrangement() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let guest = seed_user(&ctx.pool, org, "guest", None).await;
+
+    send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf",
+            &basic(&arch),
+            b"%PDF x".to_vec(),
+        ),
+    )
+    .await;
+
+    // Two different programs both feature the same arrangement/voice. The
+    // guest is assigned on item A (in collection "spring") but NOT on item B
+    // (in collection "summer") — visibility must be scoped to item A only.
+    let coll_a = seed_collection(&ctx.pool, org, "spring").await;
+    let item_a = seed_item(&ctx.pool, coll_a, arr, 1).await;
+    seed_part_assignment(&ctx.pool, item_a, voice, guest.id).await;
+
+    let coll_b = seed_collection(&ctx.pool, org, "summer").await;
+    let _item_b = seed_item(&ctx.pool, coll_b, arr, 1).await; // no assignment here
+
+    // Readable through item A.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/spring/1-bolero/voices/flute-1/part.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // NOT reachable through item B, despite being the same arrangement/voice.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "GET",
+            "/orgs/acme/collections/summer/1-bolero/voices/flute-1/part.pdf",
+            &basic(&guest),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "assignment on item A must not leak visibility to item B"
+    );
+
+    // And "summer" itself is entirely absent from the guest's collections listing.
+    let (status, body) = send(
+        &ctx.app,
+        request("PROPFIND", "/orgs/acme/collections", &basic(&guest), vec![]),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("spring"), "spring visible:\n{body}");
+    assert!(!body.contains("summer"), "summer hidden:\n{body}");
 }

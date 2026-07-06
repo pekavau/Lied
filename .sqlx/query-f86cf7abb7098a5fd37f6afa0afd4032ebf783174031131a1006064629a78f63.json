@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ci.id as item_id, ci.arrangement_id, a.slug as arr_slug\n               FROM collection_item ci\n               JOIN arrangement a ON a.id = ci.arrangement_id\n               WHERE ci.collection_id = $1 AND ci.index = $2\n                 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "arr_slug",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f86cf7abb7098a5fd37f6afa0afd4032ebf783174031131a1006064629a78f63"
+}

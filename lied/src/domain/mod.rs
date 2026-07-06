@@ -17,6 +17,7 @@ pub mod file;
 pub mod instrument;
 pub mod membership;
 pub mod organization;
+pub mod part_assignment;
 pub mod tag;
 pub mod user;
 pub mod voice;

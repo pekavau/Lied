@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE part_assignment\n        SET notified_at = COALESCE(to_timestamp($2::double precision / 1000.0), notified_at),\n            acknowledged_at = COALESCE(to_timestamp($3::double precision / 1000.0), acknowledged_at),\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "voice_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "notified_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "acknowledged_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "00b35341061e9f90f878d13e40537b3458840f9b2bc56f2dafa08168828020b8"
+}

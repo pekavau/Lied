@@ -175,6 +175,7 @@ pub enum Range416 {
         (name = "tags",          description = "Per-org open-ended classifiers"),
         (name = "files",         description = "Score and voice files (MinIO-backed, streamed)"),
         (name = "collections",   description = "Programs & standing repertoire (indexed sets of arrangements)"),
+        (name = "part-assignments", description = "Which user plays which voice for a collection item"),
     ),
     components(schemas(ProblemDetails)),
 )]

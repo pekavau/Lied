@@ -180,6 +180,179 @@ pub async fn has_assignment_on_voice(
     .await
 }
 
+// ── collections subtree (read-only computed view, issue #10) ───────────────
+//
+// The collections subtree is "not a separate permission domain" (CLAUDE.md):
+// whatever a restricted user may see under `arrangements/` they may see here,
+// scoped to *this specific collection item* rather than "any item ever". A
+// restricted user (musician member, or guest with no membership) sees only
+// collections/items they hold >=1 assignment on — mirroring the
+// arrangements-root PROPFIND-scope rule (hide entirely, not an empty
+// placeholder) — and within a visible item, only the voices they are
+// assigned to on *that item*; the full score is always staff-only.
+
+/// Whether a restricted user may see a collection at all — i.e. holds >=1
+/// part assignment on one of its live items. Staff always may; callers
+/// should short-circuit on [`Visibility::is_staff`] before calling this.
+pub async fn has_assignment_in_collection(
+    pool: &PgPool,
+    collection_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM part_assignment pa
+             JOIN collection_item ci ON ci.id = pa.collection_item_id
+             WHERE ci.collection_id = $1 AND pa.user_id = $2 AND ci.deleted_at IS NULL
+           ) AS "exists!""#,
+        collection_id,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Whether a restricted user may see a specific collection item — i.e. holds
+/// >=1 part assignment on it (any voice). Staff always may.
+pub async fn has_assignment_on_item(
+    pool: &PgPool,
+    collection_item_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM part_assignment pa
+             WHERE pa.collection_item_id = $1 AND pa.user_id = $2
+           ) AS "exists!""#,
+        collection_item_id,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Whether a user holds a part assignment on `voice_id` **specifically for
+/// `collection_item_id`** — stricter than [`has_assignment_on_voice`], which
+/// matches the voice on *any* item. The collections-subtree view scopes
+/// visibility to one concert program's item, not "this voice, on whichever
+/// item it was ever assigned".
+pub async fn has_assignment_on_item_voice(
+    pool: &PgPool,
+    collection_item_id: Uuid,
+    voice_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM part_assignment pa
+             WHERE pa.collection_item_id = $1 AND pa.voice_id = $2 AND pa.user_id = $3
+           ) AS "exists!""#,
+        collection_item_id,
+        voice_id,
+        user_id,
+    )
+    .fetch_one(pool)
+    .await
+}
+
+/// Collection slugs visible to a user in an org: staff see every live
+/// collection; a restricted user sees only collections containing >=1 item
+/// they hold an assignment on. Ordered by slug.
+pub async fn visible_collection_slugs(
+    pool: &PgPool,
+    org_id: Uuid,
+    user_id: Uuid,
+    visibility: Visibility,
+) -> Result<Vec<String>, sqlx::Error> {
+    if visibility.is_staff() {
+        sqlx::query_scalar!(
+            r#"SELECT slug FROM collection
+               WHERE organization_id = $1 AND deleted_at IS NULL
+               ORDER BY slug"#,
+            org_id,
+        )
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_scalar!(
+            r#"SELECT DISTINCT c.slug FROM collection c
+               JOIN collection_item ci ON ci.collection_id = c.id
+               JOIN part_assignment pa ON pa.collection_item_id = ci.id
+               WHERE c.organization_id = $1 AND c.deleted_at IS NULL
+                 AND ci.deleted_at IS NULL AND pa.user_id = $2
+               ORDER BY c.slug"#,
+            org_id,
+            user_id,
+        )
+        .fetch_all(pool)
+        .await
+    }
+}
+
+/// A live collection item as seen through the WebDAV collections tree: its id,
+/// index, and its arrangement's slug (the item's WebDAV directory name is
+/// `<index>-<arrangementSlug>`). An item whose arrangement is soft-deleted is
+/// excluded — unlike the REST hide-with-references view (CLAUDE.md
+/// `CollectionItemView::arrangement_removed`), there is no meaningful
+/// directory to show for a filesystem view with no live files behind it.
+pub struct VisibleCollectionItem {
+    pub id: Uuid,
+    pub index: i32,
+    pub arrangement_slug: String,
+}
+
+/// Live items in a collection, in index order, visible to the user: staff see
+/// all; a restricted user sees only items they hold >=1 assignment on.
+pub async fn visible_collection_items(
+    pool: &PgPool,
+    collection_id: Uuid,
+    user_id: Uuid,
+    visibility: Visibility,
+) -> Result<Vec<VisibleCollectionItem>, sqlx::Error> {
+    if visibility.is_staff() {
+        let rows = sqlx::query!(
+            r#"SELECT ci.id, ci.index, a.slug as arrangement_slug
+               FROM collection_item ci
+               JOIN arrangement a ON a.id = ci.arrangement_id
+               WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL
+               ORDER BY ci.index ASC, ci.id ASC"#,
+            collection_id,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| VisibleCollectionItem {
+                id: r.id,
+                index: r.index,
+                arrangement_slug: r.arrangement_slug,
+            })
+            .collect())
+    } else {
+        let rows = sqlx::query!(
+            r#"SELECT DISTINCT ci.id, ci.index, a.slug as arrangement_slug
+               FROM collection_item ci
+               JOIN arrangement a ON a.id = ci.arrangement_id
+               JOIN part_assignment pa ON pa.collection_item_id = ci.id
+               WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL
+                 AND pa.user_id = $2
+               ORDER BY ci.index ASC, ci.id ASC"#,
+            collection_id,
+            user_id,
+        )
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| VisibleCollectionItem {
+                id: r.id,
+                index: r.index,
+                arrangement_slug: r.arrangement_slug,
+            })
+            .collect())
+    }
+}
+
 /// Org slugs a user has any relationship with — a membership, or a part
 /// assignment (guest/substitute). Used to scope the `/orgs` root listing so it
 /// does not enumerate every org on the instance. Ordered by slug.
