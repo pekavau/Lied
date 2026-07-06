@@ -6,16 +6,18 @@
 //! here are *candidate* slugs that the filesystem layer still resolves to live
 //! rows (and applies soft-delete / per-role visibility to).
 //!
-//! Two trees:
+//! Three trees:
 //! - `/orgs/<org>/arrangements/<arr>/{score,voices/<voice>/{<file>,annotations/<user>/<file>}}`
+//! - `/orgs/<org>/collections/<coll>/<index>-<arr>/{score,voices/<voice>/<file>}` —
+//!   a read-only computed view assembled from `CollectionItem`s +
+//!   `PartAssignment`s (issue #10). No annotations subtree here: annotations
+//!   are addressed via the arrangements tree only.
 //! - `/users/<user>/library/<rel…>` (private, files-by-convention, no `File` rows)
-//!
-//! The `collections/` subtree (CLAUDE.md: read-only computed view) is issue #9
-//! and is intentionally not resolved here.
 
 /// The structural keyword segments that are part of the fixed tree shape rather
 /// than user-named slugs.
 const ARRANGEMENTS: &str = "arrangements";
+const COLLECTIONS: &str = "collections";
 const SCORE: &str = "score";
 const VOICES: &str = "voices";
 const ANNOTATIONS: &str = "annotations";
@@ -80,6 +82,54 @@ pub enum ResolvedPath {
         arr: String,
         voice: String,
         user: String,
+        file: String,
+    },
+
+    // ── collections tree (read-only computed view, issue #10) ───────────────
+    /// `/orgs/<org>/collections`
+    CollectionsRoot { org: String },
+    /// `/orgs/<org>/collections/<coll>`
+    Collection { org: String, coll: String },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>` — `item` is the raw
+    /// `<index>-<arrangement-slug>` segment; the filesystem layer splits and
+    /// resolves it against the live `CollectionItem`.
+    CollectionItemDir {
+        org: String,
+        coll: String,
+        item: String,
+    },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/score`
+    CollectionScoreDir {
+        org: String,
+        coll: String,
+        item: String,
+    },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/score/<file>`
+    CollectionScoreFile {
+        org: String,
+        coll: String,
+        item: String,
+        file: String,
+    },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices`
+    CollectionVoicesDir {
+        org: String,
+        coll: String,
+        item: String,
+    },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices/<voice>`
+    CollectionVoice {
+        org: String,
+        coll: String,
+        item: String,
+        voice: String,
+    },
+    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices/<voice>/<file>`
+    CollectionVoiceFile {
+        org: String,
+        coll: String,
+        item: String,
+        voice: String,
         file: String,
     },
 
@@ -189,6 +239,52 @@ impl ResolvedPath {
                 file: (*file).to_string(),
             }),
 
+            // collections/ (read-only computed view) — must be matched at the
+            // same level as ARRANGEMENTS, before the catch-all.
+            ["orgs", org, COLLECTIONS] => Some(CollectionsRoot {
+                org: (*org).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll] => Some(Collection {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item] => Some(CollectionItemDir {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+                item: (*item).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item, SCORE] => Some(CollectionScoreDir {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+                item: (*item).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item, SCORE, file] => Some(CollectionScoreFile {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+                item: (*item).to_string(),
+                file: (*file).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item, VOICES] => Some(CollectionVoicesDir {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+                item: (*item).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item, VOICES, voice] => Some(CollectionVoice {
+                org: (*org).to_string(),
+                coll: (*coll).to_string(),
+                item: (*item).to_string(),
+                voice: (*voice).to_string(),
+            }),
+            ["orgs", org, COLLECTIONS, coll, item, VOICES, voice, file] => {
+                Some(CollectionVoiceFile {
+                    org: (*org).to_string(),
+                    coll: (*coll).to_string(),
+                    item: (*item).to_string(),
+                    voice: (*voice).to_string(),
+                    file: (*file).to_string(),
+                })
+            }
+
             ["users"] => Some(UsersRoot),
             ["users", user] => Some(UserHome {
                 user: (*user).to_string(),
@@ -222,6 +318,12 @@ impl ResolvedPath {
                 | Voice { .. }
                 | AnnotationsDir { .. }
                 | AnnotationsUserDir { .. }
+                | CollectionsRoot { .. }
+                | Collection { .. }
+                | CollectionItemDir { .. }
+                | CollectionScoreDir { .. }
+                | CollectionVoicesDir { .. }
+                | CollectionVoice { .. }
                 | UsersRoot
                 | UserHome { .. }
                 | LibraryRoot { .. }
@@ -339,6 +441,105 @@ mod tests {
                 user: "alice".into(),
                 file: "bowings.pdf".into()
             })
+        );
+    }
+
+    #[test]
+    fn collections_tree() {
+        assert_eq!(
+            p("/orgs/acme/collections"),
+            Some(CollectionsRoot { org: "acme".into() })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026"),
+            Some(Collection {
+                org: "acme".into(),
+                coll: "spring-2026".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero"),
+            Some(CollectionItemDir {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/score"),
+            Some(CollectionScoreDir {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/score/full.pdf"),
+            Some(CollectionScoreFile {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into(),
+                file: "full.pdf".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/voices"),
+            Some(CollectionVoicesDir {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/voices/flute-1"),
+            Some(CollectionVoice {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into(),
+                voice: "flute-1".into()
+            })
+        );
+        assert_eq!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/voices/flute-1/part.pdf"),
+            Some(CollectionVoiceFile {
+                org: "acme".into(),
+                coll: "spring-2026".into(),
+                item: "1-bolero".into(),
+                voice: "flute-1".into(),
+                file: "part.pdf".into()
+            })
+        );
+    }
+
+    #[test]
+    fn is_collection_classification_for_collections_tree() {
+        assert!(p("/orgs/acme/collections").unwrap().is_collection());
+        assert!(p("/orgs/acme/collections/spring-2026")
+            .unwrap()
+            .is_collection());
+        assert!(p("/orgs/acme/collections/spring-2026/1-bolero")
+            .unwrap()
+            .is_collection());
+        assert!(p("/orgs/acme/collections/spring-2026/1-bolero/score")
+            .unwrap()
+            .is_collection());
+        assert!(
+            !p("/orgs/acme/collections/spring-2026/1-bolero/score/full.pdf")
+                .unwrap()
+                .is_collection()
+        );
+        assert!(p("/orgs/acme/collections/spring-2026/1-bolero/voices")
+            .unwrap()
+            .is_collection());
+        assert!(
+            p("/orgs/acme/collections/spring-2026/1-bolero/voices/flute-1")
+                .unwrap()
+                .is_collection()
+        );
+        assert!(
+            !p("/orgs/acme/collections/spring-2026/1-bolero/voices/flute-1/part.pdf")
+                .unwrap()
+                .is_collection()
         );
     }
 

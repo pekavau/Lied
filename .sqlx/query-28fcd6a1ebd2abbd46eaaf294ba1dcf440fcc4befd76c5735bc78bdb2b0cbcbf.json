@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n             SELECT 1 FROM part_assignment pa\n             JOIN collection_item ci ON ci.id = pa.collection_item_id\n             WHERE ci.collection_id = $1 AND pa.user_id = $2 AND ci.deleted_at IS NULL\n           ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "28fcd6a1ebd2abbd46eaaf294ba1dcf440fcc4befd76c5735bc78bdb2b0cbcbf"
+}

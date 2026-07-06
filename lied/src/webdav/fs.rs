@@ -79,6 +79,24 @@ fn parse_path(path: &DavPath) -> FsResult<ResolvedPath> {
     ResolvedPath::parse(s).ok_or(FsError::NotFound)
 }
 
+/// Split a collections-tree item directory segment (`<index>-<arrangement
+/// slug>`, e.g. `1-bolero`) into `(index, arrangement_slug)`. Splits on the
+/// *first* `-` only, since the index is always a plain non-negative integer
+/// with no `-` of its own (this exactly inverts the construction in
+/// [`LiedFs::list`]'s `Collection` arm) — the arrangement slug may itself
+/// contain further hyphens. Returns `None` if the segment doesn't have the
+/// `<digits>-<rest>` shape.
+fn parse_item_segment(seg: &str) -> Option<(i32, &str)> {
+    let dash = seg.find('-')?;
+    let (idx_str, rest) = seg.split_at(dash);
+    let index: i32 = idx_str.parse().ok()?;
+    let arr_slug = &rest[1..];
+    if arr_slug.is_empty() {
+        return None;
+    }
+    Some((index, arr_slug))
+}
+
 // ── leaf metadata / dir-entry types ──────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -266,6 +284,178 @@ impl LiedFs {
         Ok(rows)
     }
 
+    // ── collections tree (read-only computed view, issue #10) ──────────────
+
+    async fn collection_id_by_slug(&self, org_id: Uuid, slug: &str) -> FsResult<Option<Uuid>> {
+        let row = sqlx::query_scalar!(
+            r#"SELECT id FROM collection
+               WHERE organization_id = $1 AND slug = $2 AND deleted_at IS NULL"#,
+            org_id,
+            slug,
+        )
+        .fetch_optional(&self.state.db)
+        .await
+        .map_err(db_err)?;
+        Ok(row)
+    }
+
+    /// Resolve a collection to `(org_id, collection_id, visibility)`,
+    /// enforcing the collections-subtree scope rule: a restricted user who
+    /// holds no assignment anywhere in the collection gets `NotFound`
+    /// (hidden, not 403) — mirrors [`Self::resolve_arr`].
+    async fn resolve_collection(
+        &self,
+        org: &str,
+        coll: &str,
+    ) -> FsResult<(Uuid, Uuid, Visibility)> {
+        let (org_id, vis) = access::resolve_org_visibility(&self.state.db, org, self.user_id)
+            .await
+            .map_err(db_err)?
+            .ok_or(FsError::NotFound)?;
+        let coll_id = self
+            .collection_id_by_slug(org_id, coll)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        if !vis.is_staff()
+            && !access::has_assignment_in_collection(&self.state.db, coll_id, self.user_id)
+                .await
+                .map_err(db_err)?
+        {
+            return Err(FsError::NotFound);
+        }
+        Ok((org_id, coll_id, vis))
+    }
+
+    /// Resolve a `<index>-<arr-slug>` item segment to
+    /// `(org_id, collection_id, item_id, arrangement_id, arrangement_slug,
+    /// visibility)`. Enforces that a restricted user holds >=1 assignment on
+    /// this specific item (stricter than the collection-level check).
+    async fn resolve_collection_item(
+        &self,
+        org: &str,
+        coll: &str,
+        item_seg: &str,
+    ) -> FsResult<(Uuid, Uuid, Uuid, Uuid, String, Visibility)> {
+        let (org_id, coll_id, vis) = self.resolve_collection(org, coll).await?;
+        let (index, arr_slug) = parse_item_segment(item_seg).ok_or(FsError::NotFound)?;
+
+        let row = sqlx::query!(
+            r#"SELECT ci.id as item_id, ci.arrangement_id, a.slug as arr_slug
+               FROM collection_item ci
+               JOIN arrangement a ON a.id = ci.arrangement_id
+               WHERE ci.collection_id = $1 AND ci.index = $2
+                 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL"#,
+            coll_id,
+            index,
+        )
+        .fetch_optional(&self.state.db)
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else {
+            return Err(FsError::NotFound);
+        };
+        // The index resolved to a real item, but its arrangement slug doesn't
+        // match the path segment (stale client cache, or a tampered path) —
+        // treat as not found rather than silently serving the wrong item.
+        if row.arr_slug != arr_slug {
+            return Err(FsError::NotFound);
+        }
+
+        if !vis.is_staff()
+            && !access::has_assignment_on_item(&self.state.db, row.item_id, self.user_id)
+                .await
+                .map_err(db_err)?
+        {
+            return Err(FsError::NotFound);
+        }
+
+        Ok((
+            org_id,
+            coll_id,
+            row.item_id,
+            row.arrangement_id,
+            row.arr_slug,
+            vis,
+        ))
+    }
+
+    /// Resolve a voice within a collection item to `(org_id, collection_id,
+    /// item_id, arrangement_id, arrangement_slug, voice_id)`. Enforces that a
+    /// restricted user is assigned to *this voice on this item specifically*
+    /// (CLAUDE.md: stricter than the arrangements-tree assignment check,
+    /// which matches the voice on any item).
+    async fn resolve_collection_voice(
+        &self,
+        org: &str,
+        coll: &str,
+        item_seg: &str,
+        voice: &str,
+    ) -> FsResult<(Uuid, Uuid, Uuid, Uuid, String, Uuid)> {
+        let (org_id, coll_id, item_id, arr_id, arr_slug, vis) =
+            self.resolve_collection_item(org, coll, item_seg).await?;
+        let voice_id = self
+            .voice_id_by_slug(arr_id, voice)
+            .await?
+            .ok_or(FsError::NotFound)?;
+        if !vis.is_staff()
+            && !access::has_assignment_on_item_voice(
+                &self.state.db,
+                item_id,
+                voice_id,
+                self.user_id,
+            )
+            .await
+            .map_err(db_err)?
+        {
+            return Err(FsError::NotFound);
+        }
+        Ok((org_id, coll_id, item_id, arr_id, arr_slug, voice_id))
+    }
+
+    /// Voice `(id, slug)` pairs a user may see under a specific collection
+    /// item: staff see every live voice of the item's arrangement; a
+    /// restricted user sees only voices they are assigned to **on this
+    /// item** (not on the arrangement generally — see
+    /// [`Self::resolve_collection_voice`]).
+    async fn visible_item_voices(
+        &self,
+        item_id: Uuid,
+        arr_id: Uuid,
+        vis: Visibility,
+    ) -> FsResult<Vec<(Uuid, String)>> {
+        let rows = if vis.is_staff() {
+            sqlx::query!(
+                r#"SELECT id, slug FROM voice
+                   WHERE arrangement_id = $1 AND deleted_at IS NULL ORDER BY slug"#,
+                arr_id,
+            )
+            .fetch_all(&self.state.db)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|r| (r.id, r.slug))
+            .collect()
+        } else {
+            sqlx::query!(
+                r#"SELECT DISTINCT v.id, v.slug FROM voice v
+                   JOIN part_assignment pa ON pa.voice_id = v.id
+                   WHERE v.arrangement_id = $1 AND v.deleted_at IS NULL
+                     AND pa.collection_item_id = $2 AND pa.user_id = $3
+                   ORDER BY v.slug"#,
+                arr_id,
+                item_id,
+                self.user_id,
+            )
+            .fetch_all(&self.state.db)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|r| (r.id, r.slug))
+            .collect()
+        };
+        Ok(rows)
+    }
+
     /// The WebDAV filename + size + mtime for each live file under
     /// `(arr, voice)` (`voice = None` → full-score files).
     async fn file_entries(
@@ -377,6 +567,68 @@ impl LiedFs {
                 self.resolve_voice(org, arr, voice).await?;
                 let key = annotation_key(org, arr, voice, user, file);
                 self.stat_object(&key).await
+            }
+
+            CollectionsRoot { org } => {
+                access::find_org_id(&self.state.db, org)
+                    .await
+                    .map_err(db_err)?
+                    .ok_or(FsError::NotFound)?;
+                Ok(LiedMeta::dir())
+            }
+            Collection { org, coll } => {
+                self.resolve_collection(org, coll).await?;
+                Ok(LiedMeta::dir())
+            }
+            CollectionItemDir { org, coll, item } => {
+                self.resolve_collection_item(org, coll, item).await?;
+                Ok(LiedMeta::dir())
+            }
+            CollectionScoreDir { org, coll, item } => {
+                let (.., vis) = self.resolve_collection_item(org, coll, item).await?;
+                if !vis.is_staff() {
+                    return Err(FsError::NotFound);
+                }
+                Ok(LiedMeta::dir())
+            }
+            CollectionVoicesDir { org, coll, item } => {
+                self.resolve_collection_item(org, coll, item).await?;
+                Ok(LiedMeta::dir())
+            }
+            CollectionVoice {
+                org,
+                coll,
+                item,
+                voice,
+            } => {
+                self.resolve_collection_voice(org, coll, item, voice)
+                    .await?;
+                Ok(LiedMeta::dir())
+            }
+            CollectionScoreFile {
+                org,
+                coll,
+                item,
+                file,
+            } => {
+                let (_o, _c, _i, arr_id, _arr_slug, vis) =
+                    self.resolve_collection_item(org, coll, item).await?;
+                if !vis.is_staff() {
+                    return Err(FsError::NotFound);
+                }
+                self.stat_org_file(arr_id, None, file).await
+            }
+            CollectionVoiceFile {
+                org,
+                coll,
+                item,
+                voice,
+                file,
+            } => {
+                let (_o, _c, _i, arr_id, _arr_slug, voice_id) = self
+                    .resolve_collection_voice(org, coll, item, voice)
+                    .await?;
+                self.stat_org_file(arr_id, Some(voice_id), file).await
             }
 
             UserHome { user } | LibraryRoot { user } => {
@@ -515,6 +767,7 @@ impl LiedFs {
                     .map_err(db_err)?
                     .ok_or(FsError::NotFound)?;
                 out.push(dir_entry("arrangements", LiedMeta::dir()));
+                out.push(dir_entry("collections", LiedMeta::dir()));
             }
             ArrangementsRoot { org } => {
                 let (org_id, vis) =
@@ -591,6 +844,76 @@ impl LiedFs {
                     ));
                 }
             }
+            CollectionsRoot { org } => {
+                let (org_id, vis) =
+                    access::resolve_org_visibility(&self.state.db, org, self.user_id)
+                        .await
+                        .map_err(db_err)?
+                        .ok_or(FsError::NotFound)?;
+                for slug in
+                    access::visible_collection_slugs(&self.state.db, org_id, self.user_id, vis)
+                        .await
+                        .map_err(db_err)?
+                {
+                    out.push(dir_entry(slug.into_bytes(), LiedMeta::dir()));
+                }
+            }
+            Collection { org, coll } => {
+                let (_o, coll_id, vis) = self.resolve_collection(org, coll).await?;
+                for item in
+                    access::visible_collection_items(&self.state.db, coll_id, self.user_id, vis)
+                        .await
+                        .map_err(db_err)?
+                {
+                    out.push(dir_entry(
+                        format!("{}-{}", item.index, item.arrangement_slug).into_bytes(),
+                        LiedMeta::dir(),
+                    ));
+                }
+            }
+            CollectionItemDir { org, coll, item } => {
+                let (.., vis) = self.resolve_collection_item(org, coll, item).await?;
+                if vis.is_staff() {
+                    out.push(dir_entry("score", LiedMeta::dir()));
+                }
+                out.push(dir_entry("voices", LiedMeta::dir()));
+            }
+            CollectionScoreDir { org, coll, item } => {
+                let (_o, _c, _i, arr_id, arr_slug, vis) =
+                    self.resolve_collection_item(org, coll, item).await?;
+                if !vis.is_staff() {
+                    return Err(FsError::NotFound);
+                }
+                for e in self
+                    .file_entries(org, &arr_slug, None, arr_id, None)
+                    .await?
+                {
+                    out.push(Box::new(e));
+                }
+            }
+            CollectionVoicesDir { org, coll, item } => {
+                let (_o, _c, item_id, arr_id, _arr_slug, vis) =
+                    self.resolve_collection_item(org, coll, item).await?;
+                for (_id, slug) in self.visible_item_voices(item_id, arr_id, vis).await? {
+                    out.push(dir_entry(slug.into_bytes(), LiedMeta::dir()));
+                }
+            }
+            CollectionVoice {
+                org,
+                coll,
+                item,
+                voice,
+            } => {
+                let (_o, _c, _i, arr_id, arr_slug, voice_id) = self
+                    .resolve_collection_voice(org, coll, item, voice)
+                    .await?;
+                for e in self
+                    .file_entries(org, &arr_slug, Some(voice), arr_id, Some(voice_id))
+                    .await?
+                {
+                    out.push(Box::new(e));
+                }
+            }
             UsersRoot => {
                 out.push(dir_entry(
                     self.user_slug.clone().into_bytes(),
@@ -611,7 +934,11 @@ impl LiedFs {
                 self.list_library(&format!("{}/", library_key(user, rel)), &mut out)
                     .await?;
             }
-            ScoreFile { .. } | VoiceFile { .. } | AnnotationFile { .. } => {
+            ScoreFile { .. }
+            | VoiceFile { .. }
+            | AnnotationFile { .. }
+            | CollectionScoreFile { .. }
+            | CollectionVoiceFile { .. } => {
                 return Err(FsError::Forbidden);
             }
         }
@@ -933,6 +1260,33 @@ impl LiedFs {
                 let key = library_key(user, rel);
                 let meta = self.stat_object(&key).await?;
                 Ok((key, meta))
+            }
+            CollectionScoreFile {
+                org,
+                coll,
+                item,
+                file,
+            } => {
+                let (_o, _c, _i, arr_id, arr_slug, vis) =
+                    self.resolve_collection_item(org, coll, item).await?;
+                if !vis.is_staff() {
+                    return Err(FsError::NotFound);
+                }
+                self.org_file_key(org, &arr_slug, None, arr_id, None, file)
+                    .await
+            }
+            CollectionVoiceFile {
+                org,
+                coll,
+                item,
+                voice,
+                file,
+            } => {
+                let (_o, _c, _i, arr_id, arr_slug, voice_id) = self
+                    .resolve_collection_voice(org, coll, item, voice)
+                    .await?;
+                self.org_file_key(org, &arr_slug, Some(voice), arr_id, Some(voice_id), file)
+                    .await
             }
             _ => Err(FsError::Forbidden),
         }

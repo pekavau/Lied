@@ -20,6 +20,7 @@ pub mod files;
 pub mod infra;
 pub mod openapi;
 pub mod orgs;
+pub mod part_assignments;
 pub mod v1;
 pub mod webdav;
 
