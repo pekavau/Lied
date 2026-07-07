@@ -29,7 +29,7 @@ use crate::auth::authz::{require_collection_editor_v1, require_org_role_v1};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
-use crate::domain::{collection, collection_item, part_assignment, user};
+use crate::domain::{collection, collection_item, part_assignment};
 use crate::error::AppError;
 use crate::pagination::Page;
 use crate::routes::openapi::{
@@ -50,12 +50,6 @@ pub fn router() -> OpenApiRouter<AppState> {
 
 // ── shared helpers (duplicated per-module per existing convention — see
 // routes::collections for the same shapes) ─────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct ListQuery {
-    limit: Option<u32>,
-    offset: Option<u32>,
-}
 
 fn if_match_header(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -188,16 +182,13 @@ async fn list_assignments(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
-    Query(q): Query<ListQuery>,
+    Query(params): Query<crate::pagination::PageParams>,
 ) -> Result<Json<Page<part_assignment::PartAssignment>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
 
-    let (limit, offset) = crate::pagination::PageParams {
-        limit: q.limit,
-        offset: q.offset,
-    }
-    .resolve(state.config.default_page_size, state.config.max_page_size);
+    let (limit, offset) =
+        params.resolve(state.config.default_page_size, state.config.max_page_size);
 
     let (items, total) =
         part_assignment::list_for_item(&state.db, item_id, i64::from(limit), i64::from(offset))
@@ -228,6 +219,12 @@ struct AssignRequest {
 /// so re-issuing the same request with a different `userId` is a replace, not
 /// a new resource — the idiomatic `PUT` semantic. `201` on a fresh
 /// assignment, `200` when it replaced an existing one.
+///
+/// A replace is a mutation of an existing resource, so it carries the same
+/// optimistic-concurrency contract as PATCH/DELETE: when an assignment already
+/// exists for `(item, voice)`, the caller MUST send a matching `If-Match`
+/// (from a prior GET/list); a missing or stale value → `412`. A first-time
+/// assignment has no prior ETag, so the header is not required for creates.
 #[utoipa::path(
     put,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments",
@@ -237,6 +234,8 @@ struct AssignRequest {
         ("orgId"        = Uuid, Path, description = "Organization ID"),
         ("collectionId" = Uuid, Path, description = "Collection ID"),
         ("itemId"       = Uuid, Path, description = "Collection item ID"),
+        ("If-Match" = Option<String>, Header,
+            description = "Required when replacing an existing assignment; ETag from a prior GET/list, stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = AssignRequest,
@@ -250,6 +249,7 @@ struct AssignRequest {
         NotFound404,
         Validation400,
         Conflict409,
+        Precondition412,
     )
 )]
 async fn assign_voice(
@@ -257,16 +257,22 @@ async fn assign_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
     Json(body): Json<AssignRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
 
-    // The referenced user must exist — checked here (rather than relying on
-    // the FK-violation fallback in the domain layer) so the error message is
-    // specific to the field at fault.
-    if user::find_by_id(&state.db, body.user_id).await?.is_none() {
-        return Err(empty_field("userId", "user does not exist"));
+    // A replace overwrites an existing assignee (and resets notified/
+    // acknowledged), so guard it with `If-Match` against the current row. A
+    // fresh assignment has no prior ETag and so needs no header. An unknown
+    // `userId` is surfaced by the domain layer's FK-violation mapping (→ 400
+    // on `userId`), so no separate existence pre-check is needed here.
+    if let Some(existing) =
+        part_assignment::find_by_item_voice(&state.db, item_id, body.voice_id).await?
+    {
+        crate::listing::check_if_match(if_match_header(&headers), existing.updated_at)
+            .map_err(|_| AppError::PreconditionFailed)?;
     }
 
     let id = Uuid::now_v7();

@@ -356,7 +356,7 @@ async fn reassignment_replaces_the_row() {
     let bob = create_user(&ctx.pool, "bob").await;
 
     let url = assignments_url(ctx.org, coll, item);
-    let (s1, first, _h) = send(
+    let (s1, first, h1) = send(
         &ctx.app,
         req(
             "PUT",
@@ -368,14 +368,34 @@ async fn reassignment_replaces_the_row() {
     .await;
     assert_eq!(s1, axum::http::StatusCode::CREATED);
     let first_id = first["id"].as_str().unwrap().to_string();
+    let etag = h1.get("etag").unwrap().to_str().unwrap().to_string();
 
-    // Reassign the same (item, voice) to bob.
-    let (s2, second, _h) = send(
+    // A replace without If-Match is rejected — same optimistic-concurrency
+    // contract as PATCH/DELETE.
+    let (s_missing, _b, _h) = send(
         &ctx.app,
         req(
             "PUT",
             &url,
             &tok,
+            Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s_missing,
+        axum::http::StatusCode::PRECONDITION_FAILED,
+        "reassignment requires If-Match"
+    );
+
+    // Reassign the same (item, voice) to bob, presenting the current ETag.
+    let (s2, second, _h) = send(
+        &ctx.app,
+        req_with_if_match(
+            "PUT",
+            &url,
+            &tok,
+            Some(&etag),
             Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
         ),
     )
@@ -421,7 +441,7 @@ async fn reassigning_to_a_different_user_clears_notified_and_acknowledged() {
     let (_s, _b, headers) = send(&ctx.app, req("GET", &get_url, &tok, None)).await;
     let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
     let now = chrono::Utc::now();
-    let (s, patched, _h) = send(
+    let (s, patched, patched_h) = send(
         &ctx.app,
         req_with_if_match(
             "PATCH",
@@ -435,14 +455,17 @@ async fn reassigning_to_a_different_user_clears_notified_and_acknowledged() {
     assert_eq!(s, axum::http::StatusCode::OK);
     assert!(!patched["notifiedAt"].is_null());
     assert!(!patched["acknowledgedAt"].is_null());
+    // The PATCH bumped updated_at; the reassign must present the fresh ETag.
+    let etag = patched_h.get("etag").unwrap().to_str().unwrap().to_string();
 
     // Reassign to bob — notified/acknowledged reset to null.
     let (_s, reassigned, _h) = send(
         &ctx.app,
-        req(
+        req_with_if_match(
             "PUT",
             &url,
             &tok,
+            Some(&etag),
             Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
         ),
     )

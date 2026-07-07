@@ -13,7 +13,11 @@
 //! keeps its original `id`, but `user_id` (and `notified_at`/`acknowledged_at`,
 //! since a new assignee has been notified/acknowledged of nothing yet) are
 //! overwritten. Reassigning to the *same* user is a no-op on the
-//! notified/acknowledged state.
+//! notified/acknowledged state. `created_at`/`created_by` are **not** touched
+//! on a replace: they record who first created the row and when, and are left
+//! consistent with each other rather than pointing `created_by` at the last
+//! re-assigner while `created_at` stays original (the actor of a reassignment
+//! is captured in the audit log instead).
 //!
 //! **Implicit read grant.** A `PartAssignment` does not require the assigned
 //! user to hold a `Membership` in the org — this is how guest/substitute
@@ -111,8 +115,7 @@ pub async fn assign(
                 WHEN part_assignment.user_id <> excluded.user_id THEN NULL
                 ELSE part_assignment.acknowledged_at
             END,
-            updated_at = now(),
-            created_by = excluded.created_by
+            updated_at = now()
         RETURNING
             id, collection_item_id, user_id, voice_id,
             notified_at as "notified_at: DateTime<Utc>",
@@ -168,6 +171,36 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<PartAssignment
         WHERE id = $1
         "#,
         id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Look up the current assignment for a `(collection_item, voice)` pair, if
+/// any. The assign endpoint uses this to enforce `If-Match` on a *replace*: a
+/// PUT that overwrites an existing assignee carries the same optimistic-
+/// concurrency contract as a PATCH/DELETE, so the caller must present the
+/// current row's ETag.
+pub async fn find_by_item_voice(
+    pool: &PgPool,
+    collection_item_id: Uuid,
+    voice_id: Uuid,
+) -> Result<Option<PartAssignment>, sqlx::Error> {
+    sqlx::query_as!(
+        PartAssignment,
+        r#"
+        SELECT
+            id, collection_item_id, user_id, voice_id,
+            notified_at as "notified_at: DateTime<Utc>",
+            acknowledged_at as "acknowledged_at: DateTime<Utc>",
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>",
+            created_by
+        FROM part_assignment
+        WHERE collection_item_id = $1 AND voice_id = $2
+        "#,
+        collection_item_id,
+        voice_id,
     )
     .fetch_optional(pool)
     .await
