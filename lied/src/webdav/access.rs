@@ -199,11 +199,23 @@ pub async fn has_assignment_in_collection(
     collection_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    // Only a *live* assignment target counts: the item, its arrangement, and
+    // the assigned voice must all be un-deleted. Otherwise a guest whose sole
+    // assignment sits on a since-soft-deleted arrangement/voice would see the
+    // collection listed but find it empty on entry (the item/voice listings
+    // filter these out) — the "phantom empty directory" the module doc forbids.
+    // Kept in lockstep with `visible_collection_items` and
+    // `has_assignment_on_item`.
     sqlx::query_scalar!(
         r#"SELECT EXISTS (
              SELECT 1 FROM part_assignment pa
              JOIN collection_item ci ON ci.id = pa.collection_item_id
-             WHERE ci.collection_id = $1 AND pa.user_id = $2 AND ci.deleted_at IS NULL
+             JOIN arrangement a ON a.id = ci.arrangement_id
+             JOIN voice v ON v.id = pa.voice_id
+             WHERE ci.collection_id = $1 AND pa.user_id = $2
+               AND ci.deleted_at IS NULL
+               AND a.deleted_at IS NULL
+               AND v.deleted_at IS NULL
            ) AS "exists!""#,
         collection_id,
         user_id,
@@ -219,10 +231,19 @@ pub async fn has_assignment_on_item(
     collection_item_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
+    // Requires the assignment to target a live voice (and live item/arrangement),
+    // matching `visible_item_voices` — otherwise the item directory would be
+    // visible but enumerate no voices and no (non-staff) score.
     sqlx::query_scalar!(
         r#"SELECT EXISTS (
              SELECT 1 FROM part_assignment pa
+             JOIN collection_item ci ON ci.id = pa.collection_item_id
+             JOIN arrangement a ON a.id = ci.arrangement_id
+             JOIN voice v ON v.id = pa.voice_id
              WHERE pa.collection_item_id = $1 AND pa.user_id = $2
+               AND ci.deleted_at IS NULL
+               AND a.deleted_at IS NULL
+               AND v.deleted_at IS NULL
            ) AS "exists!""#,
         collection_item_id,
         user_id,
@@ -277,9 +298,14 @@ pub async fn visible_collection_slugs(
         sqlx::query_scalar!(
             r#"SELECT DISTINCT c.slug FROM collection c
                JOIN collection_item ci ON ci.collection_id = c.id
+               JOIN arrangement a ON a.id = ci.arrangement_id
                JOIN part_assignment pa ON pa.collection_item_id = ci.id
+               JOIN voice v ON v.id = pa.voice_id
                WHERE c.organization_id = $1 AND c.deleted_at IS NULL
-                 AND ci.deleted_at IS NULL AND pa.user_id = $2
+                 AND ci.deleted_at IS NULL
+                 AND a.deleted_at IS NULL
+                 AND v.deleted_at IS NULL
+                 AND pa.user_id = $2
                ORDER BY c.slug"#,
             org_id,
             user_id,
@@ -334,7 +360,9 @@ pub async fn visible_collection_items(
                FROM collection_item ci
                JOIN arrangement a ON a.id = ci.arrangement_id
                JOIN part_assignment pa ON pa.collection_item_id = ci.id
+               JOIN voice v ON v.id = pa.voice_id
                WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL
+                 AND v.deleted_at IS NULL
                  AND pa.user_id = $2
                ORDER BY ci.index ASC, ci.id ASC"#,
             collection_id,
