@@ -148,7 +148,7 @@ These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fr
   - `/healthz` — liveness; returns 200 whenever the process is up. Drives container-restart decisions.
   - `/readyz` — readiness; checks Postgres (`SELECT 1`) and MinIO (`HeadBucket`) reachable, 503 if either is down. Drives traffic gating without triggering restarts, so a transient DB blip sheds load instead of cycling the container.
   - `/metrics` — Prometheus format via `metrics` facade + `metrics-exporter-prometheus` (facade kept swappable for OTLP later; not coupled to axum internals). RED baseline (request rate, error rate, per-route duration histograms) plus upload/download byte counters. **Gated behind `LIED_METRICS_ENABLED` (default off)** since the endpoint is unauthenticated — an operator opts in rather than leaking operational detail from a fresh self-host.
-- **Sort & filter.** List endpoints accept `?sort=<field>:<dir>` (e.g. `sort=created_at:desc`) and `?filter[<field>]=<value>` (e.g. `filter[status]=active`); multiple filters AND together. Each endpoint declares an **allowlist** of sortable/filterable fields with a default sort (arrangements default `title:asc`); an unknown field or direction → `400` Problem Details. The allowlist keeps this from becoming arbitrary-column SQL surface. The bracket syntax namespaces filters away from control params (`sort`, `limit`, `offset`, `q`) so they never collide. Phase-1 ILIKE search stays a separate `?q=` param.
+- **Sort & filter.** List endpoints accept `?sort=<field>:<dir>` (e.g. `sort=created_at:desc`) and `?filter[<field>]=<value>` (e.g. `filter[status]=active`); multiple filters AND together. Each endpoint declares an **allowlist** of sortable/filterable fields with a default sort (arrangements default `title:asc`); an unknown field or direction → `400` Problem Details. The allowlist keeps this from becoming arbitrary-column SQL surface. The bracket syntax namespaces filters away from control params (`sort`, `limit`, `offset`, `q`) so they never collide. Phase-1 `?q=` is a plain ILIKE on title/composer; phase 2 upgrades the same `?q=` param to FTS + `pg_trgm` in place (see **Phase 2 cut**), without changing its request shape.
 - **OpenAPI exposure.** `utoipa` serves the spec at **`/openapi.json` (always available)**; a rendered UI via `utoipa-rapidoc` is mounted at **`/docs`, gated behind `LIED_DOCS_ENABLED` (default on)**. Docs default on (unlike metrics) because the API spec isn't sensitive operational data and discoverability helps the programmatic-client/federation story; an operator who wants it dark flips one flag. RapiDoc over Swagger UI keeps the binary slim (one embedded asset).
 
 ### WebDAV layout
@@ -763,26 +763,70 @@ Smallest version that closes the **archivist → musician loop** end-to-end: an 
 
 **UI** — minimal admin web UI for the archivist (entity CRUD, file upload, build collections, assign parts). Conductor uses the same UI for program planning. Musicians have no UI — WebDAV is their interface.
 
-### Deferred to phase 2+
+### Deferred beyond phase 1
 
-Model supports these; phase 1 has no implementation.
+Model supports these; phase 1 has no implementation. Items marked **(→ phase 2)** are pulled into the management-console phase — see **Phase 2 cut** below; everything else is phase 3+.
 
 - OIDC auth.
-- Search: FTS, `pg_trgm`, tag-based search, `difficulty_ratings` cross-scale lookups, faceted filters.
+- Search: FTS, `pg_trgm`, tag-based search, faceted filters **(→ phase 2)**; `difficulty_ratings` cross-scale lookups (phase 3+).
 - Conversion pipelines (LilyPond → PDF, MusicXML → LilyPond, etc.) and the conversion-quality UI surface.
 - OMR (Audiveris integration).
-- Global annotations workflow.
-- Distribution flow: notification email, acknowledgement UI (`notified_at` / `acknowledged_at` fields exist but unused).
-- Principal coverage check (UC-13).
+- Global annotations workflow **(→ phase 2)** — authoring/CRUD; the entity already exists.
+- Distribution flow: notification email, acknowledgement UI (`notified_at` / `acknowledged_at` fields exist but unused). The assignment state becomes settable in the phase-2 admin; automated email/sync **delivery** stays phase 3+.
+- Principal coverage check (UC-13) **(→ phase 2)**.
 - Performance UI (UC-17, UC-18).
 - External repertoire discovery (UC-4).
-- Edition-switching UX (UC-20) and per-instrument variants per Membership (UC-19) — model supports both; UI/flow deferred.
+- Edition-switching UX (UC-20) and per-instrument variants per Membership (UC-19) — model supports both. Admin-side edition status + membership instrument config land in phase 2; the musician-facing switching UX stays phase 3+.
 - Annotation staleness indicator.
-- Purpose-built display app (already deferred indefinitely in the spec).
+- Purpose-built display app (already deferred indefinitely in the spec) — now scoped as the phase-3 consumer client.
 
 ### Trade-off accepted
 
 Phase 1 is unglamorous from the conductor's perspective (title ILIKE only, no tags, no fancy program planning aids) and from the format-conversion angle (you upload what you upload). It delivers the actual base value — getting parts from archivist to musician — and every later phase plugs in cleanly because the data model already accommodates it.
+
+## Phase 2 cut
+
+Make the **management/curation console feature-complete** for the personas who work at a PC — the archivist, owner, and conductor-as-planner — and land the "medium" backend features the data model already anticipated (real archive search, coverage, global-annotation authoring). Musicians and guests stay on WebDAV + existing readers; **no consumer client is built in phase 2**.
+
+This is chosen over building a client first because: (1) the archivist/planner workload is desktop-bound data entry, and the in-binary HTMX console is its right, self-host-friendly home (no JS build, ships in the container); (2) completing this surface hardens the `/v1` contract and OpenAPI spec, de-risking any future client and the deferred MCP server; and (3) it is mostly UI over the phase-1 model plus three already-specified backend features — a low-risk phase with no new repo, language, or client-auth/CORS plumbing.
+
+**Scope is management/curation only.** The use-case list splits three ways: desktop/back-office cases are in scope; performance/consumption cases (UC-14 access my parts, UC-15 personal annotations, UC-17/UC-18 performance modes, and the musician-facing side of UC-12/UC-19/UC-20) stay on WebDAV and wait for the phase-3 client; discovery/commerce (UC-4) and the out-of-scope list are untouched.
+
+**One deliberate carve-out to "musicians have no phase-2 UI":** a **principal** (`musician` with `is_principal = true`) may log into the console for the **section-coverage screen only** — this realizes the view the model already grants them (Membership decision: `is_principal` "adds the section-coverage view without changing other permissions"), not a new permission. It is read-only and scoped to their own section. The principal's day-to-day, mobile-first coverage experience is deferred to the phase-3 client; the console screen is the "at my laptop" fallback.
+
+### In scope for phase 2
+
+**Backend — the "medium" features.** Each lands on `/v1` (JSON, with OpenAPI coverage so the contract stays complete for the future client + MCP server); the HTMX admin fragments call the same `domain/*` service functions — no logic duplication.
+
+- **Archive search (UC-2).** Implement the already-specified search design (see Data Model → Search & metadata): Postgres FTS (`tsvector` + GIN) over title, composer, arranger, instrumentation description, and tag names; `pg_trgm` fuzzy match on title and composer; tag-based filtering; faceted filters (difficulty range on the ABRSM `difficulty` column, duration range, `status`, tags, instrumentation via `Voice.instrument_id`). Surfaced on the arrangements list endpoint through the existing `?q=` / `?filter[…]=` params plus a relevance sort, all allowlist-gated per the HTTP conventions — this upgrades the phase-1 `?q=` ILIKE in place. The searchable text spans **three tables** — `Work.composer`, `Tag` names (via `ArrangementTag`), and `arrangement` columns — so the `tsvector` **cannot be a single generated column**: the migration maintains it via triggers on `arrangement`, `work`, `tag`, and `arrangement_tag` (or, equivalently, keeps per-source vectors combined at query time — the issue picks one), plus the GIN index and the `pg_trgm` trigram indexes. `difficulty_ratings` cross-scale lookups remain phase 3+.
+- **Coverage check (UC-13).** A `domain/*` service + `/v1` read endpoint reporting, for a collection (and per `CollectionItem`), which required voices have a `PartAssignment` and which are "rehearsed" (`acknowledged_at` set). Two views over the one service, differing only in what counts as *required*: the **full-program** view (required = every live voice of each item) and the **principal's section** view (required = voices whose `instrument_id ∈ Membership.principal_instrument_ids`). Authorization: staff (`owner` / `archivist` / `conductor`) get the full-program view; a `musician` with `is_principal = true` may read **only** the section view, scoped to their own `principal_instrument_ids` (the one *new* non-staff-facing view phase 2 adds to `/v1`, mirrored by the console carve-out above; musicians already have phase-1 `/v1` read access to their own assignments). Pure query over existing tables — no migration.
+- **Global annotations (UC-16, authoring).** Activate the existing `GlobalAnnotation` entity: `/v1` CRUD (create / list / get / update / delete) with ETag / `If-Match`, RFC 7807 errors, and audit; author gated to `conductor` / `owner` per the permission matrix. `GlobalAnnotation` carries no `deleted_at` (Unique-constraints table), so delete here is a **hard** delete — unlike the soft-deleted entities elsewhere in phase 2. Table already exists — no migration.
+
+**Admin UI (HTMX) — the management/curation surface, completed.** Every screen enforces the permission matrix — a conductor gets collections / part assignments / global annotations but sees arrangement, voice, and file data **read-only**; arrangement / file / tag edits stay `owner` / `archivist`; member and role management stays `owner`. The only non-staff surface is the principal's read-only section-coverage screen (see the carve-out above).
+
+- Arrangement / Work / Voice / Tag management: full CRUD with provenance, licensing, edition status (`active` / `archived`), difficulty + `difficulty_ratings`, duration.
+- File management: upload / replace / soft-delete score and voice files (all four formats; images accepted as-is per UC-11), surfacing each file's `format` / `mime_type` and `derived_from` provenance — the format-transparency requirement from Supported Formats. Conversion **actions** stay deferred (phase 3+).
+- Program & standing-collection building: create/edit, add/remove items, reorder by index, the consult-and-update flow (closes admin-UI issue #27).
+- Part-assignment screens: assign / reassign / unassign per `(item, voice)`; set `notifiedAt` / `acknowledgedAt` manually; list assignments.
+- Coverage dashboard: per-collection / per-item voice coverage (assigned vs rehearsed) for staff; a principal reaches a read-only, section-scoped slice of the same screen (the one non-staff console surface).
+- Rich archive-search UI over the new FTS/facets — the conductor's UC-2 planning surface.
+- Global-annotation authoring on an arrangement.
+- Membership & instrument config: members / roles, `instrument_ids`, `is_principal` / `principal_instrument_ids`.
+
+**Correctness/quality carried in this phase.** PATCH partial-update semantics fix (#23) and CI for the PR gates (#24, orthogonal but cheap to land alongside).
+
+### Deferred to phase 3+
+
+Still model-supported, still not built:
+
+- The **consumer / reader client** (musician + guest + conductor-in-performance): a cross-platform web + mobile app in its **own repository**, consuming `/v1` + the OpenAPI-generated types. It requires new backend plumbing not present in phase 2 — **CORS**, and a first-party username/password → JWT login with a **refresh-token** flow (the current 30-day JWT has no refresh model). (Bearer-authed `/v1` file streaming with Range already exists from phase 1 — issue #7 — so that is *not* new work.) Covers UC-14, UC-15, UC-17, UC-18, the musician-facing side of UC-19 / UC-20, and the **principal's mobile/end-device coverage view** — the read-only console view ships in phase 2, the mobile-first surface is part of this client.
+- Conversion pipelines (LilyPond → PDF, MusicXML → LilyPond) + the conversion-quality UI (UC-9/UC-10); OMR / Audiveris.
+- Distribution **delivery** (UC-12): notification email + sync. Assignment state (`notifiedAt` / `acknowledgedAt`) is settable in the phase-2 admin, but automated delivery is deferred.
+- OIDC / SSO; the MCP server; external repertoire discovery → purchase pipeline (UC-4); annotation staleness indicator; `difficulty_ratings` cross-scale search.
+
+### Trade-off accepted
+
+Phase 2 makes the archivist and conductor-planner experience genuinely good — real search, program building, coverage, global annotations, and part-distribution state — but musicians still have no dedicated app; they remain on WebDAV + forScore / MobileSheets / MuseScore, which the spec sanctions. Two consequences are accepted deliberately. **Global annotations are authored but not yet consumed:** they are structured Postgres records, invisible over WebDAV, so the musicians they target have no surface to read them until the phase-3 client — phase 2 ships the conductor's authoring half only. And **automated distribution (email/sync) and format conversion stay deferred.** The payoff is a complete, exercised `/v1` contract and a mature management surface — exactly the evidence base needed before committing to the consumer client in phase 3.
 
 <!-- code-graph-mcp:begin v2 -->
 ## Code Graph (repo-wide AST index)
@@ -797,7 +841,7 @@ structural queries (LSP only sees open files; this sees everything). Fastest pat
 | Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
 | Symbol source / signature | `code-graph-mcp show X` |
 | Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
-| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
+| grep + AST context | `code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]` |
 
 Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`
