@@ -21,49 +21,62 @@ pub fn csrf_field(token: &str) -> Markup {
     html! { input type="hidden" name="csrf_token" value=(token); }
 }
 
-/// Render a full `/admin` page: doctype, head, and the given body content
-/// inside a minimal nav shell. `title` is plain
-/// text and is auto-escaped by `maud`'s `html!` macro like everything else
-/// here — no `PreEscaped` needed for any caller-supplied string.
-pub fn page(title: &str, display_name: &str, body: Markup) -> Markup {
+/// Shared page styles, inlined into every admin document's `<head>`.
+const STYLES: &str = r#"
+    body { font-family: sans-serif; margin: 2rem; color: #222; }
+    nav a { margin-right: 1rem; }
+    nav .current { margin-right: 1rem; font-weight: bold; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
+    form.inline { display: inline; }
+    .error { color: #b00020; }
+    .muted { color: #666; }
+    fieldset { margin-bottom: 1rem; }
+"#;
+
+/// Render a full `/admin` document: doctype, head (with the shared styles),
+/// the caller-supplied `nav` bar, and the body content under an `h1(title)`.
+/// Every admin surface — the system-admin screens ([`page`]) and the per-org
+/// console (`routes::admin::console`) — shares this skeleton so styling and
+/// structure stay in one place. `title` is auto-escaped by `maud`.
+///
+/// No JS framework: admin screens are plain server-rendered forms with a
+/// hidden CSRF field (see [`csrf_field`]). htmx can return as a progressive
+/// enhancement later, but the UI must not depend on it loading — CSRF
+/// protection stays server-side.
+pub fn document(title: &str, nav: Markup, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html {
             head {
                 meta charset="utf-8";
                 title { "Lied admin — " (title) }
-                // No JS framework: admin screens are plain server-rendered
-                // forms with a hidden CSRF field (see `csrf_field`). htmx can
-                // return as a progressive enhancement later, but the UI must
-                // not depend on it loading — CSRF protection stays server-side.
-                style {
-                    (PreEscaped(r#"
-                        body { font-family: sans-serif; margin: 2rem; color: #222; }
-                        nav a { margin-right: 1rem; }
-                        table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-                        th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
-                        form.inline { display: inline; }
-                        .error { color: #b00020; }
-                        fieldset { margin-bottom: 1rem; }
-                    "#))
-                }
+                style { (PreEscaped(STYLES)) }
             }
             body {
-                nav {
-                    // No trailing slash — see the login redirect note; `/admin/`
-                    // is unrouted (issue #15, bug 2).
-                    a href="/admin" { "Home" }
-                    a href="/admin/orgs" { "Organizations" }
-                    a href="/admin/users" { "Users" }
-                    span { " — logged in as " (display_name) " — " }
-                    form class="inline" method="post" action="/admin/logout" {
-                        button type="submit" { "Log out" }
-                    }
-                }
+                nav { (nav) }
                 hr;
                 h1 { (title) }
                 (body)
             }
         }
     }
+}
+
+/// Render a full `/admin` page inside the instance-admin nav shell (Home /
+/// Organizations / Users). Used by the system-admin provisioning screens; the
+/// per-org console builds its own role-aware nav (see `routes::admin::console`).
+pub fn page(title: &str, display_name: &str, body: Markup) -> Markup {
+    let nav = html! {
+        // No trailing slash — see the login redirect note; `/admin/`
+        // is unrouted (issue #15, bug 2).
+        a href="/admin" { "Home" }
+        a href="/admin/orgs" { "Organizations" }
+        a href="/admin/users" { "Users" }
+        span { " — logged in as " (display_name) " — " }
+        form class="inline" method="post" action="/admin/logout" {
+            button type="submit" { "Log out" }
+        }
+    };
+    document(title, nav, body)
 }
