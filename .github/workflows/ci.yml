@@ -35,6 +35,7 @@ jobs:
   fmt:
     name: fmt --check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -43,6 +44,7 @@ jobs:
   clippy:
     name: clippy -D warnings
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     # --all-targets compiles the test crates, whose sqlx macros need a schema
     # to check against, so this job runs against a live Postgres.
     services:
@@ -68,6 +70,7 @@ jobs:
   test:
     name: test --all
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Integration tests use testcontainers, which start their own Postgres +
     # MinIO against the runner's Docker daemon at runtime. The service Postgres
     # here is only for compile-time sqlx macro checking of the test crates.
@@ -94,6 +97,7 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -103,6 +107,7 @@ jobs:
   sqlx-check:
     name: sqlx prepare --check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Verifies the committed .sqlx/ cache matches the lib/bin queries in code.
     # Runs without --tests, matching how the cache is produced (`just prepare`).
     services:
@@ -128,6 +133,7 @@ jobs:
   docker-build:
     name: docker image build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Hermetic build: the Dockerfile sets SQLX_OFFLINE=true and uses the
     # committed .sqlx/ cache, so no database is needed. Build only, no push.
     steps:
