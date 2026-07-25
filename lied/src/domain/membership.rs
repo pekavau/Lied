@@ -48,6 +48,40 @@ impl Role {
             _ => None,
         }
     }
+
+    // --- Permission matrix (CLAUDE.md "Permission matrix") ---
+    //
+    // The single source of truth for the org-role capability rows, so the
+    // `/v1` authorization helpers ([`crate::auth::authz`]) and the `/admin`
+    // console gate ([`crate::routes::admin::console`]) can't drift. These are
+    // the *role* facts only; `is_system_admin` (owner-equivalent) and the
+    // principal carve-out are context concerns layered on top by the callers.
+
+    /// A staff role — owner, archivist, or conductor. Non-staff (musician)
+    /// have no general console access.
+    pub fn is_staff(self) -> bool {
+        matches!(self, Role::Owner | Role::Archivist | Role::Conductor)
+    }
+
+    /// Upload/edit arrangements, voices, files, and tags.
+    pub fn can_edit_arrangements(self) -> bool {
+        matches!(self, Role::Owner | Role::Archivist)
+    }
+
+    /// Build and edit collections + manage part assignments.
+    pub fn can_build_collections(self) -> bool {
+        self.is_staff()
+    }
+
+    /// Manage members and roles, and org settings.
+    pub fn can_manage_members(self) -> bool {
+        matches!(self, Role::Owner)
+    }
+
+    /// Author global (conductor-level) annotations.
+    pub fn can_author_global_annotations(self) -> bool {
+        matches!(self, Role::Owner | Role::Conductor)
+    }
 }
 
 /// Wire representation of a `membership` row. `camelCase` per CLAUDE.md's
@@ -467,6 +501,69 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, MembershipError> {
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// One organization a user belongs to, with the role they hold there —
+/// the rows the console's `/admin` landing lists so a member can enter each
+/// org's workspace. Joins `membership` to `organization`; ordered by org
+/// name for a stable, human-friendly list.
+#[derive(Debug, Clone)]
+pub struct UserOrg {
+    pub organization_id: Uuid,
+    pub organization_name: String,
+    pub organization_slug: String,
+    pub role: Role,
+    pub is_principal: bool,
+}
+
+/// Every organization `user_id` is a member of, with their role in each.
+/// Used by the console landing (`/admin`) to render the list of workspaces a
+/// user can enter. A `is_system_admin` user additionally reaches every org
+/// via [`crate::domain::organization::list`]; that superset is composed at
+/// the call site, not here.
+pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<UserOrg>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            o.id   AS organization_id,
+            o.name AS organization_name,
+            o.slug AS organization_slug,
+            m.role AS role,
+            m.is_principal AS is_principal
+        FROM membership m
+        JOIN organization o ON o.id = m.organization_id
+        WHERE m.user_id = $1
+        ORDER BY o.name ASC, o.id ASC
+        "#,
+        user_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let Some(role) = Role::parse(&r.role) else {
+                // `role` is text + CHECK, so an unrecognized value can only come
+                // from a manual DB edit or a role added to the schema before the
+                // enum — skip it, but log, since it silently costs the user a
+                // workspace entry rather than failing loudly.
+                tracing::warn!(
+                    organization_id = %r.organization_id,
+                    role = %r.role,
+                    "membership has an unrecognized role; omitting from workspace list"
+                );
+                return None;
+            };
+            Some(UserOrg {
+                organization_id: r.organization_id,
+                organization_name: r.organization_name,
+                organization_slug: r.organization_slug,
+                role,
+                is_principal: r.is_principal,
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]

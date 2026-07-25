@@ -4,6 +4,7 @@
 //! first real screens (`orgs` submodule: org/user/membership management),
 //! sharing the `layout` submodule's maud page shell.
 
+pub mod console;
 pub mod layout;
 pub mod orgs;
 
@@ -41,6 +42,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/logout", post(logout_submit))
         // Org/User/Membership screens (issue #5) — see `orgs` submodule.
         .merge(orgs::router())
+        // Per-org management console (issue #30) — see `console` submodule.
+        .merge(console::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
@@ -48,16 +51,135 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .layer(session_layer)
 }
 
-async fn index(auth: Option<AuthSession>) -> impl IntoResponse {
-    match auth {
-        Some(AuthSession(user)) => {
-            let body = maud::html! {
-                p { "Use the nav above to manage organizations and users." }
-            };
-            Html(layout::page("Home", &user.display_name, body).into_string()).into_response()
-        }
-        None => Redirect::to("/admin/login").into_response(),
+async fn index(State(state): State<AppState>, auth: Option<AuthSession>) -> Response {
+    let Some(AuthSession(user)) = auth else {
+        return Redirect::to("/admin/login").into_response();
+    };
+
+    // A row in the workspace list: an org the caller can actually enter, with
+    // an honest role label (never a fabricated one).
+    struct WorkspaceRow {
+        id: uuid::Uuid,
+        name: String,
+        role_label: String,
     }
+
+    // Nested `fn` (not a closure) so it can be passed by name into `.map` in
+    // the loop below — it captures nothing.
+    fn membership_label(m: &crate::domain::membership::UserOrg) -> String {
+        if m.is_principal {
+            format!("{} (principal)", m.role.as_str())
+        } else {
+            m.role.as_str().to_string()
+        }
+    }
+
+    let memberships = match crate::domain::membership::list_for_user(&state.db, user.id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(%error, "failed to list user memberships");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut rows: Vec<WorkspaceRow> = Vec::new();
+    if user.is_system_admin {
+        // A system admin enters every org (owner-equivalent), so list them all,
+        // paging through so none are silently dropped. Label by their actual
+        // membership where one exists, else "system admin" — never a fake role.
+        const ORG_PAGE: i64 = 200;
+        let mut offset: i64 = 0;
+        loop {
+            let (orgs, total) = match crate::domain::organization::list(
+                &state.db,
+                ORG_PAGE,
+                offset,
+                "name",
+                crate::listing::SortDirection::Asc,
+                None,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(%error, "failed to list organizations for system admin");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            if orgs.is_empty() {
+                break;
+            }
+            let fetched = orgs.len() as i64;
+            for org in orgs {
+                let role_label = memberships
+                    .iter()
+                    .find(|m| m.organization_id == org.id)
+                    .map(membership_label)
+                    .unwrap_or_else(|| "system admin".to_string());
+                rows.push(WorkspaceRow {
+                    id: org.id,
+                    name: org.name,
+                    role_label,
+                });
+            }
+            offset += fetched;
+            if offset >= total {
+                break;
+            }
+        }
+        // `organization::list` orders by name and we appended in page order, so
+        // `rows` is already name-sorted.
+    } else {
+        // Non-admins see only orgs they can actually enter (staff, or a
+        // principal musician) — so the list never advertises a workspace the
+        // console gate would 403 on. Uses the same rule as `ConsoleCtx::load`.
+        for m in &memberships {
+            if console::can_enter(m.role, m.is_principal) {
+                rows.push(WorkspaceRow {
+                    id: m.organization_id,
+                    name: m.organization_name.clone(),
+                    role_label: membership_label(m),
+                });
+            }
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    let body = maud::html! {
+        h2 { "Your workspaces" }
+        @if rows.is_empty() {
+            p class="muted" {
+                "You don't have access to any organization workspaces."
+                @if user.is_system_admin { " Create one under Organizations." }
+            }
+        } @else {
+            table {
+                thead { tr { th { "Organization" } th { "Role" } th {} } }
+                tbody {
+                    @for row in &rows {
+                        tr {
+                            td { (row.name) }
+                            td { (row.role_label) }
+                            td {
+                                a href={ "/admin/orgs/" (row.id) "/console" } {
+                                    "Open workspace"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        @if user.is_system_admin {
+            p class="muted" {
+                "System administration: "
+                a href="/admin/orgs" { "Organizations" }
+                " · "
+                a href="/admin/users" { "Users" }
+            }
+        }
+    };
+    Html(layout::page("Home", &user.display_name, body).into_string()).into_response()
 }
 
 async fn login_page(session: Session) -> impl IntoResponse {

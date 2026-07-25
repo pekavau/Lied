@@ -107,7 +107,8 @@ pub async fn require_org_role_v1(
 /// Require the caller to be able to **build/edit collections** in the org
 /// (CLAUDE.md Permission matrix: `owner`, `archivist`, *or* `conductor`). This
 /// is not a single `at_least` threshold — archivist and conductor are
-/// incomparable — so it matches the matrix row directly with a `matches!`.
+/// incomparable — so it delegates to [`Role::can_build_collections`], the one
+/// place that matrix row lives (shared with the `/admin` console gate).
 /// `is_system_admin` short-circuits, as with [`require_org_role`]. Returns
 /// `403 Forbidden` otherwise (e.g. a `musician`).
 pub async fn require_collection_editor_v1(
@@ -122,7 +123,7 @@ pub async fn require_collection_editor_v1(
         .await
         .map_err(AppError::from)?;
     match found {
-        Some(m) if matches!(m.role, Role::Owner | Role::Archivist | Role::Conductor) => Ok(()),
+        Some(m) if m.role.can_build_collections() => Ok(()),
         _ => Err(AppError::Forbidden),
     }
 }
