@@ -1,0 +1,20 @@
+name: DB setup
+description: >-
+  Install a pinned sqlx-cli and apply the migrations against the CI Postgres
+  service, so compile-time sqlx macros validate against a real schema. Shared by
+  the clippy, test, and sqlx-check jobs (a service container is job-scoped and
+  cannot live in a composite action, but these steps can).
+
+runs:
+  using: composite
+  steps:
+    # Pinned deliberately, bumped alongside the workspace sqlx dependency. An
+    # unpinned latest can change the query-cache format and break the
+    # `sqlx prepare --check` gate on unrelated PRs.
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: sqlx-cli@0.9.0
+    - name: Apply migrations
+      shell: bash
+      # DATABASE_URL is inherited from the workflow-level env.
+      run: sqlx migrate run --source migrations
