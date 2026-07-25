@@ -12,9 +12,18 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: the gates only read the repo. No job pushes, comments, or
+# releases, so a read-only token is all any of them (including third-party
+# actions) should hold.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR branches (a force-push obsoletes the old run),
+  # but never on main: each pushed commit keeps its own verdict so a later
+  # failure can be attributed to the commit that caused it.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,11 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: sqlx-cli
-      - name: Apply migrations
-        run: sqlx migrate run --source migrations
+      - uses: ./.github/actions/db-setup
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -83,11 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: sqlx-cli
-      - name: Apply migrations
-        run: sqlx migrate run --source migrations
+      - uses: ./.github/actions/db-setup
       - run: cargo test --all
 
   deny:
@@ -121,11 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: sqlx-cli
-      - name: Apply migrations
-        run: sqlx migrate run --source migrations
+      - uses: ./.github/actions/db-setup
       - run: cargo sqlx prepare --workspace --check
 
   docker-build:
