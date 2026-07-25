@@ -1,0 +1,144 @@
+name: CI
+
+# Automates the "CI gates (every PR must pass)" from CLAUDE.md.
+# Six gates run as parallel jobs. Jobs that compile test code (clippy
+# --all-targets, test) or validate SQL need a live Postgres because the
+# committed .sqlx/ cache deliberately covers only lib/bin queries — the
+# `sqlx prepare --check` gate runs without --tests, so caching test-only
+# queries would make that gate fail. See issue #24.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Compile-time sqlx macros read DATABASE_URL. The Postgres service below is
+  # reachable at localhost:5432 for the jobs that need it.
+  DATABASE_URL: postgres://lied:lied@localhost:5432/lied
+
+jobs:
+  fmt:
+    name: fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    # --all-targets compiles the test crates, whose sqlx macros need a schema
+    # to check against, so this job runs against a live Postgres.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lied
+          POSTGRES_PASSWORD: lied
+          POSTGRES_DB: lied
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lied"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
+      - name: Apply migrations
+        run: sqlx migrate run --source migrations
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test --all
+    runs-on: ubuntu-latest
+    # Integration tests use testcontainers, which start their own Postgres +
+    # MinIO against the runner's Docker daemon at runtime. The service Postgres
+    # here is only for compile-time sqlx macro checking of the test crates.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lied
+          POSTGRES_PASSWORD: lied
+          POSTGRES_DB: lied
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lied"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
+      - name: Apply migrations
+        run: sqlx migrate run --source migrations
+      - run: cargo test --all
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  sqlx-check:
+    name: sqlx prepare --check
+    runs-on: ubuntu-latest
+    # Verifies the committed .sqlx/ cache matches the lib/bin queries in code.
+    # Runs without --tests, matching how the cache is produced (`just prepare`).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lied
+          POSTGRES_PASSWORD: lied
+          POSTGRES_DB: lied
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lied"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sqlx-cli
+      - name: Apply migrations
+        run: sqlx migrate run --source migrations
+      - run: cargo sqlx prepare --workspace --check
+
+  docker-build:
+    name: docker image build
+    runs-on: ubuntu-latest
+    # Hermetic build: the Dockerfile sets SQLX_OFFLINE=true and uses the
+    # committed .sqlx/ cache, so no database is needed. Build only, no push.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
