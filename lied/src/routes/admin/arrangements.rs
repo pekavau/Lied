@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::{arrangement, work};
+use crate::domain::{arrangement, instrument, voice, work};
 use crate::listing::SortDirection;
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
@@ -46,6 +46,23 @@ pub fn router() -> Router<AppState> {
         .route(
             "/orgs/:org_id/arrangements/:arr_id/undelete",
             post(undelete),
+        )
+        // Voices belong to an arrangement (Phase 2 issue #31, slice 2).
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/voices",
+            get(voices_page).post(create_voice),
+        )
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id",
+            get(voice_detail_page).post(update_voice),
+        )
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/delete",
+            post(delete_voice),
+        )
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/undelete",
+            post(undelete_voice),
         )
         .route("/orgs/:org_id/works", get(works_page).post(create_work))
         .route("/orgs/:org_id/works/:work_id", post(update_work))
@@ -530,7 +547,11 @@ async fn detail_page(
         } @else {
             (arrangement_readonly(&a, &works))
         }
-        p { a href=(format!("/admin/orgs/{org_id}/arrangements")) { "← Back to arrangements" } }
+        p {
+            a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "Manage voices →" }
+            " · "
+            a href=(format!("/admin/orgs/{org_id}/arrangements")) { "← Back to arrangements" }
+        }
     };
     Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
 }
@@ -994,6 +1015,519 @@ fn arrangement_readonly(a: &arrangement::Arrangement, works: &[work::Work]) -> M
             @if let Some(v) = &a.publisher { tr { th { "Publisher" } td { (v) } } }
             @if let Some(d) = a.difficulty { tr { th { "Difficulty" } td { (d) } } }
             @if let Some(v) = &a.difficulty_notes { tr { th { "Difficulty notes" } td { (v) } } }
+        }
+    }
+}
+
+// ===========================================================================
+// Voices (issue #31, slice 2) — individual instrument parts within an
+// arrangement, with the instrument picker drawn from the Instrument vocabulary
+// grouped by family.
+// ===========================================================================
+
+/// Instrument families in a sensible display order for the picker's optgroups;
+/// any family not listed falls to the end under its own heading.
+const FAMILY_ORDER: &[&str] = &[
+    "woodwind",
+    "brass",
+    "strings",
+    "percussion",
+    "keyboard",
+    "voice",
+    "other",
+];
+
+#[derive(Deserialize)]
+struct VoiceForm {
+    name: Option<String>,
+    instrument_id: Option<String>,
+    expected_version: Option<String>,
+}
+
+/// Load the whole instrument vocabulary (~177 rows) for the picker.
+async fn load_instruments(state: &AppState) -> Result<Vec<instrument::Instrument>, sqlx::Error> {
+    let (instruments, _total) = instrument::list(&state.db, 1000, 0).await?;
+    Ok(instruments)
+}
+
+/// A `<select name="instrument_id">` with the vocabulary grouped into
+/// `<optgroup>`s by family, `selected` pre-selecting the current instrument.
+fn instrument_picker(instruments: &[instrument::Instrument], selected: Option<Uuid>) -> Markup {
+    // Families present, ordered by FAMILY_ORDER then any extras alphabetically.
+    let mut families: Vec<&str> = instruments.iter().map(|i| i.family.as_str()).collect();
+    families.sort_unstable();
+    families.dedup();
+    families.sort_by_key(|f| {
+        FAMILY_ORDER
+            .iter()
+            .position(|o| o == f)
+            .unwrap_or(FAMILY_ORDER.len())
+    });
+
+    html! {
+        select name="instrument_id" required {
+            @for family in &families {
+                optgroup label=(family) {
+                    @for inst in instruments.iter().filter(|i| &i.family == family) {
+                        option value=(inst.id) selected[selected == Some(inst.id)] {
+                            (inst.display_name)
+                            @if let Some(t) = &inst.transposition { " (" (t) ")" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render the instrument's display name for a voice row (falls back to the raw
+/// id if the instrument somehow isn't in the loaded set).
+fn instrument_name(instruments: &[instrument::Instrument], id: Uuid) -> String {
+    instruments
+        .iter()
+        .find(|i| i.id == id)
+        .map(|i| i.display_name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+async fn voices_page(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id)): Path<(Uuid, Uuid)>,
+    session: Session,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.is_staff() {
+        return console::section_forbidden(&ctx);
+    }
+    let token = match csrf_token(&ctx, &session).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+
+    let a = match scoped_arrangement(&state, &ctx, arr_id, false).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found."),
+        Err(error) => {
+            tracing::error!(%error, "failed to load arrangement for voices");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load voices.",
+            );
+        }
+    };
+
+    let (voices, _total) = match voice::list_for_arrangement(
+        &state.db,
+        arr_id,
+        500,
+        0,
+        "name",
+        SortDirection::Asc,
+        None,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "failed to list voices");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load voices.",
+            );
+        }
+    };
+    let instruments = load_instruments(&state).await.unwrap_or_default();
+    let can_edit = ctx.can_edit_arrangements();
+
+    let body = html! {
+        h2 { "Voices — " (a.title) }
+        @if !can_edit { p class="muted" { "You have read-only access to voices." } }
+        table {
+            thead { tr { th { "Voice" } th { "Instrument" } @if can_edit { th {} } } }
+            tbody {
+                @for v in &voices {
+                    tr {
+                        td { (v.name) }
+                        td { (instrument_name(&instruments, v.instrument_id)) }
+                        @if can_edit {
+                            td {
+                                a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{}", v.id)) { "Edit" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        @if voices.is_empty() { p class="muted" { "No voices yet." } }
+
+        @if can_edit {
+            h2 { "Add a voice" }
+            form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) {
+                (layout::csrf_field(&token))
+                label { "Name " input type="text" name="name" required; }
+                label { "Instrument " (instrument_picker(&instruments, None)) }
+                button type="submit" { "Add voice" }
+            }
+        }
+        p { a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}")) { "← Back to arrangement" } }
+    };
+    Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
+}
+
+/// Load a voice scoped to `arr_id` (which must belong to `ctx`'s org), or
+/// `None` for any mismatch — cross-org / cross-arrangement access is a 404.
+async fn scoped_voice(
+    state: &AppState,
+    ctx: &ConsoleCtx,
+    arr_id: Uuid,
+    voice_id: Uuid,
+    including_deleted: bool,
+) -> Result<Option<voice::Voice>, sqlx::Error> {
+    // The parent arrangement must belong to this org.
+    if scoped_arrangement(state, ctx, arr_id, true)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let found = if including_deleted {
+        voice::find_by_id_including_deleted(&state.db, voice_id).await?
+    } else {
+        voice::find_by_id(&state.db, voice_id).await?
+    };
+    Ok(found.filter(|v| v.arrangement_id == arr_id))
+}
+
+async fn create_voice(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id)): Path<(Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+    Form(form): Form<VoiceForm>,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.can_edit_arrangements() {
+        return console::section_forbidden(&ctx);
+    }
+    if scoped_arrangement(&state, &ctx, arr_id, false)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found.");
+    }
+    let Some(name) = blank_to_none(form.name) else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Voice name must not be empty.",
+        );
+    };
+    let instrument_id = match blank_to_none(form.instrument_id).map(|s| Uuid::parse_str(&s)) {
+        Some(Ok(id)) => id,
+        _ => {
+            return error_page(
+                &ctx,
+                StatusCode::BAD_REQUEST,
+                "Please choose an instrument.",
+            )
+        }
+    };
+    let slug = voice::slugify(&name);
+    match voice::create(
+        &state.db,
+        Uuid::now_v7(),
+        arr_id,
+        &name,
+        &slug,
+        instrument_id,
+        Some(ctx.user().id),
+    )
+    .await
+    {
+        Ok(created) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "voice.create",
+                "voice",
+                Some(created.id),
+                serde_json::json!({ "name": created.name, "slug": created.slug }),
+            )
+            .await;
+            Redirect::to(&format!(
+                "/admin/orgs/{org_id}/arrangements/{arr_id}/voices"
+            ))
+            .into_response()
+        }
+        Err(voice::VoiceError::DuplicateSlug) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "A voice with a slug derived from this name already exists in this arrangement.",
+        ),
+        Err(voice::VoiceError::UnknownInstrument) => error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "That instrument no longer exists.",
+        ),
+        Err(voice::VoiceError::Database(error)) => {
+            tracing::error!(%error, "failed to create voice");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not create the voice.",
+            )
+        }
+    }
+}
+
+async fn voice_detail_page(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id, voice_id)): Path<(Uuid, Uuid, Uuid)>,
+    session: Session,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.is_staff() {
+        return console::section_forbidden(&ctx);
+    }
+    let token = match csrf_token(&ctx, &session).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let v = match scoped_voice(&state, &ctx, arr_id, voice_id, true).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
+        Err(error) => {
+            tracing::error!(%error, "failed to load voice");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load the voice.",
+            );
+        }
+    };
+    let instruments = load_instruments(&state).await.unwrap_or_default();
+    let can_edit = ctx.can_edit_arrangements();
+    let version = v.updated_at.timestamp_millis();
+    let deleted = v.deleted_at.is_some();
+
+    let body = html! {
+        h2 { "Voice: " (v.name) }
+        p { "Slug: " code { (v.slug) } @if deleted { " · " span class="error" { "deleted" } } }
+        @if deleted && can_edit {
+            form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/undelete")) {
+                (layout::csrf_field(&token))
+                button type="submit" { "Restore this voice" }
+            }
+        } @else if can_edit {
+            form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}")) {
+                (layout::csrf_field(&token))
+                input type="hidden" name="expected_version" value=(version);
+                label { "Name " input type="text" name="name" value=(v.name) required; }
+                label { "Instrument " (instrument_picker(&instruments, Some(v.instrument_id))) }
+                button type="submit" { "Save changes" }
+            }
+            form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/delete")) {
+                (layout::csrf_field(&token))
+                button type="submit" { "Delete voice" }
+            }
+        } @else {
+            p { "Instrument: " (instrument_name(&instruments, v.instrument_id)) }
+        }
+        p { a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "← Back to voices" } }
+    };
+    Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
+}
+
+async fn update_voice(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id, voice_id)): Path<(Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+    Form(form): Form<VoiceForm>,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.can_edit_arrangements() {
+        return console::section_forbidden(&ctx);
+    }
+    let current = match scoped_voice(&state, &ctx, arr_id, voice_id, false).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
+        Err(error) => {
+            tracing::error!(%error, "failed to load voice for update");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load the voice.",
+            );
+        }
+    };
+    let expected: Option<i64> = form
+        .expected_version
+        .as_deref()
+        .and_then(|v| v.parse().ok());
+    if expected != Some(current.updated_at.timestamp_millis()) {
+        return precondition_page(&ctx, arr_id);
+    }
+    let Some(name) = blank_to_none(form.name) else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Voice name must not be empty.",
+        );
+    };
+    let instrument_id = match blank_to_none(form.instrument_id).map(|s| Uuid::parse_str(&s)) {
+        Some(Ok(id)) => id,
+        _ => {
+            return error_page(
+                &ctx,
+                StatusCode::BAD_REQUEST,
+                "Please choose an instrument.",
+            )
+        }
+    };
+    match voice::update(&state.db, voice_id, &name, instrument_id).await {
+        Ok(Some(updated)) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "voice.update",
+                "voice",
+                Some(updated.id),
+                serde_json::json!({ "name": updated.name }),
+            )
+            .await;
+            Redirect::to(&format!(
+                "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
+            ))
+            .into_response()
+        }
+        Ok(None) => error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
+        Err(voice::VoiceError::UnknownInstrument) => error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "That instrument no longer exists.",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to update voice");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not save the voice.",
+            )
+        }
+    }
+}
+
+async fn delete_voice(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id, voice_id)): Path<(Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.can_edit_arrangements() {
+        return console::section_forbidden(&ctx);
+    }
+    if scoped_voice(&state, &ctx, arr_id, voice_id, false)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found.");
+    }
+    match voice::soft_delete(&state.db, voice_id).await {
+        Ok(_) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "voice.soft_delete",
+                "voice",
+                Some(voice_id),
+                serde_json::json!({}),
+            )
+            .await;
+            Redirect::to(&format!(
+                "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to soft-delete voice");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete the voice.",
+            )
+        }
+    }
+}
+
+async fn undelete_voice(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, arr_id, voice_id)): Path<(Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+) -> Response {
+    let ctx = match console::enter(&state, auth, org_id).await {
+        Ok(ctx) => ctx,
+        Err(response) => return response,
+    };
+    if !ctx.can_edit_arrangements() {
+        return console::section_forbidden(&ctx);
+    }
+    if scoped_voice(&state, &ctx, arr_id, voice_id, true)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found.");
+    }
+    match voice::undelete(&state.db, voice_id).await {
+        Ok(_) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "voice.undelete",
+                "voice",
+                Some(voice_id),
+                serde_json::json!({}),
+            )
+            .await;
+            Redirect::to(&format!(
+                "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
+            ))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to undelete voice");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not restore the voice.",
+            )
         }
     }
 }
