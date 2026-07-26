@@ -37,18 +37,9 @@ pub fn router() -> Router<AppState> {
         .route("/orgs", get(list_orgs_page).post(create_org_submit))
         .route("/orgs/:id", get(org_detail_page))
         .route("/orgs/:id/delete", axum::routing::post(delete_org_submit))
-        .route(
-            "/orgs/:org_id/members",
-            axum::routing::post(create_member_submit),
-        )
-        .route(
-            "/orgs/:org_id/members/:id/delete",
-            axum::routing::post(delete_member_submit),
-        )
-        .route(
-            "/orgs/:org_id/members/:id/role",
-            axum::routing::post(update_member_role_submit),
-        )
+        // Member management moved to the per-org console (issue #31 slice 4);
+        // this system-admin tree keeps org/user provisioning + a read-only
+        // roster on the org-detail page.
         .route("/users", get(list_users_page).post(create_user_submit))
         .route("/users/:id/delete", axum::routing::post(delete_user_submit))
 }
@@ -239,23 +230,18 @@ async fn delete_org_submit(
     }
 }
 
-/// `GET /admin/orgs/{id}` — org detail + member roster + add-member form.
-/// Requires at least `musician` membership in the org (or system admin),
-/// matching the `/v1` member-list gate.
+/// `GET /admin/orgs/{id}` — org detail + read-only member roster. Requires at
+/// least `musician` membership in the org (or system admin), matching the
+/// `/v1` member-list gate. Member *management* lives in the per-org console
+/// (see `admin::members`).
 async fn org_detail_page(
     AuthSession(actor): AuthSession,
     State(state): State<AppState>,
-    session: Session,
     Path(id): Path<Uuid>,
 ) -> Response {
     if let Err(err) = require_org_role(&state, &actor, id, Role::Musician).await {
         return app_error_fragment(err);
     }
-    let is_owner = require_org_role(&state, &actor, id, Role::Owner)
-        .await
-        .is_ok();
-
-    let token = csrf::ensure_token(&session).await.unwrap_or_default();
 
     let org = match organization::find_by_id(&state.db, id).await {
         Ok(Some(org)) => org,
@@ -299,57 +285,23 @@ async fn org_detail_page(
     let body = html! {
         p { "Slug: " (org.slug) }
         h2 { "Members" }
+        // Read-only roster. Member management (add / role / instruments /
+        // remove) moved to the per-org console (issue #31 slice 4), which is
+        // the single owner-facing surface for it.
         table {
-            thead { tr { th { "User" } th { "Role" } th { "Principal" } th { "" } } }
+            thead { tr { th { "User" } th { "Role" } th { "Principal" } } }
             tbody {
                 @for (m, username) in &rows {
                     tr {
                         td { (username) }
-                        td {
-                            @if is_owner {
-                                form class="inline" method="post" action={"/admin/orgs/" (id) "/members/" (m.id) "/role"} {
-                                    (layout::csrf_field(&token))
-                                    select name="role" {
-                                        @for role in [Role::Owner, Role::Archivist, Role::Conductor, Role::Musician] {
-                                            option value=(role.as_str()) selected[role == m.role] { (role.as_str()) }
-                                        }
-                                    }
-                                    button type="submit" { "Update" }
-                                }
-                            } @else {
-                                (m.role.as_str())
-                            }
-                        }
+                        td { (m.role.as_str()) }
                         td { @if m.is_principal { "yes" } @else { "no" } }
-                        td {
-                            @if is_owner {
-                                form class="inline" method="post" action={"/admin/orgs/" (id) "/members/" (m.id) "/delete"} {
-                                    (layout::csrf_field(&token))
-                                    button type="submit" { "Remove" }
-                                }
-                            }
-                        }
                     }
                 }
             }
         }
-        @if is_owner {
-            h2 { "Add member" }
-            form method="post" action={"/admin/orgs/" (id) "/members"} {
-                (layout::csrf_field(&token))
-                fieldset {
-                    label { "User ID (UUID) " input type="text" name="user_id" required; }
-                    label {
-                        "Role "
-                        select name="role" {
-                            @for role in [Role::Owner, Role::Archivist, Role::Conductor, Role::Musician] {
-                                option value=(role.as_str()) { (role.as_str()) }
-                            }
-                        }
-                    }
-                    button type="submit" { "Add" }
-                }
-            }
+        p {
+            a href={"/admin/orgs/" (id) "/members"} { "Manage members in the org console →" }
         }
     };
 
@@ -362,199 +314,6 @@ async fn org_detail_page(
         .into_string(),
     )
     .into_response()
-}
-
-#[derive(Deserialize)]
-struct CreateMemberForm {
-    user_id: Uuid,
-    role: String,
-}
-
-/// `POST /admin/orgs/{orgId}/members` — add a member (owner-only).
-async fn create_member_submit(
-    AuthSession(actor): AuthSession,
-    State(state): State<AppState>,
-    RequestId(request_id): RequestId,
-    Path(org_id): Path<Uuid>,
-    Form(form): Form<CreateMemberForm>,
-) -> Response {
-    if let Err(err) = require_org_role(&state, &actor, org_id, Role::Owner).await {
-        return app_error_fragment(err);
-    }
-
-    let Some(role) = Role::parse(&form.role) else {
-        return error_fragment(StatusCode::BAD_REQUEST, "Unknown role.");
-    };
-
-    let id = Uuid::now_v7();
-    match membership::create(
-        &state.db,
-        id,
-        form.user_id,
-        org_id,
-        membership::MembershipFields {
-            role,
-            instrument_ids: &[],
-            is_principal: false,
-            principal_instrument_ids: &[],
-        },
-        Some(actor.id),
-    )
-    .await
-    {
-        Ok(created) => {
-            audit(
-                &state.db,
-                &AuditContext {
-                    actor_user_id: Some(actor.id),
-                    org_id: Some(org_id),
-                    request_id: Some(request_id),
-                },
-                "membership.create",
-                "membership",
-                Some(created.id),
-                serde_json::json!({ "userId": created.user_id, "role": created.role }),
-            )
-            .await;
-            Redirect::to(&format!("/admin/orgs/{org_id}")).into_response()
-        }
-        Err(err) => membership_error_fragment(err),
-    }
-}
-
-#[derive(Deserialize)]
-struct UpdateMemberRoleForm {
-    role: String,
-}
-
-/// `POST /admin/orgs/{orgId}/members/{id}/role` — change a member's role
-/// (owner-only). Last-owner protection is enforced by
-/// [`membership::update`] itself.
-async fn update_member_role_submit(
-    AuthSession(actor): AuthSession,
-    State(state): State<AppState>,
-    RequestId(request_id): RequestId,
-    Path((org_id, id)): Path<(Uuid, Uuid)>,
-    Form(form): Form<UpdateMemberRoleForm>,
-) -> Response {
-    if let Err(err) = require_org_role(&state, &actor, org_id, Role::Owner).await {
-        return app_error_fragment(err);
-    }
-
-    let Some(role) = Role::parse(&form.role) else {
-        return error_fragment(StatusCode::BAD_REQUEST, "Unknown role.");
-    };
-
-    let current = match membership::find_by_id(&state.db, id).await {
-        Ok(Some(m)) if m.organization_id == org_id => m,
-        Ok(_) => return error_fragment(StatusCode::NOT_FOUND, "Membership not found."),
-        Err(error) => {
-            tracing::error!(%error, "failed to look up membership");
-            return error_fragment(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed");
-        }
-    };
-
-    match membership::update(
-        &state.db,
-        id,
-        membership::MembershipFields {
-            role,
-            instrument_ids: &current.instrument_ids,
-            is_principal: current.is_principal,
-            principal_instrument_ids: &current.principal_instrument_ids,
-        },
-    )
-    .await
-    {
-        Ok(Some(updated)) => {
-            let action = if current.role != updated.role {
-                "membership.role_change"
-            } else {
-                "membership.update"
-            };
-            audit(
-                &state.db,
-                &AuditContext {
-                    actor_user_id: Some(actor.id),
-                    org_id: Some(org_id),
-                    request_id: Some(request_id),
-                },
-                action,
-                "membership",
-                Some(id),
-                serde_json::json!({ "before": { "role": current.role }, "after": { "role": updated.role } }),
-            )
-            .await;
-            Redirect::to(&format!("/admin/orgs/{org_id}")).into_response()
-        }
-        Ok(None) => error_fragment(StatusCode::NOT_FOUND, "Membership not found."),
-        Err(err) => membership_error_fragment(err),
-    }
-}
-
-/// `POST /admin/orgs/{orgId}/members/{id}/delete` — remove a member
-/// (owner-only). Last-owner protection is enforced by [`membership::delete`].
-async fn delete_member_submit(
-    AuthSession(actor): AuthSession,
-    State(state): State<AppState>,
-    RequestId(request_id): RequestId,
-    Path((org_id, id)): Path<(Uuid, Uuid)>,
-) -> Response {
-    if let Err(err) = require_org_role(&state, &actor, org_id, Role::Owner).await {
-        return app_error_fragment(err);
-    }
-
-    let current = match membership::find_by_id(&state.db, id).await {
-        Ok(Some(m)) if m.organization_id == org_id => m,
-        Ok(_) => return error_fragment(StatusCode::NOT_FOUND, "Membership not found."),
-        Err(error) => {
-            tracing::error!(%error, "failed to look up membership");
-            return error_fragment(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed");
-        }
-    };
-
-    match membership::delete(&state.db, id).await {
-        Ok(_) => {
-            audit(
-                &state.db,
-                &AuditContext {
-                    actor_user_id: Some(actor.id),
-                    org_id: Some(org_id),
-                    request_id: Some(request_id),
-                },
-                "membership.delete",
-                "membership",
-                Some(id),
-                serde_json::json!({ "userId": current.user_id, "role": current.role }),
-            )
-            .await;
-            Redirect::to(&format!("/admin/orgs/{org_id}")).into_response()
-        }
-        Err(err) => membership_error_fragment(err),
-    }
-}
-
-fn membership_error_fragment(err: membership::MembershipError) -> Response {
-    match err {
-        membership::MembershipError::Database(error) => {
-            tracing::error!(%error, "membership operation failed");
-            error_fragment(StatusCode::INTERNAL_SERVER_ERROR, "operation failed")
-        }
-        membership::MembershipError::Duplicate => {
-            error_fragment(StatusCode::CONFLICT, "This user is already a member.")
-        }
-        membership::MembershipError::UnknownInstrument => {
-            error_fragment(StatusCode::BAD_REQUEST, "Unknown instrument id.")
-        }
-        membership::MembershipError::PrincipalNotSubset => error_fragment(
-            StatusCode::BAD_REQUEST,
-            "Principal instruments must be a subset of assigned instruments.",
-        ),
-        membership::MembershipError::LastOwner => error_fragment(
-            StatusCode::CONFLICT,
-            "Organization must keep at least one owner.",
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------

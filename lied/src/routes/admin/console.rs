@@ -228,17 +228,19 @@ pub enum Section {
     Coverage,
     Annotations,
     Search,
+    Members,
 }
 
 impl Section {
     /// Display order for the nav.
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::Home,
         Section::Arrangements,
         Section::Collections,
         Section::Coverage,
         Section::Annotations,
         Section::Search,
+        Section::Members,
     ];
 
     fn label(self) -> &'static str {
@@ -249,6 +251,7 @@ impl Section {
             Section::Coverage => "Coverage",
             Section::Annotations => "Global annotations",
             Section::Search => "Search",
+            Section::Members => "Members",
         }
     }
 
@@ -261,6 +264,7 @@ impl Section {
             Section::Coverage => "coverage",
             Section::Annotations => "annotations",
             Section::Search => "search",
+            Section::Members => "members",
         }
     }
 
@@ -278,6 +282,8 @@ impl Section {
             Section::Coverage => Some("#35"),
             Section::Annotations => Some("#36"),
             Section::Search => Some("#34"),
+            // Members is a real screen (admin::members), not a stub.
+            Section::Members => None,
         }
     }
 
@@ -292,6 +298,7 @@ impl Section {
             Section::Collections => access.can_build_collections(),
             Section::Coverage => access.can_view_coverage(),
             Section::Annotations => access.can_author_global_annotations(),
+            Section::Members => access.can_manage_members(),
         }
     }
 
@@ -594,9 +601,10 @@ mod tests {
                 Section::Coverage,
                 Section::Annotations,
                 Section::Search,
+                Section::Members,
             ]
         );
-        // Archivist: everything staff except global annotations.
+        // Archivist: everything staff except global annotations and members.
         assert_eq!(
             member(Role::Archivist).visible_sections(),
             vec![

@@ -7,6 +7,7 @@
 pub mod arrangements;
 pub mod console;
 pub mod layout;
+pub mod members;
 pub mod orgs;
 pub mod tags;
 
@@ -50,6 +51,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(arrangements::router())
         // Tag management + attach/detach (issue #31, slice 3).
         .merge(tags::router())
+        // Member & instrument config (issue #31, slice 4).
+        .merge(members::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
