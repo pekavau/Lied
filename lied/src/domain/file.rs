@@ -396,6 +396,42 @@ pub async fn list(
     Ok((rows, total))
 }
 
+/// The soft-deleted files for an arrangement (or one of its voices when
+/// `voice_id` is `Some`), most-recently-deleted first. Powers the console's
+/// "previous / deleted versions" list — a replaced file leaves its old row
+/// soft-deleted here, and each is restorable. The parent arrangement must be
+/// live (a soft-deleted arrangement hides its whole subtree).
+pub async fn list_deleted(
+    pool: &PgPool,
+    arrangement_id: Uuid,
+    voice_id: Option<Uuid>,
+) -> Result<Vec<File>, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        File,
+        r#"
+        SELECT
+            f.id, f.arrangement_id, f.voice_id, f.name, f.format, f.mime_type,
+            f.derived_from_file_id, f.conversion_quality,
+            f.created_at as "created_at: DateTime<Utc>",
+            f.updated_at as "updated_at: DateTime<Utc>",
+            f.created_by,
+            f.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM file f
+        JOIN arrangement a ON a.id = f.arrangement_id
+        WHERE f.arrangement_id = $1
+          AND f.deleted_at IS NOT NULL
+          AND a.deleted_at IS NULL
+          AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)
+        ORDER BY f.deleted_at DESC, f.id ASC
+        "#,
+        arrangement_id,
+        voice_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Atomically replace a file: soft-delete `old_id` and insert a new row that
 /// records `derived_from_file_id = old_id`-chain continuity, in ONE
 /// transaction (CLAUDE.md: never in-place). The new row's
@@ -470,6 +506,23 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
     )
     .execute(pool)
     .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Restore a soft-deleted file. If a *live* file already occupies the same
+/// `(arrangement, voice, name, format)` slot — e.g. this row was replaced by a
+/// newer upload — the partial unique index rejects the restore, surfaced as
+/// [`FileError::Duplicate`] (the caller shows a "a current file already holds
+/// that name/format" message). Returns `false` if no soft-deleted row matched.
+pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
+    let res = sqlx::query!(
+        r#"UPDATE file SET deleted_at = NULL, updated_at = now()
+           WHERE id = $1 AND deleted_at IS NOT NULL"#,
+        id,
+    )
+    .execute(pool)
+    .await
+    .map_err(map_write_error)?;
     Ok(res.rows_affected() > 0)
 }
 

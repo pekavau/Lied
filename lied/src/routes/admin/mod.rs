@@ -6,6 +6,7 @@
 
 pub mod arrangements;
 pub mod console;
+pub mod files;
 pub mod layout;
 pub mod members;
 pub mod orgs;
@@ -53,6 +54,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(tags::router())
         // Member & instrument config (issue #31, slice 4).
         .merge(members::router())
+        // File management screens (issue #32).
+        .merge(files::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
