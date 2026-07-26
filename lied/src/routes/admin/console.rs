@@ -393,6 +393,46 @@ fn error_body(message: &str) -> Markup {
     html! { p class="error" { (message) } }
 }
 
+/// Render a full-page error inside a given section's shell, at `status`. The
+/// one error-page primitive every section module (`arrangements`, `tags`,
+/// `members`, …) shares — the `section` keeps the nav highlight correct.
+pub(crate) fn error_page(
+    ctx: &ConsoleCtx,
+    section: Section,
+    status: StatusCode,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Html(console_page(ctx, section, error_body(message)).into_string()),
+    )
+        .into_response()
+}
+
+/// The stale-write retry page (`412`): the row changed since the form loaded.
+/// `entity` names the thing ("arrangement", "voice", "member", "tag") and
+/// `back_url` links back to *that* entity — shared so every editable screen
+/// reports the right thing (not always "arrangement").
+pub(crate) fn precondition_page(
+    ctx: &ConsoleCtx,
+    section: Section,
+    entity: &str,
+    back_url: &str,
+) -> Response {
+    let body = html! {
+        p class="error" {
+            "This " (entity) " was changed by someone else since you opened the "
+            "form. Your edit was not saved — reload and try again."
+        }
+        p { a href=(back_url) { "Reload the " (entity) } }
+    };
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Html(console_page(ctx, section, body).into_string()),
+    )
+        .into_response()
+}
+
 /// Render a full-page access-denied / not-found response in the admin styling,
 /// with a link back to the workspace list. Used when [`ConsoleCtx::load`]
 /// rejects the caller (before a console shell is available).

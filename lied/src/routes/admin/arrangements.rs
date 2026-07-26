@@ -29,7 +29,7 @@ use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::{arrangement, instrument, tag, voice, work};
-use crate::listing::SortDirection;
+use crate::listing::{check_if_match, SortDirection};
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
 use crate::routes::RequestId;
@@ -84,41 +84,19 @@ const RATING_SCALES: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 
 /// Trim a form value and treat the empty string as absent — text inputs always
-/// submit (even blank), so `""` means "not provided".
-fn blank_to_none(value: Option<String>) -> Option<String> {
+/// submit (even blank), so `""` means "not provided". Shared by every console
+/// screen module (`tags`, `members`).
+pub(crate) fn blank_to_none(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
 }
 
-/// Render a full-page error inside the arrangements section shell, at `status`.
+/// Full-page error in the arrangements-section shell (the catalog area, which
+/// also hosts works/voices/tags). Thin wrapper over the shared
+/// [`console::error_page`].
 pub(crate) fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
-    let body = html! { p class="error" { (message) } };
-    (
-        status,
-        Html(console::console_page(ctx, Section::Arrangements, body).into_string()),
-    )
-        .into_response()
-}
-
-/// The stale-write retry page (`412`): the row changed since the form loaded.
-fn precondition_page(ctx: &ConsoleCtx, arr_id: Uuid) -> Response {
-    let body = html! {
-        p class="error" {
-            "This arrangement was changed by someone else since you opened the "
-            "form. Your edit was not saved — reload and try again."
-        }
-        p {
-            a href=(format!("/admin/orgs/{}/arrangements/{}", ctx.org().id, arr_id)) {
-                "Reload the arrangement"
-            }
-        }
-    };
-    (
-        StatusCode::PRECONDITION_FAILED,
-        Html(console::console_page(ctx, Section::Arrangements, body).into_string()),
-    )
-        .into_response()
+    console::error_page(ctx, Section::Arrangements, status, message)
 }
 
 pub(crate) async fn csrf_token(ctx: &ConsoleCtx, session: &Session) -> Result<String, Response> {
@@ -132,11 +110,59 @@ pub(crate) async fn csrf_token(ctx: &ConsoleCtx, session: &Session) -> Result<St
     })
 }
 
+/// Audit context for a normal, org-scoped write.
 pub(crate) fn audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
     AuditContext {
         actor_user_id: Some(ctx.user().id),
         org_id: Some(ctx.org().id),
         request_id: Some(request_id),
+    }
+}
+
+/// Audit context for a write to an **instance-wide** entity (a `Work`), whose
+/// events are not attributed to an org (CLAUDE.md: "instance-wide events are
+/// not attributed to an org"; `org_id` is `NULL`). Mirrors the `/v1` Work
+/// handlers, which pass `org_id: None`.
+fn instance_audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
+    AuditContext {
+        actor_user_id: Some(ctx.user().id),
+        org_id: None,
+        request_id: Some(request_id),
+    }
+}
+
+/// Existence/scope guard for a `Result<Option<T>, sqlx::Error>` lookup: yields
+/// the row, or a ready-to-return response — **404** for not-found and **500**
+/// for a DB error, so a transient failure is never collapsed into a misleading
+/// "not found". Shared by every console screen module.
+///
+/// The `Err` variant is a full `Response` on purpose (it's ready to return), so
+/// the large-error lint doesn't apply — boxing would only add indirection at
+/// every call site.
+#[allow(clippy::result_large_err)]
+pub(crate) fn require_found<T>(
+    result: Result<Option<T>, sqlx::Error>,
+    ctx: &ConsoleCtx,
+    section: Section,
+    not_found: &str,
+) -> Result<T, Response> {
+    match result {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(console::error_page(
+            ctx,
+            section,
+            StatusCode::NOT_FOUND,
+            not_found,
+        )),
+        Err(error) => {
+            tracing::error!(%error, "scoped lookup failed");
+            Err(console::error_page(
+                ctx,
+                section,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Please retry.",
+            ))
+        }
     }
 }
 
@@ -282,18 +308,26 @@ impl ArrangementForm {
                 ratings.insert((*key).to_string(), serde_json::Value::String(value));
             }
         }
-        // ABRSM key, if present, must agree with the numeric difficulty
-        // (rounded) — CLAUDE.md difficulty_ratings rule.
-        if let (Some(diff), Some(serde_json::Value::String(abrsm))) =
-            (difficulty, ratings.get("abrsm"))
-        {
+        // The ABRSM rating maps to the numeric `difficulty` column, so validate
+        // it independently of whether `difficulty` is set: it must be a number
+        // on the 1–8 grade scale (unlike the other, free-form scales). Then, if
+        // `difficulty` is also present, the two must agree (rounded) — CLAUDE.md
+        // difficulty_ratings rule. Validating only in the agreement branch let a
+        // blank difficulty pass any garbage ("99", "x") straight into storage.
+        if let Some(serde_json::Value::String(abrsm)) = ratings.get("abrsm") {
             let abrsm_num: f64 = abrsm
                 .parse()
-                .map_err(|_| "ABRSM rating must be a number.")?;
-            if abrsm_num.round() as i16 != diff {
-                return Err(format!(
-                    "The ABRSM rating ({abrsm}) must agree with the difficulty ({diff})."
-                ));
+                .map_err(|_| "ABRSM rating must be a number (grade 1–8).")?;
+            let abrsm_grade = abrsm_num.round() as i16;
+            if !(1..=8).contains(&abrsm_grade) {
+                return Err("ABRSM rating must be on the 1–8 grade scale.".to_string());
+            }
+            if let Some(diff) = difficulty {
+                if abrsm_grade != diff {
+                    return Err(format!(
+                        "The ABRSM rating ({abrsm}) must agree with the difficulty ({diff})."
+                    ));
+                }
             }
         }
         let difficulty_ratings = if ratings.is_empty() {
@@ -643,13 +677,15 @@ async fn update(
         }
     };
 
-    // Optimistic concurrency: reject a stale edit rather than clobber a newer one.
-    let expected: Option<i64> = form
-        .expected_version
-        .as_deref()
-        .and_then(|v| v.parse().ok());
-    if expected != Some(current.updated_at.timestamp_millis()) {
-        return precondition_page(&ctx, arr_id);
+    // Optimistic concurrency: reject a stale edit rather than clobber a newer
+    // one (reuses the same ms-epoch check as the /v1 If-Match path).
+    if check_if_match(form.expected_version.as_deref(), current.updated_at).is_err() {
+        return console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "arrangement",
+            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}"),
+        );
     }
 
     let parsed = match form.parse() {
@@ -713,7 +749,7 @@ async fn delete(
         }
     }
     match arrangement::soft_delete(&state.db, arr_id).await {
-        Ok(_) => {
+        Ok(true) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -723,6 +759,9 @@ async fn delete(
                 serde_json::json!({}),
             )
             .await;
+            Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
+        }
+        Ok(false) => {
             Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
         }
         Err(error) => {
@@ -763,7 +802,7 @@ async fn undelete(
         }
     }
     match arrangement::undelete(&state.db, arr_id).await {
-        Ok(_) => {
+        Ok(true) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -773,6 +812,9 @@ async fn undelete(
                 serde_json::json!({}),
             )
             .await;
+            Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
+        }
+        Ok(false) => {
             Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
         }
         Err(error) => {
@@ -907,7 +949,7 @@ async fn create_work(
         Ok(created) => {
             audit(
                 &state.db,
-                &audit_ctx(&ctx, request_id),
+                &instance_audit_ctx(&ctx, request_id),
                 "work.create",
                 "work",
                 Some(created.id),
@@ -973,7 +1015,7 @@ async fn update_work(
         Ok(_) => {
             audit(
                 &state.db,
-                &audit_ctx(&ctx, request_id),
+                &instance_audit_ctx(&ctx, request_id),
                 "work.update",
                 "work",
                 Some(work_id),
@@ -1104,15 +1146,17 @@ struct VoiceForm {
 }
 
 /// Load the whole instrument vocabulary (~177 rows) for the picker.
-async fn load_instruments(state: &AppState) -> Result<Vec<instrument::Instrument>, sqlx::Error> {
+pub(crate) async fn load_instruments(
+    state: &AppState,
+) -> Result<Vec<instrument::Instrument>, sqlx::Error> {
     let (instruments, _total) = instrument::list(&state.db, 1000, 0).await?;
     Ok(instruments)
 }
 
-/// A `<select name="instrument_id">` with the vocabulary grouped into
-/// `<optgroup>`s by family, `selected` pre-selecting the current instrument.
-fn instrument_picker(instruments: &[instrument::Instrument], selected: Option<Uuid>) -> Markup {
-    // Families present, ordered by FAMILY_ORDER then any extras alphabetically.
+/// The distinct families present in `instruments`, in `FAMILY_ORDER` (unknown
+/// families sort to the end). Shared so every instrument `<select>` — the voice
+/// picker and the member multiselect — groups families identically.
+pub(crate) fn ordered_families(instruments: &[instrument::Instrument]) -> Vec<&str> {
     let mut families: Vec<&str> = instruments.iter().map(|i| i.family.as_str()).collect();
     families.sort_unstable();
     families.dedup();
@@ -1122,6 +1166,13 @@ fn instrument_picker(instruments: &[instrument::Instrument], selected: Option<Uu
             .position(|o| o == f)
             .unwrap_or(FAMILY_ORDER.len())
     });
+    families
+}
+
+/// A `<select name="instrument_id">` with the vocabulary grouped into
+/// `<optgroup>`s by family, `selected` pre-selecting the current instrument.
+fn instrument_picker(instruments: &[instrument::Instrument], selected: Option<Uuid>) -> Markup {
+    let families = ordered_families(instruments);
 
     html! {
         select name="instrument_id" required {
@@ -1141,7 +1192,7 @@ fn instrument_picker(instruments: &[instrument::Instrument], selected: Option<Uu
 
 /// Render the instrument's display name for a voice row (falls back to the raw
 /// id if the instrument somehow isn't in the loaded set).
-fn instrument_name(instruments: &[instrument::Instrument], id: Uuid) -> String {
+pub(crate) fn instrument_name(instruments: &[instrument::Instrument], id: Uuid) -> String {
     instruments
         .iter()
         .find(|i| i.id == id)
@@ -1277,13 +1328,13 @@ async fn create_voice(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_arrangement(&state, &ctx, arr_id, false)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found.");
+    if let Err(response) = require_found(
+        scoped_arrangement(&state, &ctx, arr_id, false).await,
+        &ctx,
+        Section::Arrangements,
+        "Arrangement not found.",
+    ) {
+        return response;
     }
     let Some(name) = blank_to_none(form.name) else {
         return error_page(
@@ -1438,12 +1489,13 @@ async fn update_voice(
             );
         }
     };
-    let expected: Option<i64> = form
-        .expected_version
-        .as_deref()
-        .and_then(|v| v.parse().ok());
-    if expected != Some(current.updated_at.timestamp_millis()) {
-        return precondition_page(&ctx, arr_id);
+    if check_if_match(form.expected_version.as_deref(), current.updated_at).is_err() {
+        return console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "voice",
+            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"),
+        );
     }
     let Some(name) = blank_to_none(form.name) else {
         return error_page(
@@ -1508,16 +1560,16 @@ async fn delete_voice(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_voice(&state, &ctx, arr_id, voice_id, false)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found.");
+    if let Err(response) = require_found(
+        scoped_voice(&state, &ctx, arr_id, voice_id, false).await,
+        &ctx,
+        Section::Arrangements,
+        "Voice not found.",
+    ) {
+        return response;
     }
     match voice::soft_delete(&state.db, voice_id).await {
-        Ok(_) => {
+        Ok(true) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -1532,6 +1584,12 @@ async fn delete_voice(
             ))
             .into_response()
         }
+        // No live row matched (already deleted) — nothing changed, so don't
+        // write a misleading audit entry; just return to the voice.
+        Ok(false) => Redirect::to(&format!(
+            "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
+        ))
+        .into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to soft-delete voice");
             error_page(
@@ -1556,16 +1614,16 @@ async fn undelete_voice(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_voice(&state, &ctx, arr_id, voice_id, true)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found.");
+    if let Err(response) = require_found(
+        scoped_voice(&state, &ctx, arr_id, voice_id, true).await,
+        &ctx,
+        Section::Arrangements,
+        "Voice not found.",
+    ) {
+        return response;
     }
     match voice::undelete(&state.db, voice_id).await {
-        Ok(_) => {
+        Ok(true) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -1580,6 +1638,10 @@ async fn undelete_voice(
             ))
             .into_response()
         }
+        Ok(false) => Redirect::to(&format!(
+            "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
+        ))
+        .into_response(),
         Err(error) => {
             tracing::error!(%error, "failed to undelete voice");
             error_page(
@@ -1680,6 +1742,25 @@ mod tests {
     #[test]
     fn no_ratings_yield_none() {
         assert!(with_title().parse().unwrap().difficulty_ratings.is_none());
+    }
+
+    #[test]
+    fn abrsm_rating_is_validated_even_without_a_difficulty() {
+        // Bogus ABRSM values are rejected even when `difficulty` is left blank
+        // (the agreement branch used to be the only validation).
+        for raw in ["99", "0", "x"] {
+            let f = ArrangementForm {
+                rating_abrsm: Some(raw.to_string()),
+                ..with_title()
+            };
+            assert!(f.parse().is_err(), "abrsm {raw} without difficulty");
+        }
+        // A valid grade with no difficulty is fine.
+        let ok = ArrangementForm {
+            rating_abrsm: Some("6".to_string()),
+            ..with_title()
+        };
+        assert!(ok.parse().is_ok());
     }
 
     #[test]
