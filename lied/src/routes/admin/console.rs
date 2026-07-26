@@ -191,6 +191,31 @@ impl ConsoleCtx {
                 .unwrap_or_default()
         }
     }
+
+    /// The organization this console request is scoped to.
+    pub fn org(&self) -> &Organization {
+        &self.org
+    }
+
+    /// The authenticated user.
+    pub fn user(&self) -> &User {
+        &self.user
+    }
+}
+
+/// Resolve a section handler's session and console context in one step:
+/// returns the ready-to-send response (login redirect, 403, or 404 page) on
+/// failure, so section modules (`arrangements`, `tags`, …) share the exact
+/// same entry gate as the foundation's own handlers.
+pub(crate) async fn enter(
+    state: &AppState,
+    auth: Option<AuthSession>,
+    org_id: Uuid,
+) -> Result<ConsoleCtx, Response> {
+    let user = require_login(auth).map_err(IntoResponse::into_response)?;
+    ConsoleCtx::load(state, &user, org_id)
+        .await
+        .map_err(load_error_response)
 }
 
 /// A console navigation section. Each maps to a route under the org prefix and
@@ -291,9 +316,10 @@ pub fn can_enter(role: Role, is_principal: bool) -> bool {
 }
 
 pub fn router() -> Router<AppState> {
+    // The arrangements section is a real screen (see `admin::arrangements`),
+    // merged separately in `admin::router`; the rest are still gated stubs.
     Router::new()
         .route("/orgs/:org_id/console", get(home_page))
-        .route("/orgs/:org_id/arrangements", get(arrangements_stub))
         .route("/orgs/:org_id/collections", get(collections_stub))
         .route("/orgs/:org_id/coverage", get(coverage_stub))
         .route("/orgs/:org_id/annotations", get(annotations_stub))
@@ -302,7 +328,7 @@ pub fn router() -> Router<AppState> {
 
 /// Render a full console page inside the org's role-aware nav shell, with
 /// `active` highlighted and only the caller's permitted sections shown.
-fn console_page(ctx: &ConsoleCtx, active: Section, body: Markup) -> Markup {
+pub(crate) fn console_page(ctx: &ConsoleCtx, active: Section, body: Markup) -> Markup {
     let nav = html! {
         a href="/admin" { "← Workspaces" }
         span class="muted" { (ctx.org.name) " · " (ctx.role_label()) }
@@ -398,7 +424,7 @@ fn load_error_response(err: AppError) -> Response {
 /// not (e.g. an archivist reaching global annotations, or a principal
 /// reaching arrangements). Rendered inside the console shell so the nav stays
 /// available.
-fn section_forbidden(ctx: &ConsoleCtx) -> Response {
+pub(crate) fn section_forbidden(ctx: &ConsoleCtx) -> Response {
     let body = error_body("You do not have permission to view this section.");
     (
         StatusCode::FORBIDDEN,
@@ -471,7 +497,6 @@ macro_rules! section_handler {
     };
 }
 
-section_handler!(arrangements_stub, Section::Arrangements);
 section_handler!(collections_stub, Section::Collections);
 section_handler!(coverage_stub, Section::Coverage);
 section_handler!(annotations_stub, Section::Annotations);
