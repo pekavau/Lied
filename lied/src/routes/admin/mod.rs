@@ -8,6 +8,7 @@ pub mod arrangements;
 pub mod console;
 pub mod layout;
 pub mod orgs;
+pub mod tags;
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue, StatusCode};
@@ -45,8 +46,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(orgs::router())
         // Per-org management console (issue #30) — see `console` submodule.
         .merge(console::router())
-        // Arrangement + Work management screens (issue #31).
+        // Arrangement + Work + Voice management screens (issue #31).
         .merge(arrangements::router())
+        // Tag management + attach/detach (issue #31, slice 3).
+        .merge(tags::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
