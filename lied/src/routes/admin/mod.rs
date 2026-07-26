@@ -4,6 +4,7 @@
 //! first real screens (`orgs` submodule: org/user/membership management),
 //! sharing the `layout` submodule's maud page shell.
 
+pub mod arrangements;
 pub mod console;
 pub mod layout;
 pub mod orgs;
@@ -44,6 +45,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(orgs::router())
         // Per-org management console (issue #30) — see `console` submodule.
         .merge(console::router())
+        // Arrangement + Work management screens (issue #31).
+        .merge(arrangements::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
