@@ -641,6 +641,8 @@ async fn detail_page(
         p {
             a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "Manage voices →" }
             " · "
+            a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/files")) { "Score files →" }
+            " · "
             a href=(format!("/admin/orgs/{org_id}/tags")) { "Manage tags →" }
             " · "
             a href=(format!("/admin/orgs/{org_id}/arrangements")) { "← Back to arrangements" }
@@ -1292,7 +1294,7 @@ async fn voices_page(
 
 /// Load a voice scoped to `arr_id` (which must belong to `ctx`'s org), or
 /// `None` for any mismatch — cross-org / cross-arrangement access is a 404.
-async fn scoped_voice(
+pub(crate) async fn scoped_voice(
     state: &AppState,
     ctx: &ConsoleCtx,
     arr_id: Uuid,
@@ -1458,7 +1460,11 @@ async fn voice_detail_page(
         } @else {
             p { "Instrument: " (instrument_name(&instruments, v.instrument_id)) }
         }
-        p { a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "← Back to voices" } }
+        p {
+            a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/files")) { "Voice files →" }
+            " · "
+            a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "← Back to voices" }
+        }
     };
     Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
 }

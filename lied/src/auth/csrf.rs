@@ -110,6 +110,23 @@ pub async fn csrf_middleware(
             return next.run(request).await;
         }
 
+        // (c) a `csrf` query parameter matching the session token — for the
+        //     multipart file-upload/replace forms (issue #32). Their body IS
+        //     the streamed file, so they can't carry the token in a urlencoded
+        //     body, and the JS-free UI can't set the `HX-CSRF` header. The
+        //     token is the unguessable double-submit value, so a cross-site
+        //     form can't supply it; reading it from the query needs no body
+        //     buffering, so the streaming upload path is untouched.
+        let query_ok = request
+            .uri()
+            .query()
+            .and_then(|q| form_field(q.as_bytes(), "csrf"))
+            .as_deref()
+            == Some(expected.as_str());
+        if query_ok {
+            return next.run(request).await;
+        }
+
         if is_form_urlencoded(&request) {
             // Buffer the (size-bounded) form body to read the token, then
             // rebuild the request so the handler's `Form` extractor still sees
@@ -133,7 +150,9 @@ pub async fn csrf_middleware(
             return csrf_rejection("CSRF token mismatch or missing csrf_token field");
         }
 
-        return csrf_rejection("CSRF token mismatch or missing HX-CSRF header / csrf_token field");
+        return csrf_rejection(
+            "CSRF token mismatch or missing HX-CSRF header / csrf_token field / csrf query param",
+        );
     }
 
     // Safe method: make sure the session carries a token, then hand the
