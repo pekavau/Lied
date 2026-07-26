@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::{arrangement, instrument, voice, work};
+use crate::domain::{arrangement, instrument, tag, voice, work};
 use crate::listing::SortDirection;
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
@@ -92,7 +92,7 @@ fn blank_to_none(value: Option<String>) -> Option<String> {
 }
 
 /// Render a full-page error inside the arrangements section shell, at `status`.
-fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
     let body = html! { p class="error" { (message) } };
     (
         status,
@@ -121,7 +121,7 @@ fn precondition_page(ctx: &ConsoleCtx, arr_id: Uuid) -> Response {
         .into_response()
 }
 
-async fn csrf_token(ctx: &ConsoleCtx, session: &Session) -> Result<String, Response> {
+pub(crate) async fn csrf_token(ctx: &ConsoleCtx, session: &Session) -> Result<String, Response> {
     csrf::ensure_token(session).await.map_err(|error| {
         tracing::error!(%error, "failed to establish CSRF token");
         error_page(
@@ -132,7 +132,7 @@ async fn csrf_token(ctx: &ConsoleCtx, session: &Session) -> Result<String, Respo
     })
 }
 
-fn audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
+pub(crate) fn audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
     AuditContext {
         actor_user_id: Some(ctx.user().id),
         org_id: Some(ctx.org().id),
@@ -142,7 +142,7 @@ fn audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
 
 /// Fetch an arrangement scoped to `ctx`'s org, or `None` if it doesn't exist
 /// or belongs to another org (cross-org access is a 404, never a leak).
-async fn scoped_arrangement(
+pub(crate) async fn scoped_arrangement(
     state: &AppState,
     ctx: &ConsoleCtx,
     arr_id: Uuid,
@@ -412,7 +412,11 @@ async fn list_page(
         @if arrangements.is_empty() {
             p class="muted" { "No arrangements yet." }
         }
-        p { a href=(format!("/admin/orgs/{org_id}/works")) { "Manage works →" } }
+        p {
+            a href=(format!("/admin/orgs/{org_id}/works")) { "Manage works →" }
+            " · "
+            a href=(format!("/admin/orgs/{org_id}/tags")) { "Manage tags →" }
+        }
 
         @if can_edit {
             h2 { "Add an arrangement" }
@@ -521,6 +525,13 @@ async fn detail_page(
 
     let can_edit = ctx.can_edit_arrangements();
     let works = load_works(&state, &ctx).await.unwrap_or_default();
+    let attached_tags = tag::list_tags_for_arrangement(&state.db, arr_id)
+        .await
+        .unwrap_or_default();
+    let (all_tags, _) =
+        tag::list_for_org(&state.db, org_id, 500, 0, "name", SortDirection::Asc, None)
+            .await
+            .unwrap_or_default();
     let version = a.updated_at.timestamp_millis();
     let deleted = a.deleted_at.is_some();
 
@@ -547,8 +558,56 @@ async fn detail_page(
         } @else {
             (arrangement_readonly(&a, &works))
         }
+
+        h2 { "Tags" }
+        @if attached_tags.is_empty() {
+            p class="muted" { "No tags attached." }
+        } @else {
+            p {
+                @for t in &attached_tags {
+                    span {
+                        (t.name)
+                        @if let Some(k) = &t.kind { " " span class="muted" { "(" (k) ")" } }
+                        @if can_edit {
+                            " "
+                            form class="inline" method="post"
+                                action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/tags/{}/detach", t.id)) {
+                                (layout::csrf_field(&token))
+                                button type="submit" title="Detach" { "×" }
+                            }
+                        }
+                    }
+                    "  "
+                }
+            }
+        }
+        @if can_edit {
+            @let unattached: Vec<&tag::Tag> = all_tags
+                .iter()
+                .filter(|t| !attached_tags.iter().any(|a| a.id == t.id))
+                .collect();
+            @if unattached.is_empty() {
+                p class="muted" { "No more tags to attach — " a href=(format!("/admin/orgs/{org_id}/tags")) { "create some" } "." }
+            } @else {
+                form class="inline" method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/tags")) {
+                    (layout::csrf_field(&token))
+                    select name="tag_id" required {
+                        option value="" { "— choose a tag —" }
+                        @for t in &unattached {
+                            option value=(t.id) {
+                                (t.name) @if let Some(k) = &t.kind { " (" (k) ")" }
+                            }
+                        }
+                    }
+                    button type="submit" { "Attach tag" }
+                }
+            }
+        }
+
         p {
             a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices")) { "Manage voices →" }
+            " · "
+            a href=(format!("/admin/orgs/{org_id}/tags")) { "Manage tags →" }
             " · "
             a href=(format!("/admin/orgs/{org_id}/arrangements")) { "← Back to arrangements" }
         }

@@ -127,6 +127,33 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Tag>, sqlx::Er
     Ok(row.map(Row::into_tag))
 }
 
+/// The soft-deleted tags of an organization, most-recently-deleted first —
+/// backs the admin console's "restore" list (tags have no detail page to reach
+/// undelete from, unlike arrangements/voices).
+pub async fn list_deleted_for_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<Vec<Tag>, sqlx::Error> {
+    let rows = sqlx::query_as!(
+        Row,
+        r#"
+        SELECT
+            id, organization_id, name, kind,
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>",
+            created_by,
+            deleted_at as "deleted_at: DateTime<Utc>"
+        FROM tag
+        WHERE organization_id = $1 AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC, id
+        "#,
+        organization_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(Row::into_tag).collect())
+}
+
 /// Sort allowlist for `GET /v1/orgs/{orgId}/tags`. Default sort is
 /// `name:asc`.
 pub const SORT_ALLOWLIST: &[(&str, &str)] = &[("name", "name"), ("kind", "kind")];
