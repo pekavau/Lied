@@ -1,14 +1,16 @@
-//! `/admin/orgs`, `/admin/orgs/{id}`, `/admin/orgs/{id}/members`,
-//! `/admin/users` — HTMX admin screens for issue #5 (Org/User/Membership
-//! management). Minimal but functional: list + create/edit/delete forms,
-//! server-rendered HTML fragments per CLAUDE.md's HTMX admin-UI convention.
+//! `/admin/orgs`, `/admin/orgs/{id}`, `/admin/users` — the **system-admin**
+//! provisioning screens (issue #5): org and user create/delete, plus a
+//! **read-only** member roster on the org-detail page. Server-rendered HTML
+//! fragments per CLAUDE.md's HTMX admin-UI convention.
+//!
+//! Member *management* (add / role / instruments / remove) is **not** here —
+//! it moved to the per-org console ([`crate::routes::admin::members`], issue
+//! #31), the single owner-facing surface for it; this page only links to it.
 //!
 //! Authorization mirrors the `/v1` handlers in [`crate::routes::orgs`]: org
-//! create/delete and user create/delete are system-admin-gated; membership
-//! management is owner-gated via [`crate::auth::authz::require_org_role`].
-//! A caller who fails a check gets a small HTML error fragment (not Problem
-//! Details — the HTMX tree is exempt from RFC 7807 per CLAUDE.md) with the
-//! same status code.
+//! create/delete and user create/delete are system-admin-gated. A caller who
+//! fails a check gets a small HTML error fragment (not Problem Details — the
+//! HTMX tree is exempt from RFC 7807 per CLAUDE.md) with the same status code.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -242,6 +244,12 @@ async fn org_detail_page(
     if let Err(err) = require_org_role(&state, &actor, id, Role::Musician).await {
         return app_error_fragment(err);
     }
+    // Only owners / system admins can actually manage members in the console —
+    // so only they get the link (a plain musician would just hit a 403).
+    let can_manage_members = actor.is_system_admin
+        || require_org_role(&state, &actor, id, Role::Owner)
+            .await
+            .is_ok();
 
     let org = match organization::find_by_id(&state.db, id).await {
         Ok(Some(org)) => org,
@@ -300,8 +308,10 @@ async fn org_detail_page(
                 }
             }
         }
-        p {
-            a href={"/admin/orgs/" (id) "/members"} { "Manage members in the org console →" }
+        @if can_manage_members {
+            p {
+                a href={"/admin/orgs/" (id) "/members"} { "Manage members in the org console →" }
+            }
         }
     };
 

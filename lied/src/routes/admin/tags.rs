@@ -21,8 +21,10 @@ use uuid::Uuid;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::tag;
-use crate::listing::SortDirection;
-use crate::routes::admin::arrangements::{audit_ctx, csrf_token, error_page, scoped_arrangement};
+use crate::listing::{check_if_match, SortDirection};
+use crate::routes::admin::arrangements::{
+    audit_ctx, blank_to_none, csrf_token, error_page, require_found, scoped_arrangement,
+};
 use crate::routes::admin::console::{self, Section};
 use crate::routes::admin::layout;
 use crate::routes::RequestId;
@@ -46,17 +48,12 @@ pub fn router() -> Router<AppState> {
 struct TagForm {
     name: Option<String>,
     kind: Option<String>,
+    expected_version: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct AttachForm {
     tag_id: Option<String>,
-}
-
-fn blank(value: Option<String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +123,7 @@ async fn tags_page(
                             td colspan="3" {
                                 form class="inline" method="post" action=(format!("/admin/orgs/{org_id}/tags/{}", t.id)) {
                                     (layout::csrf_field(&token))
+                                    input type="hidden" name="expected_version" value=(t.updated_at.timestamp_millis());
                                     input type="text" name="name" value=(t.name);
                                     input type="text" name="kind" value=(t.kind.clone().unwrap_or_default()) placeholder="kind";
                                     button type="submit" { "Save" }
@@ -185,10 +183,10 @@ async fn create_tag(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    let Some(name) = blank(form.name) else {
+    let Some(name) = blank_to_none(form.name) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Tag name must not be empty.");
     };
-    let kind = blank(form.kind);
+    let kind = blank_to_none(form.kind);
     match tag::create(
         &state.db,
         Uuid::now_v7(),
@@ -241,13 +239,27 @@ async fn update_tag(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if !tag_belongs_to_org(&state, org_id, tag_id).await {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Tag not found.");
+    let current = match require_found(
+        scoped_tag(&state, org_id, tag_id).await,
+        &ctx,
+        Section::Arrangements,
+        "Tag not found.",
+    ) {
+        Ok(tag) => tag,
+        Err(response) => return response,
+    };
+    if check_if_match(form.expected_version.as_deref(), current.updated_at).is_err() {
+        return console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "tag",
+            &format!("/admin/orgs/{org_id}/tags"),
+        );
     }
-    let Some(name) = blank(form.name) else {
+    let Some(name) = blank_to_none(form.name) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Tag name must not be empty.");
     };
-    let kind = blank(form.kind);
+    let kind = blank_to_none(form.kind);
     match tag::update(&state.db, tag_id, &name, kind.as_deref()).await {
         Ok(_) => {
             audit(
@@ -290,19 +302,36 @@ async fn delete_tag(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if !tag_belongs_to_org(&state, org_id, tag_id).await {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Tag not found.");
+    if let Err(response) = require_found(
+        scoped_tag(&state, org_id, tag_id).await,
+        &ctx,
+        Section::Arrangements,
+        "Tag not found.",
+    ) {
+        return response;
     }
-    let _ = tag::soft_delete(&state.db, tag_id).await;
-    audit(
-        &state.db,
-        &audit_ctx(&ctx, request_id),
-        "tag.soft_delete",
-        "tag",
-        Some(tag_id),
-        serde_json::json!({}),
-    )
-    .await;
+    match tag::soft_delete(&state.db, tag_id).await {
+        Ok(true) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "tag.soft_delete",
+                "tag",
+                Some(tag_id),
+                serde_json::json!({}),
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, "failed to soft-delete tag");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not delete the tag.",
+            );
+        }
+    }
     Redirect::to(&format!("/admin/orgs/{org_id}/tags")).into_response()
 }
 
@@ -320,33 +349,61 @@ async fn undelete_tag(
         return console::section_forbidden(&ctx);
     }
     // Scope: the deleted tag must belong to this org.
-    let owned = tag::list_deleted_for_org(&state.db, org_id)
-        .await
-        .map(|ts| ts.iter().any(|t| t.id == tag_id))
-        .unwrap_or(false);
+    let owned = match tag::list_deleted_for_org(&state.db, org_id).await {
+        Ok(ts) => ts.iter().any(|t| t.id == tag_id),
+        Err(error) => {
+            tracing::error!(%error, "failed to list deleted tags");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not restore the tag.",
+            );
+        }
+    };
     if !owned {
         return error_page(&ctx, StatusCode::NOT_FOUND, "Tag not found.");
     }
-    let _ = tag::undelete(&state.db, tag_id).await;
-    audit(
-        &state.db,
-        &audit_ctx(&ctx, request_id),
-        "tag.undelete",
-        "tag",
-        Some(tag_id),
-        serde_json::json!({}),
-    )
-    .await;
+    match tag::undelete(&state.db, tag_id).await {
+        Ok(true) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "tag.undelete",
+                "tag",
+                Some(tag_id),
+                serde_json::json!({}),
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, "failed to undelete tag");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not restore the tag.",
+            );
+        }
+    }
     Redirect::to(&format!("/admin/orgs/{org_id}/tags")).into_response()
 }
 
-/// Whether a live tag with `tag_id` belongs to `org_id` — the scope check for
-/// tag mutations (a tag id from another org must 404, not mutate).
+/// Fetch a live tag scoped to `org_id`, or `None` if it doesn't exist or
+/// belongs to another org (cross-org access is a 404, never a leak).
+async fn scoped_tag(
+    state: &AppState,
+    org_id: Uuid,
+    tag_id: Uuid,
+) -> Result<Option<tag::Tag>, sqlx::Error> {
+    Ok(tag::find_by_id(&state.db, tag_id)
+        .await?
+        .filter(|t| t.organization_id == org_id))
+}
+
+/// Whether a live tag with `tag_id` belongs to `org_id` — the existence check
+/// used when attaching (a foreign tag id must be rejected, not attached).
 async fn tag_belongs_to_org(state: &AppState, org_id: Uuid, tag_id: Uuid) -> bool {
-    matches!(
-        tag::find_by_id(&state.db, tag_id).await,
-        Ok(Some(t)) if t.organization_id == org_id
-    )
+    matches!(scoped_tag(state, org_id, tag_id).await, Ok(Some(_)))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,15 +424,15 @@ async fn attach_tag(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_arrangement(&state, &ctx, arr_id, false)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found.");
+    if let Err(response) = require_found(
+        scoped_arrangement(&state, &ctx, arr_id, false).await,
+        &ctx,
+        Section::Arrangements,
+        "Arrangement not found.",
+    ) {
+        return response;
     }
-    let tag_id = match blank(form.tag_id).map(|s| Uuid::parse_str(&s)) {
+    let tag_id = match blank_to_none(form.tag_id).map(|s| Uuid::parse_str(&s)) {
         Some(Ok(id)) => id,
         _ => return error_page(&ctx, StatusCode::BAD_REQUEST, "Please choose a tag."),
     };
@@ -428,23 +485,35 @@ async fn detach_tag(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_arrangement(&state, &ctx, arr_id, false)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found.");
+    if let Err(response) = require_found(
+        scoped_arrangement(&state, &ctx, arr_id, false).await,
+        &ctx,
+        Section::Arrangements,
+        "Arrangement not found.",
+    ) {
+        return response;
     }
-    let _ = tag::detach(&state.db, arr_id, tag_id).await;
-    audit(
-        &state.db,
-        &audit_ctx(&ctx, request_id),
-        "arrangement_tag.delete",
-        "arrangement_tag",
-        Some(arr_id),
-        serde_json::json!({ "arrangementId": arr_id, "tagId": tag_id }),
-    )
-    .await;
+    match tag::detach(&state.db, arr_id, tag_id).await {
+        Ok(true) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "arrangement_tag.delete",
+                "arrangement_tag",
+                Some(arr_id),
+                serde_json::json!({ "arrangementId": arr_id, "tagId": tag_id }),
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(%error, "failed to detach tag");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not detach the tag.",
+            );
+        }
+    }
     Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
 }

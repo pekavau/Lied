@@ -24,8 +24,11 @@ use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::membership::{self, Membership, Role};
 use crate::domain::{instrument, user};
-use crate::listing::SortDirection;
-use crate::routes::admin::arrangements::{audit_ctx, csrf_token};
+use crate::listing::{check_if_match, SortDirection};
+use crate::routes::admin::arrangements::{
+    audit_ctx, blank_to_none, csrf_token, instrument_name, load_instruments, ordered_families,
+    require_found,
+};
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
 use crate::routes::RequestId;
@@ -44,38 +47,10 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// Full-page error inside the Members section shell.
+/// Full-page error inside the Members section shell (thin wrapper over the
+/// shared [`console::error_page`], pinned to this section for the nav highlight).
 fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
-    let body = html! { p class="error" { (message) } };
-    (
-        status,
-        Html(console::console_page(ctx, Section::Members, body).into_string()),
-    )
-        .into_response()
-}
-
-fn blank(value: Option<String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-async fn load_instruments(state: &AppState) -> Vec<instrument::Instrument> {
-    match instrument::list(&state.db, 1000, 0).await {
-        Ok((instruments, _)) => instruments,
-        Err(error) => {
-            tracing::error!(%error, "failed to list instruments");
-            Vec::new()
-        }
-    }
-}
-
-fn instrument_name(instruments: &[instrument::Instrument], id: Uuid) -> String {
-    instruments
-        .iter()
-        .find(|i| i.id == id)
-        .map(|i| i.display_name.clone())
-        .unwrap_or_else(|| id.to_string())
+    console::error_page(ctx, Section::Members, status, message)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +96,7 @@ async fn members_page(
             );
         }
     };
-    let instruments = load_instruments(&state).await;
+    let instruments = load_instruments(&state).await.unwrap_or_default();
 
     // Username per member for display (small orgs — N+1 is fine here).
     let mut rows = Vec::with_capacity(members.len());
@@ -204,7 +179,7 @@ async fn add_member(
     if !ctx.can_manage_members() {
         return console::section_forbidden(&ctx);
     }
-    let Some(username) = blank(form.username) else {
+    let Some(username) = blank_to_none(form.username) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Username must not be empty.");
     };
     let Some(role) = form.role.as_deref().and_then(Role::parse) else {
@@ -307,19 +282,16 @@ async fn member_edit_page(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let m = match scoped_membership(&state, org_id, membership_id).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "Member not found."),
-        Err(error) => {
-            tracing::error!(%error, "failed to load membership");
-            return error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not load the member.",
-            );
-        }
+    let m = match require_found(
+        scoped_membership(&state, org_id, membership_id).await,
+        &ctx,
+        Section::Members,
+        "Member not found.",
+    ) {
+        Ok(m) => m,
+        Err(response) => return response,
     };
-    let instruments = load_instruments(&state).await;
+    let instruments = load_instruments(&state).await.unwrap_or_default();
     let username = match user::find_by_id(&state.db, m.user_id).await {
         Ok(Some(u)) => u.username,
         _ => m.user_id.to_string(),
@@ -329,6 +301,7 @@ async fn member_edit_page(
         h2 { "Member: " (username) }
         form method="post" action=(format!("/admin/orgs/{org_id}/members/{membership_id}")) {
             (layout::csrf_field(&token))
+            input type="hidden" name="expected_version" value=(m.updated_at.timestamp_millis());
             label {
                 "Role "
                 select name="role" {
@@ -365,9 +338,9 @@ fn instrument_multiselect(
     instruments: &[instrument::Instrument],
     selected: &[Uuid],
 ) -> Markup {
-    let mut families: Vec<&str> = instruments.iter().map(|i| i.family.as_str()).collect();
-    families.sort_unstable();
-    families.dedup();
+    // Same family ordering as the voice picker (shared helper), so the two
+    // instrument selects group families identically.
+    let families = ordered_families(instruments);
     html! {
         select name=(name) multiple size="8" {
             @for family in &families {
@@ -422,13 +395,24 @@ async fn update_member(
     if !ctx.can_manage_members() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_membership(&state, org_id, membership_id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Member not found.");
+    let current = match require_found(
+        scoped_membership(&state, org_id, membership_id).await,
+        &ctx,
+        Section::Members,
+        "Member not found.",
+    ) {
+        Ok(m) => m,
+        Err(response) => return response,
+    };
+    // Optimistic concurrency: don't let a stale editor clobber concurrent
+    // role/instrument changes.
+    if check_if_match(field(&pairs, "expected_version"), current.updated_at).is_err() {
+        return console::precondition_page(
+            &ctx,
+            Section::Members,
+            "member",
+            &format!("/admin/orgs/{org_id}/members/{membership_id}"),
+        );
     }
 
     let Some(role) = field(&pairs, "role").and_then(Role::parse) else {
@@ -459,13 +443,28 @@ async fn update_member(
     };
     match membership::update(&state.db, membership_id, fields).await {
         Ok(_) => {
+            // Distinguish the security-relevant transitions (CLAUDE.md audit
+            // events: "role change, principal-flag change"), matching the /v1
+            // membership handler — a plain field edit stays `membership.update`.
+            let action = if role != current.role {
+                "membership.role_change"
+            } else if is_principal != current.is_principal {
+                "membership.principal_change"
+            } else {
+                "membership.update"
+            };
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
-                "membership.update",
+                action,
                 "membership",
                 Some(membership_id),
-                serde_json::json!({ "role": role.as_str(), "isPrincipal": is_principal }),
+                serde_json::json!({
+                    "role": role.as_str(),
+                    "previousRole": current.role.as_str(),
+                    "isPrincipal": is_principal,
+                    "previousIsPrincipal": current.is_principal,
+                }),
             )
             .await;
             Redirect::to(&format!("/admin/orgs/{org_id}/members")).into_response()
@@ -509,16 +508,16 @@ async fn remove_member(
     if !ctx.can_manage_members() {
         return console::section_forbidden(&ctx);
     }
-    if scoped_membership(&state, org_id, membership_id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Member not found.");
+    if let Err(response) = require_found(
+        scoped_membership(&state, org_id, membership_id).await,
+        &ctx,
+        Section::Members,
+        "Member not found.",
+    ) {
+        return response;
     }
     match membership::delete(&state.db, membership_id).await {
-        Ok(_) => {
+        Ok(true) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -530,6 +529,7 @@ async fn remove_member(
             .await;
             Redirect::to(&format!("/admin/orgs/{org_id}/members")).into_response()
         }
+        Ok(false) => Redirect::to(&format!("/admin/orgs/{org_id}/members")).into_response(),
         Err(membership::MembershipError::LastOwner) => error_page(
             &ctx,
             StatusCode::CONFLICT,
