@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::file;
+use crate::file_service;
 use crate::routes::admin::arrangements::{
     audit_ctx, csrf_token, error_page, require_found, scoped_arrangement, scoped_voice,
 };
@@ -36,8 +37,12 @@ use crate::state::AppState;
 use crate::storage;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        // Score files (voice_id = None).
+    // Streaming routes: uploads/replaces lift the default 2 MiB body limit so
+    // bytes flow to MinIO bounded by the chunk buffer, not fully buffered. The
+    // GET list pages share the upload path; a disabled limit on a body-less GET
+    // is harmless. The limit stays scoped here — delete/undelete (urlencoded
+    // POSTs) keep the default guard.
+    let streaming = Router::new()
         .route(
             "/orgs/:org_id/arrangements/:arr_id/files",
             get(score_files_page).post(upload_score),
@@ -47,21 +52,23 @@ pub fn router() -> Router<AppState> {
             post(replace_score),
         )
         .route(
-            "/orgs/:org_id/arrangements/:arr_id/files/:file_id/delete",
-            post(delete_score),
-        )
-        .route(
-            "/orgs/:org_id/arrangements/:arr_id/files/:file_id/undelete",
-            post(undelete_score),
-        )
-        // Voice files.
-        .route(
             "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files",
             get(voice_files_page).post(upload_voice),
         )
         .route(
             "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files/:file_id/replace",
             post(replace_voice),
+        )
+        .layer(axum::extract::DefaultBodyLimit::disable());
+
+    Router::new()
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/files/:file_id/delete",
+            post(delete_score),
+        )
+        .route(
+            "/orgs/:org_id/arrangements/:arr_id/files/:file_id/undelete",
+            post(undelete_score),
         )
         .route(
             "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files/:file_id/delete",
@@ -71,9 +78,7 @@ pub fn router() -> Router<AppState> {
             "/orgs/:org_id/arrangements/:arr_id/voices/:voice_id/files/:file_id/undelete",
             post(undelete_voice),
         )
-        // Uploads/replaces stream to MinIO with a manual byte ceiling, so the
-        // default 2 MiB extractor body limit must be lifted on this tree.
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        .merge(streaming)
 }
 
 /// Where a file screen / write is scoped: the arrangement, and — for voice
@@ -192,13 +197,7 @@ async fn files_page(
     } else {
         Vec::new()
     };
-    // Best-effort size per file (a HEAD to MinIO); rendered as "?" on failure.
-    let mut sizes = std::collections::HashMap::new();
-    for f in &files {
-        if let Some(size) = file_size(&state, &f.id).await {
-            sizes.insert(f.id, size);
-        }
-    }
+    let sizes = collect_sizes(&state, arr_id, voice_id, &files).await;
 
     let heading = match target.voice_id {
         Some(_) => "Voice files",
@@ -298,24 +297,43 @@ async fn files_page(
     Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
 }
 
-/// Best-effort size of a file's stored object (a HEAD to MinIO).
-async fn file_size(state: &AppState, file_id: &Uuid) -> Option<u64> {
-    let f = file::find_by_id(&state.db, *file_id).await.ok()??;
-    let slugs = file::resolve_path_slugs(&state.db, f.arrangement_id, f.voice_id)
+/// Best-effort object sizes for a file list. The path slugs are identical for
+/// every file (same arrangement/voice), so they're resolved once; each key is
+/// derived from the in-hand row (no per-file DB refetch), and the MinIO HEADs
+/// run concurrently. A file with no HEAD result is simply absent from the map
+/// (rendered "?").
+async fn collect_sizes(
+    state: &AppState,
+    arr_id: Uuid,
+    voice_id: Option<Uuid>,
+    files: &[file::File],
+) -> std::collections::HashMap<Uuid, u64> {
+    let Ok(Some(slugs)) = file::resolve_path_slugs(&state.db, arr_id, voice_id).await else {
+        return std::collections::HashMap::new();
+    };
+    let heads = files.iter().filter_map(|f| {
+        let (_format, ext) = file::format_and_ext_for_mime(&f.mime_type)?;
+        let key = file::derived_key(
+            &slugs.org_slug,
+            &slugs.arrangement_slug,
+            slugs.voice_slug.as_deref(),
+            &f.name,
+            ext,
+        );
+        let id = f.id;
+        Some(async move {
+            let size = storage::head_object(&state.s3, &state.config.s3_bucket, &key)
+                .await
+                .ok()
+                .map(|h| h.size);
+            (id, size)
+        })
+    });
+    futures_util::future::join_all(heads)
         .await
-        .ok()??;
-    let (_format, ext) = file::format_and_ext_for_mime(&f.mime_type)?;
-    let key = file::derived_key(
-        &slugs.org_slug,
-        &slugs.arrangement_slug,
-        slugs.voice_slug.as_deref(),
-        &f.name,
-        ext,
-    );
-    storage::head_object(&state.s3, &state.config.s3_bucket, &key)
-        .await
-        .ok()
-        .map(|h| h.size)
+        .into_iter()
+        .filter_map(|(id, size)| size.map(|s| (id, s)))
+        .collect()
 }
 
 fn human_size(bytes: u64) -> String {
@@ -353,7 +371,19 @@ async fn do_upload(
         return console::section_forbidden(&ctx);
     }
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "malformed multipart upload body");
+                return error_page(
+                    &ctx,
+                    StatusCode::BAD_REQUEST,
+                    "The upload body was malformed.",
+                );
+            }
+        };
         let Some(file_name) = field.file_name().map(str::to_string) else {
             continue;
         };
@@ -361,109 +391,79 @@ async fn do_upload(
             .content_type()
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        let Some((format, ext)) = file::format_and_ext_for_mime(&mime) else {
-            return error_page(
-                &ctx,
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                &format!(
-                    "'{mime}' is not a stored format — use LilyPond, MusicXML, PDF, or an image."
-                ),
-            );
-        };
-        let Some((name, _)) = file::split_filename(&file_name) else {
-            return error_page(&ctx, StatusCode::BAD_REQUEST, "The file needs a name.");
-        };
-        let name = name.to_string();
 
-        let slugs = match file::resolve_path_slugs(&state.db, arr_id, voice_id).await {
-            Ok(Some(s)) => s,
-            _ => return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found."),
-        };
-        let key = file::derived_key(
-            &slugs.org_slug,
-            &slugs.arrangement_slug,
-            slugs.voice_slug.as_deref(),
-            &name,
-            ext,
-        );
-
-        // DB row first (cheap duplicate detection), then stream the bytes.
-        let id = Uuid::now_v7();
-        let created =
-            match file::create(
-                &state.db,
-                id,
-                file::NewFile {
-                    arrangement_id: arr_id,
-                    voice_id,
-                    name: &name,
-                    format,
-                    mime_type: &mime,
-                    derived_from_file_id: None,
-                    conversion_quality: None,
-                    created_by: Some(ctx.user().id),
-                },
-            )
-            .await
-            {
-                Ok(created) => created,
-                Err(file::FileError::Duplicate) => return error_page(
-                    &ctx,
-                    StatusCode::CONFLICT,
-                    "A file with this name and format already exists here — use Replace instead.",
-                ),
-                Err(error) => {
-                    tracing::error!(%error, "failed to create file row");
-                    return error_page(
-                        &ctx,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Could not save the file.",
-                    );
-                }
-            };
-
-        return match storage::upload_streaming(
-            &state.s3,
-            &state.config.s3_bucket,
-            &key,
+        return match file_service::store_upload(
+            &state,
+            arr_id,
+            voice_id,
+            &file_name,
             &mime,
-            state.config.max_upload_bytes,
+            Some(ctx.user().id),
             field,
         )
         .await
         {
-            Ok(bytes) => {
+            Ok((created, bytes)) => {
                 audit(
                     &state.db,
                     &audit_ctx(&ctx, request_id),
                     "file.create",
                     "file",
                     Some(created.id),
-                    serde_json::json!({ "name": name, "format": format, "bytes": bytes }),
+                    serde_json::json!({ "name": created.name, "format": created.format, "bytes": bytes }),
                 )
                 .await;
                 Redirect::to(&target.base_url()).into_response()
             }
-            Err(storage::StorageError::TooLarge { limit }) => {
-                let _ = file::soft_delete(&state.db, id).await;
-                error_page(
-                    &ctx,
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    &format!("That file is too large (limit {} bytes).", limit),
-                )
-            }
-            Err(error) => {
-                let _ = file::soft_delete(&state.db, id).await;
-                tracing::error!(%error, "upload failed");
-                error_page(
-                    &ctx,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "The upload failed.",
-                )
-            }
+            Err(error) => upload_error_page(&ctx, error),
         };
     }
     error_page(&ctx, StatusCode::BAD_REQUEST, "No file was provided.")
+}
+
+/// Map a shared [`file_service::UploadError`] to a console error page.
+fn upload_error_page(ctx: &ConsoleCtx, err: file_service::UploadError) -> Response {
+    use file_service::UploadError as E;
+    let (status, message) = match err {
+        E::UnsupportedMime(mime) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("'{mime}' is not a stored format — use LilyPond, MusicXML, PDF, or an image."),
+        ),
+        E::EmptyName => (
+            StatusCode::BAD_REQUEST,
+            "The file needs a name.".to_string(),
+        ),
+        E::FormatMismatch { expected } => (
+            StatusCode::CONFLICT,
+            format!("The replacement must keep the original's format {expected}."),
+        ),
+        E::Duplicate => (
+            StatusCode::CONFLICT,
+            "A file with this name and format already exists here — use Replace instead."
+                .to_string(),
+        ),
+        E::NotFound => (StatusCode::NOT_FOUND, "Arrangement not found.".to_string()),
+        E::ReplaceTargetGone => (StatusCode::NOT_FOUND, "File not found.".to_string()),
+        E::TooLarge { limit } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("That file is too large (limit {limit} bytes)."),
+        ),
+        E::Db(error) => {
+            tracing::error!(%error, "file store db error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not save the file.".to_string(),
+            )
+        }
+        E::Storage(error) => {
+            tracing::error!(%error, "file store storage error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The upload failed.".to_string(),
+            )
+        }
+    };
+    error_page(ctx, status, &message)
 }
 
 async fn do_replace(
@@ -492,7 +492,19 @@ async fn do_replace(
         Err(response) => return response,
     };
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "malformed multipart replace body");
+                return error_page(
+                    &ctx,
+                    StatusCode::BAD_REQUEST,
+                    "The upload body was malformed.",
+                );
+            }
+        };
         if field.file_name().is_none() {
             continue;
         }
@@ -500,82 +512,17 @@ async fn do_replace(
             .content_type()
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        let Some((format, ext)) = file::format_and_ext_for_mime(&mime) else {
-            return error_page(
-                &ctx,
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "That file type isn't a stored format.",
-            );
-        };
-        // Replacement keeps the same identity (name + format) so the derived
-        // key and unique slot stay stable — reject a format switch.
-        if format != old.format {
-            return error_page(
-                &ctx,
-                StatusCode::CONFLICT,
-                &format!(
-                    "The replacement must be the same format as the original ({}).",
-                    old.format
-                ),
-            );
-        }
-        let slugs = match file::resolve_path_slugs(&state.db, arr_id, voice_id).await {
-            Ok(Some(s)) => s,
-            _ => return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found."),
-        };
-        let key = file::derived_key(
-            &slugs.org_slug,
-            &slugs.arrangement_slug,
-            slugs.voice_slug.as_deref(),
-            &old.name,
-            ext,
-        );
 
-        // DB-first: swap the row, then overwrite the object; roll back on
-        // upload failure so the old row stays live.
-        let new_id = Uuid::now_v7();
-        let created = match file::replace(
-            &state.db,
-            old.id,
-            new_id,
-            file::NewFile {
-                arrangement_id: arr_id,
-                voice_id,
-                name: &old.name,
-                format,
-                mime_type: &mime,
-                derived_from_file_id: None,
-                conversion_quality: None,
-                created_by: Some(ctx.user().id),
-            },
-        )
-        .await
-        {
-            Ok(created) => created,
-            Err(file::FileError::ReplaceTargetGone) => {
-                return error_page(&ctx, StatusCode::NOT_FOUND, "File not found.")
-            }
-            Err(error) => {
-                tracing::error!(%error, "failed to swap file row on replace");
-                return error_page(
-                    &ctx,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Could not replace the file.",
-                );
-            }
-        };
-
-        return match storage::upload_streaming(
-            &state.s3,
-            &state.config.s3_bucket,
-            &key,
+        return match file_service::store_replacement(
+            &state,
+            &old,
             &mime,
-            state.config.max_upload_bytes,
+            Some(ctx.user().id),
             field,
         )
         .await
         {
-            Ok(bytes) => {
+            Ok((created, bytes)) => {
                 audit(
                     &state.db,
                     &audit_ctx(&ctx, request_id),
@@ -587,20 +534,7 @@ async fn do_replace(
                 .await;
                 Redirect::to(&target.base_url()).into_response()
             }
-            Err(error) => {
-                // Undo the row swap: drop the new row, re-live the old one.
-                let _ = file::restore_replaced(&state.db, old.id, new_id).await;
-                let status = match &error {
-                    storage::StorageError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
-                    _ => StatusCode::INTERNAL_SERVER_ERROR,
-                };
-                tracing::error!(%error, "replace upload failed");
-                error_page(
-                    &ctx,
-                    status,
-                    "The replacement upload failed; the original is unchanged.",
-                )
-            }
+            Err(error) => upload_error_page(&ctx, error),
         };
     }
     error_page(&ctx, StatusCode::BAD_REQUEST, "No file was provided.")
@@ -667,16 +601,15 @@ async fn do_undelete(
     if !ctx.can_edit_arrangements() {
         return console::section_forbidden(&ctx);
     }
-    // Scope against the (deleted) row.
-    if require_found(
+    // Scope against the (deleted) row — a DB error surfaces as 500, not a
+    // misleading 404 (require_found builds the right response).
+    if let Err(response) = require_found(
         scoped_file_including_deleted(&state, arr_id, voice_id, file_id).await,
         &ctx,
         Section::Arrangements,
         "File not found.",
-    )
-    .is_err()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "File not found.");
+    ) {
+        return response;
     }
     match file::undelete(&state.db, file_id).await {
         Ok(true) => {
@@ -696,6 +629,11 @@ async fn do_undelete(
             &ctx,
             StatusCode::CONFLICT,
             "A current file already holds that name and format — delete or replace it first.",
+        ),
+        Err(file::FileError::Superseded) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "A newer file has taken this file's storage slot, so restoring it would serve the wrong content.",
         ),
         Err(error) => {
             tracing::error!(%error, "failed to undelete file");

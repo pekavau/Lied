@@ -10,6 +10,7 @@ pub mod auth;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod file_service;
 pub mod listing;
 pub mod pagination;
 pub mod routes;

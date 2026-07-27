@@ -55,6 +55,11 @@ pub enum FileError {
     /// the caller's lookup and the replace transaction.
     #[error("the file being replaced no longer exists")]
     ReplaceTargetGone,
+    /// Restoring this file would serve the wrong bytes: a newer file has since
+    /// occupied the same derived storage key, so the object there is not this
+    /// file's content (see [`undelete`]).
+    #[error("a newer file has taken this file's storage slot")]
+    Superseded,
 }
 
 /// Map a MIME type to the coarse `format` routing key and the canonical file
@@ -111,6 +116,21 @@ pub fn split_filename(filename: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((stem, ext))
+}
+
+/// The stored `File.name` for an **uploaded** file: the base name with any
+/// client-supplied directory components stripped (browsers may send a path in
+/// `filename`), the extension removed, and surrounding whitespace trimmed.
+/// `None` for an empty result. Used by upload/replace so a hostile filename
+/// like `../../x.pdf` can't inject path segments into the derived storage key.
+pub fn name_stem(file_name: &str) -> Option<String> {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base).trim();
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
 }
 
 /// Build the WebDAV filename (`<name>.<ext>`) for a stored file, deriving the
@@ -515,6 +535,44 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 /// [`FileError::Duplicate`] (the caller shows a "a current file already holds
 /// that name/format" message). Returns `false` if no soft-deleted row matched.
 pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
+    let Some(target) = find_by_id_including_deleted(pool, id).await? else {
+        return Ok(false);
+    };
+    if target.deleted_at.is_none() {
+        return Ok(false); // already live
+    }
+    // The object at the derived key belongs to whichever file was written to
+    // that `(arrangement, voice, name, format)` slot most recently. If a newer
+    // file (live or since-deleted) took the slot, restoring THIS older row
+    // would silently serve the newer file's bytes — refuse it.
+    // Read the target's `created_at` via a subquery rather than binding a
+    // `DateTime<Utc>` — the transitively-enabled sqlx `time` feature would
+    // otherwise demand a `time::OffsetDateTime` for the timestamptz param.
+    let superseded = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM file f
+            WHERE f.arrangement_id = $1
+              AND f.voice_id IS NOT DISTINCT FROM $2
+              AND f.name = $3
+              AND f.format = $4
+              AND f.id <> $5
+              AND f.created_at > (SELECT created_at FROM file WHERE id = $5)
+        ) AS "superseded!"
+        "#,
+        target.arrangement_id,
+        target.voice_id,
+        target.name,
+        target.format,
+        target.id,
+    )
+    .fetch_one(pool)
+    .await?;
+    if superseded {
+        return Err(FileError::Superseded);
+    }
+    // The partial unique index still backstops the live-slot case; map its
+    // violation to `Duplicate`.
     let res = sqlx::query!(
         r#"UPDATE file SET deleted_at = NULL, updated_at = now()
            WHERE id = $1 AND deleted_at IS NOT NULL"#,
@@ -523,6 +581,17 @@ pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
     .execute(pool)
     .await
     .map_err(map_write_error)?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Hard-delete a file **row** (no MinIO operation). Used to roll back a
+/// never-written upload: the `create` inserted a row, then the byte stream
+/// failed, so the row references no object and must vanish entirely — a
+/// soft-delete would leave a restorable row pointing at nothing.
+pub async fn hard_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query!(r#"DELETE FROM file WHERE id = $1"#, id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -556,6 +625,23 @@ pub async fn restore_replaced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_stem_strips_directories_extension_and_whitespace() {
+        assert_eq!(name_stem("part.pdf").as_deref(), Some("part"));
+        // Directory components (from a hostile or path-preserving client) are
+        // stripped so they can't inject path segments into the storage key.
+        assert_eq!(name_stem("../../etc/passwd.pdf").as_deref(), Some("passwd"));
+        assert_eq!(
+            name_stem("sub\\dir\\part.musicxml").as_deref(),
+            Some("part")
+        );
+        assert_eq!(name_stem("  Flute 1 .pdf ").as_deref(), Some("Flute 1"));
+        // A name with no extension is still accepted (unlike split_filename).
+        assert_eq!(name_stem("score").as_deref(), Some("score"));
+        assert_eq!(name_stem("   "), None);
+        assert_eq!(name_stem("/"), None);
+    }
 
     #[test]
     fn mime_lookup_covers_the_four_formats() {
