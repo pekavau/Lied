@@ -110,29 +110,12 @@ pub async fn csrf_middleware(
             return next.run(request).await;
         }
 
-        // (c) a `csrf` query parameter matching the session token — for the
-        //     multipart file-upload/replace forms (issue #32). Their body IS
-        //     the streamed file, so they can't carry the token in a urlencoded
-        //     body, and the JS-free UI can't set the `HX-CSRF` header. The
-        //     token is the unguessable double-submit value, so a cross-site
-        //     form can't supply it; reading it from the query needs no body
-        //     buffering, so the streaming upload path is untouched.
-        let query_ok = request
-            .uri()
-            .query()
-            .and_then(|q| form_field(q.as_bytes(), "csrf"))
-            .as_deref()
-            == Some(expected.as_str());
-        if query_ok {
-            return next.run(request).await;
-        }
-
         if is_form_urlencoded(&request) {
             // Buffer the (size-bounded) form body to read the token, then
             // rebuild the request so the handler's `Form` extractor still sees
-            // the body. Only urlencoded bodies are buffered; multipart uploads
-            // never arrive as one of these form posts, so streaming is
-            // unaffected.
+            // the body. A urlencoded form MUST carry the token in its body
+            // field — it is never accepted from the query for these (so the
+            // token doesn't need to appear in a URL for ordinary admin forms).
             let limit = state.config.max_request_bytes as usize;
             let (parts, body) = request.into_parts();
             let bytes = match axum::body::to_bytes(body, limit).await {
@@ -148,6 +131,23 @@ pub async fn csrf_middleware(
                 return next.run(request).await;
             }
             return csrf_rejection("CSRF token mismatch or missing csrf_token field");
+        }
+
+        // Non-urlencoded body (the multipart file-upload/replace forms, issue
+        // #32): the body IS the streamed file, so the token can't live in a
+        // urlencoded field and the JS-free UI can't set `HX-CSRF`. Accept a
+        // matching `csrf` query param instead — reading it needs no body
+        // buffering, so the streaming path is untouched. This branch is
+        // deliberately reached ONLY for non-urlencoded requests, so ordinary
+        // admin forms never put the token in a URL.
+        let query_ok = request
+            .uri()
+            .query()
+            .and_then(|q| form_field(q.as_bytes(), "csrf"))
+            .as_deref()
+            == Some(expected.as_str());
+        if query_ok {
+            return next.run(request).await;
         }
 
         return csrf_rejection(

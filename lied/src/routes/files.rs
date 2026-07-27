@@ -27,6 +27,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
 use crate::domain::{arrangement, file, voice};
 use crate::error::AppError;
+use crate::file_service;
 use crate::pagination::{Page, PageParams};
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, PayloadTooLarge413, Precondition412,
@@ -134,16 +135,27 @@ async fn scope_voice(state: &AppState, arr_id: Uuid, voice_id: Uuid) -> Result<(
     Ok(())
 }
 
-fn file_error_to_app_error(err: file::FileError) -> AppError {
+fn upload_error_to_app_error(err: file_service::UploadError) -> AppError {
+    use file_service::UploadError as E;
     match err {
-        file::FileError::Database(e) => AppError::Database(e),
-        file::FileError::Duplicate => {
+        E::UnsupportedMime(mime) => {
+            AppError::UnsupportedMediaType(format!("mime type '{mime}' is not a stored format"))
+        }
+        E::EmptyName => AppError::Validation(field_report("file", "missing filename")),
+        E::FormatMismatch { expected } => AppError::Conflict(format!(
+            "a replacement must keep the original's format {expected}; upload a new file instead"
+        )),
+        E::Duplicate => {
             AppError::Conflict("a file with this name and format already exists here".to_string())
         }
-        file::FileError::UnsupportedMime => {
-            AppError::UnsupportedMediaType("unsupported or unrecognized mime type".to_string())
+        E::NotFound | E::ReplaceTargetGone => AppError::NotFound,
+        E::TooLarge { limit } => AppError::PayloadTooLarge(format!(
+            "upload exceeds the maximum allowed size of {limit} bytes"
+        )),
+        E::Db(e) => AppError::Database(e),
+        E::Storage(message) => {
+            AppError::Internal(anyhow::anyhow!("object storage error: {message}"))
         }
-        file::FileError::ReplaceTargetGone => AppError::NotFound,
     }
 }
 
@@ -166,19 +178,6 @@ fn field_report(field: &str, msg: &str) -> garde::Report {
     let mut report = garde::Report::new();
     report.append(garde::Path::new(field), garde::Error::new(msg.to_string()));
     report
-}
-
-/// Strip any directory components and trailing extension from an uploaded
-/// filename to get `File.name`. Rejects empty results.
-fn name_stem(file_name: &str) -> Option<String> {
-    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
-    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
-    let stem = stem.trim();
-    if stem.is_empty() {
-        None
-    } else {
-        Some(stem.to_string())
-    }
 }
 
 /// Adapt an axum multipart `Field` to the storage layer's [`ChunkSource`].
@@ -207,7 +206,8 @@ async fn do_upload(
         scope_voice(&state, arr_id, vid).await?;
     }
 
-    // Find the first multipart part that carries a file (has a filename).
+    // Find the first multipart part that carries a file (has a filename), then
+    // hand it to the shared store service (same logic as the /admin console).
     while let Some(field) = multipart
         .next_field()
         .await
@@ -221,77 +221,32 @@ async fn do_upload(
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let (format, ext) = file::format_and_ext_for_mime(&mime).ok_or_else(|| {
-            AppError::UnsupportedMediaType(format!("mime type '{mime}' is not a stored format"))
-        })?;
-        let name = name_stem(&file_name)
-            .ok_or_else(|| AppError::Validation(field_report("file", "missing filename")))?;
-
-        let slugs = file::resolve_path_slugs(&state.db, arr_id, voice_id)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let key = file::derived_key(
-            &slugs.org_slug,
-            &slugs.arrangement_slug,
-            slugs.voice_slug.as_deref(),
-            &name,
-            ext,
-        );
-
-        // DB row first (cheap duplicate detection), then stream the bytes.
-        // CLAUDE.md backup ordering: a DB ref to a not-yet-written object is
-        // the safe (detectable-404) failure mode.
-        let id = Uuid::now_v7();
-        let created = file::create(
-            &state.db,
-            id,
-            file::NewFile {
-                arrangement_id: arr_id,
-                voice_id,
-                name: &name,
-                format,
-                mime_type: &mime,
-                derived_from_file_id: None,
-                conversion_quality: None,
-                created_by: Some(auth.user.id),
-            },
-        )
-        .await
-        .map_err(file_error_to_app_error)?;
-
-        match storage::upload_streaming(
-            &state.s3,
-            &state.config.s3_bucket,
-            &key,
+        let (created, bytes) = file_service::store_upload(
+            &state,
+            arr_id,
+            voice_id,
+            &file_name,
             &mime,
-            state.config.max_upload_bytes,
+            Some(auth.user.id),
             field,
         )
         .await
-        {
-            Ok(bytes) => {
-                audit(
-                    &state.db,
-                    &AuditContext {
-                        actor_user_id: Some(auth.user.id),
-                        org_id: Some(org_id),
-                        request_id: Some(request_id),
-                    },
-                    "file.create",
-                    "file",
-                    Some(id),
-                    serde_json::json!({ "name": name, "format": format, "key": key, "bytes": bytes }),
-                )
-                .await;
-                return Ok((StatusCode::CREATED, Json(FileResponse::from(created))).into_response());
-            }
-            Err(e) => {
-                // Roll back the orphaned row so a failed/oversize upload leaves
-                // no dangling DB reference.
-                let _ = file::soft_delete(&state.db, id).await;
-                return Err(storage_error_to_app_error(e));
-            }
-        }
+        .map_err(upload_error_to_app_error)?;
+
+        audit(
+            &state.db,
+            &AuditContext {
+                actor_user_id: Some(auth.user.id),
+                org_id: Some(org_id),
+                request_id: Some(request_id),
+            },
+            "file.create",
+            "file",
+            Some(created.id),
+            serde_json::json!({ "name": created.name, "format": created.format, "bytes": bytes }),
+        )
+        .await;
+        return Ok((StatusCode::CREATED, Json(FileResponse::from(created))).into_response());
     }
 
     Err(AppError::Validation(field_report(
@@ -678,20 +633,9 @@ async fn do_replace(
         return Err(AppError::NotFound);
     }
 
-    let slugs = file::resolve_path_slugs(&state.db, arr_id, voice_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let (old_format, ext) = file::format_and_ext_for_mime(&old.mime_type)
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("stored file has unknown mime")))?;
-    // Replacement keeps identity (same name/format/voice) → same derived key.
-    let key = file::derived_key(
-        &slugs.org_slug,
-        &slugs.arrangement_slug,
-        slugs.voice_slug.as_deref(),
-        &old.name,
-        ext,
-    );
-
+    // Find the file part and hand it to the shared store service (the identity
+    // swap, format/extension check, provenance preservation, and rollback all
+    // live there — same logic as the /admin console).
     while let Some(field) = multipart
         .next_field()
         .await
@@ -700,66 +644,15 @@ async fn do_replace(
         if field.file_name().is_none() {
             continue;
         }
-
-        // A replacement must keep the same format + extension (so the derived
-        // key, and what we serve, stay coherent). A different format is a new
-        // file, not a replace — reject rather than store mismatched bytes.
         let new_mime = field
             .content_type()
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        let new_pair = file::format_and_ext_for_mime(&new_mime).ok_or_else(|| {
-            AppError::UnsupportedMediaType(format!("mime type '{new_mime}' is not a stored format"))
-        })?;
-        if new_pair != (old_format, ext) {
-            return Err(AppError::Conflict(format!(
-                "a replacement must keep the original's format ('{old_format}'); \
-                 upload a new file instead"
-            )));
-        }
 
-        // Swap the DB identity FIRST (new row + soft-delete old, one txn),
-        // then write the bytes to the (identical) key. If the upload fails we
-        // compensate by restoring the old row — so a partial failure never
-        // leaves the old identity pointing at the new bytes. This matches the
-        // create path's DB-first ordering and CLAUDE.md's safe-failure rule.
-        let new_id = Uuid::now_v7();
-        let new = file::replace(
-            &state.db,
-            old.id,
-            new_id,
-            file::NewFile {
-                arrangement_id: arr_id,
-                voice_id,
-                name: &old.name,
-                format: &old.format,
-                mime_type: &old.mime_type,
-                // Preserve the derivation chain across the identity swap.
-                derived_from_file_id: old.derived_from_file_id,
-                conversion_quality: old.conversion_quality.as_deref(),
-                created_by: Some(auth.user.id),
-            },
-        )
-        .await
-        .map_err(file_error_to_app_error)?;
-
-        let bytes = match storage::upload_streaming(
-            &state.s3,
-            &state.config.s3_bucket,
-            &key,
-            &old.mime_type,
-            state.config.max_upload_bytes,
-            field,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Restore the pre-replace state: drop the new row, re-live old.
-                let _ = file::restore_replaced(&state.db, old.id, new_id).await;
-                return Err(storage_error_to_app_error(e));
-            }
-        };
+        let (new, bytes) =
+            file_service::store_replacement(&state, &old, &new_mime, Some(auth.user.id), field)
+                .await
+                .map_err(upload_error_to_app_error)?;
 
         audit(
             &state.db,
@@ -770,8 +663,8 @@ async fn do_replace(
             },
             "file.replace",
             "file",
-            Some(new_id),
-            serde_json::json!({ "replaced": old.id, "name": old.name, "key": key, "bytes": bytes }),
+            Some(new.id),
+            serde_json::json!({ "replaced": old.id, "name": old.name, "bytes": bytes }),
         )
         .await;
 
