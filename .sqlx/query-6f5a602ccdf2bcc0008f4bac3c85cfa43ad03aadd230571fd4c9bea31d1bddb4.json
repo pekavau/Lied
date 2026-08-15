@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*) as \"count!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL\n          AND NOT EXISTS (\n              SELECT 1 FROM collection_item live\n              WHERE live.collection_id = ci.collection_id\n                AND live.arrangement_id = ci.arrangement_id\n                AND live.deleted_at IS NULL\n          )\n          AND ci.deleted_at = (\n              SELECT max(newer.deleted_at) FROM collection_item newer\n              WHERE newer.collection_id = ci.collection_id\n                AND newer.arrangement_id = ci.arrangement_id\n                AND newer.deleted_at IS NOT NULL\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6f5a602ccdf2bcc0008f4bac3c85cfa43ad03aadd230571fd4c9bea31d1bddb4"
+}

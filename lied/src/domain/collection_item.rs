@@ -76,12 +76,20 @@ pub enum CollectionItemError {
     UnknownReference,
     #[error("the item order must be exactly the collection's current live items")]
     InvalidReorder,
+    /// This arrangement is already a live piece in the collection. Adding it
+    /// twice — or restoring a removed piece after re-adding the same
+    /// arrangement — would list the same music under two numbers.
+    #[error("this arrangement is already in the collection")]
+    DuplicateArrangement,
 }
 
 fn map_write_error(err: sqlx::Error) -> CollectionItemError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.constraint() == Some("collection_item_collection_id_index_key") {
             return CollectionItemError::DuplicateIndex;
+        }
+        if db_err.constraint() == Some("collection_item_collection_id_arrangement_id_key") {
+            return CollectionItemError::DuplicateArrangement;
         }
         if db_err.is_foreign_key_violation() {
             return CollectionItemError::UnknownReference;
@@ -224,9 +232,19 @@ pub async fn list_for_collection(
         .collect())
 }
 
-/// A collection's soft-deleted items, most-recently-removed first, plus the
-/// total. Backs the console's "removed pieces" restore list. Paginated so the
-/// query stays bounded however often a program has been rebuilt.
+/// A collection's *restorable* removed items, most-recently-removed first, plus
+/// the total. Backs the console's "removed pieces" list.
+///
+/// Two filters make the list mean "these can come back":
+///   - an arrangement that is live in the collection again is excluded — its
+///     old row can never be restored ([`restore`] refuses it), so offering a
+///     Restore button that always 409s would be a lie;
+///   - where the same arrangement was removed more than once, only the most
+///     recent removal is listed; restoring an older one would be restoring the
+///     same piece by a different row.
+///
+/// Paginated so the query stays bounded however often a program has been
+/// rebuilt.
 pub async fn list_deleted_for_collection(
     pool: &PgPool,
     collection_id: Uuid,
@@ -248,6 +266,18 @@ pub async fn list_deleted_for_collection(
         JOIN collection c ON c.id = ci.collection_id
         JOIN arrangement a ON a.id = ci.arrangement_id
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM collection_item live
+              WHERE live.collection_id = ci.collection_id
+                AND live.arrangement_id = ci.arrangement_id
+                AND live.deleted_at IS NULL
+          )
+          AND ci.deleted_at = (
+              SELECT max(newer.deleted_at) FROM collection_item newer
+              WHERE newer.collection_id = ci.collection_id
+                AND newer.arrangement_id = ci.arrangement_id
+                AND newer.deleted_at IS NOT NULL
+          )
         ORDER BY ci.deleted_at DESC, ci.id ASC
         LIMIT $2 OFFSET $3
         "#,
@@ -264,6 +294,18 @@ pub async fn list_deleted_for_collection(
         FROM collection_item ci
         JOIN collection c ON c.id = ci.collection_id
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM collection_item live
+              WHERE live.collection_id = ci.collection_id
+                AND live.arrangement_id = ci.arrangement_id
+                AND live.deleted_at IS NULL
+          )
+          AND ci.deleted_at = (
+              SELECT max(newer.deleted_at) FROM collection_item newer
+              WHERE newer.collection_id = ci.collection_id
+                AND newer.arrangement_id = ci.arrangement_id
+                AND newer.deleted_at IS NOT NULL
+          )
         "#,
         collection_id,
     )
@@ -386,8 +428,199 @@ pub async fn reorder(
     Ok(())
 }
 
-/// Soft-delete an item (its slot frees up for reuse). Returns `false` if no
-/// live row matched.
+/// Assign 1..n to `ordered_ids` inside an open transaction, parking the
+/// collection's live indices out of range first so the per-row updates never
+/// transiently collide on the unique `(collection_id, index)` index.
+///
+/// This is the one place piece numbers are written. Every operation that
+/// changes the running order — reorder, remove, restore — ends here, which is
+/// what keeps the numbers dense and increasing down the collection no matter
+/// which one ran.
+async fn renumber(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    collection_id: Uuid,
+    ordered_ids: &[Uuid],
+) -> Result<(), CollectionItemError> {
+    park(tx, collection_id).await?;
+    assign_order(tx, collection_id, ordered_ids).await
+}
+
+/// Move every live index of a collection out of the legal range, clearing the
+/// unique space so the subsequent per-row writes cannot transiently collide.
+/// Parked values land in `[1 + OFFSET, MAX_INDEX + OFFSET]`, which is why
+/// [`MAX_INDEX`] must stay below the offset.
+async fn park(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    collection_id: Uuid,
+) -> Result<(), CollectionItemError> {
+    sqlx::query!(
+        r#"UPDATE collection_item SET index = index + $2
+           WHERE collection_id = $1 AND deleted_at IS NULL"#,
+        collection_id,
+        INDEX_PARK_OFFSET,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Assign 1..n to already-parked rows.
+async fn assign_order(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    collection_id: Uuid,
+    ordered_ids: &[Uuid],
+) -> Result<(), CollectionItemError> {
+    for (position, id) in ordered_ids.iter().enumerate() {
+        let new_index = (position as i32) + 1;
+        sqlx::query!(
+            r#"UPDATE collection_item SET index = $1, updated_at = now()
+               WHERE id = $2 AND collection_id = $3 AND deleted_at IS NULL"#,
+            new_index,
+            id,
+            collection_id,
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(map_write_error)?;
+    }
+    Ok(())
+}
+
+/// The collection's live item ids in index order, inside a transaction.
+async fn live_ids_in_order(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    collection_id: Uuid,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT id FROM collection_item
+           WHERE collection_id = $1 AND deleted_at IS NULL
+           ORDER BY index ASC, id ASC
+           FOR UPDATE"#,
+        collection_id,
+    )
+    .fetch_all(&mut **tx)
+    .await
+}
+
+/// Remove a piece and close the gap it leaves: the pieces after it shift down
+/// one, so the numbering stays dense and increasing.
+///
+/// Leaving the gap and letting the next reorder collapse it would mean the
+/// numbers shown after a removal are not the numbers the collection actually
+/// has — a standing collection is drawn from by number, so "there is no 3 any
+/// more, count on" is not a state worth rendering.
+///
+/// Returns `false` if no live item matched.
+pub async fn remove(
+    pool: &PgPool,
+    collection_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+
+    let removed = sqlx::query!(
+        r#"UPDATE collection_item SET deleted_at = now(), updated_at = now()
+           WHERE id = $1 AND collection_id = $2 AND deleted_at IS NULL
+           RETURNING id"#,
+        item_id,
+        collection_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if removed.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    let remaining = live_ids_in_order(&mut tx, collection_id).await?;
+    renumber(&mut tx, collection_id, &remaining).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Restore a removed piece at the position it held, shifting the pieces from
+/// there on up one.
+///
+/// The number it had is where it belongs — restoring is undoing a removal, not
+/// appending. If the collection has since shrunk below that number the piece
+/// lands at the end instead, so the numbering stays dense.
+///
+/// Refuses with [`CollectionItemError::DuplicateArrangement`] when the same
+/// arrangement has been re-added in the meantime: the collection would
+/// otherwise list one piece twice.
+///
+/// Returns `false` if no removed item matched.
+pub async fn restore(
+    pool: &PgPool,
+    collection_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+
+    let Some(target) = sqlx::query!(
+        r#"SELECT index, arrangement_id FROM collection_item
+           WHERE id = $1 AND collection_id = $2 AND deleted_at IS NOT NULL
+           FOR UPDATE"#,
+        item_id,
+        collection_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+
+    // The same arrangement may have been added again while this one was gone.
+    let clash = sqlx::query_scalar!(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM collection_item
+               WHERE collection_id = $1 AND arrangement_id = $2 AND deleted_at IS NULL
+           ) AS "clash!""#,
+        collection_id,
+        target.arrangement_id,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if clash {
+        tx.rollback().await?;
+        return Err(CollectionItemError::DuplicateArrangement);
+    }
+
+    let live = live_ids_in_order(&mut tx, collection_id).await?;
+
+    // Park the live rows BEFORE reviving this one: its old number is very
+    // likely taken by whichever piece shifted into it, and coming back at that
+    // number would violate the unique index on the spot. Parking clears the
+    // whole legal range first, and the row rejoins above the parked block —
+    // `2 * INDEX_PARK_OFFSET` is out of reach of any parked value because
+    // `MAX_INDEX < INDEX_PARK_OFFSET`.
+    park(&mut tx, collection_id).await?;
+    sqlx::query!(
+        r#"UPDATE collection_item SET deleted_at = NULL, index = $2, updated_at = now()
+           WHERE id = $1"#,
+        item_id,
+        2 * INDEX_PARK_OFFSET,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_write_error)?;
+
+    // Its old number, clamped to the end of a collection that has since shrunk.
+    let position = (target.index.max(1) as usize - 1).min(live.len());
+    let mut order = live;
+    order.insert(position, item_id);
+    assign_order(&mut tx, collection_id, &order).await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Soft-delete an item without touching the other pieces' numbers. Prefer
+/// [`remove`], which closes the gap; this stays for callers that manage the
+/// numbering themselves.
+///
+/// Returns `false` if no live row matched.
 pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
     let result = sqlx::query!(
         r#"UPDATE collection_item SET deleted_at = now(), updated_at = now()

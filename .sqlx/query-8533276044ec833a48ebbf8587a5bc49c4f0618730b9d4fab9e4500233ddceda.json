@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.index,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL\n        ORDER BY ci.deleted_at DESC, ci.id ASC\n        LIMIT $2 OFFSET $3\n        ",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.index,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL\n          AND NOT EXISTS (\n              SELECT 1 FROM collection_item live\n              WHERE live.collection_id = ci.collection_id\n                AND live.arrangement_id = ci.arrangement_id\n                AND live.deleted_at IS NULL\n          )\n          AND ci.deleted_at = (\n              SELECT max(newer.deleted_at) FROM collection_item newer\n              WHERE newer.collection_id = ci.collection_id\n                AND newer.arrangement_id = ci.arrangement_id\n                AND newer.deleted_at IS NOT NULL\n          )\n        ORDER BY ci.deleted_at DESC, ci.id ASC\n        LIMIT $2 OFFSET $3\n        ",
   "describe": {
     "columns": [
       {
@@ -80,5 +80,5 @@
       null
     ]
   },
-  "hash": "d13e11f78d574d3d1be9f2b2fa0e76d1463a2b4907ed77030c676ac9a7bd9175"
+  "hash": "8533276044ec833a48ebbf8587a5bc49c4f0618730b9d4fab9e4500233ddceda"
 }

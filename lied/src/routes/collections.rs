@@ -122,6 +122,9 @@ fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppErro
         collection_item::CollectionItemError::InvalidReorder => {
             AppError::Conflict("orderedIds must be exactly the collection's current items".into())
         }
+        collection_item::CollectionItemError::DuplicateArrangement => {
+            AppError::Conflict("this arrangement is already an item in the collection".into())
+        }
         collection_item::CollectionItemError::Database(e) => AppError::Database(e),
     }
 }
@@ -846,7 +849,10 @@ async fn delete_item(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if !collection_item::soft_delete(&state.db, item_id).await? {
+    if !collection_item::remove(&state.db, collection_id, item_id)
+        .await
+        .map_err(item_error_to_app_error)?
+    {
         return Err(AppError::NotFound);
     }
 
@@ -896,7 +902,7 @@ async fn undelete_item(
     require_collection_editor_v1(&state, &auth, org_id).await?;
     let current = find_item_scoped(&state, org_id, collection_id, item_id, true).await?;
 
-    let restored = collection_item::undelete(&state.db, item_id)
+    let restored = collection_item::restore(&state.db, collection_id, item_id)
         .await
         .map_err(item_error_to_app_error)?;
     if !restored {
