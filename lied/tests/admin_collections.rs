@@ -1694,3 +1694,90 @@ async fn the_reorder_audit_records_the_resulting_order() {
         "the audit row records the swapped order, not the submitted one"
     );
 }
+
+#[tokio::test]
+async fn an_out_of_range_piece_number_is_refused_before_it_can_break_reordering() {
+    // Found by hand-testing #33: the console accepted any positive i32 while
+    // `/v1` capped it at MAX_INDEX. An index near i32::MAX was therefore
+    // storable from the form, and the next reorder — which parks indices at
+    // `index + 1_000_000` to clear the unique space — overflowed Postgres
+    // `integer` and 500'd. Both surfaces now share `is_valid_index`.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    for bad in ["2147483000", "1000000", "0", "-3"] {
+        let response = post_form(
+            &ctx.app,
+            &browser,
+            &format!("{detail_url}/items"),
+            &[("arrangement_id", &arr.to_string()), ("index", bad)],
+            &token,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "piece number {bad} must be refused"
+        );
+    }
+    assert!(
+        items(&ctx, coll).await.is_empty(),
+        "no piece was stored at an unusable number"
+    );
+
+    // The boundary is usable, and reordering across it still works — i.e. the
+    // cap is what keeps the park-and-renumber arithmetic in range.
+    let second = seed_arrangement(&ctx.state, fx.org_id, "Egmont Overture").await;
+    for (arrangement, index) in [(arr, "999999"), (second, "1")] {
+        let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+        let token = form_csrf(&html);
+        let response = post_form(
+            &ctx.app,
+            &browser,
+            &format!("{detail_url}/items"),
+            &[
+                ("arrangement_id", &arrangement.to_string()),
+                ("index", index),
+            ],
+            &token,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    let live = items(&ctx, coll).await;
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let directive = format!("down:{}", live[0].item.id);
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    fields.push(("move", &directive));
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &fields,
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "reordering a collection holding the maximum index must not overflow"
+    );
+    assert_eq!(
+        items(&ctx, coll)
+            .await
+            .iter()
+            .map(|i| i.item.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "and it renumbers as usual"
+    );
+}

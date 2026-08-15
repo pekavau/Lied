@@ -85,14 +85,14 @@ fn etag_response_status<T: Serialize>(
 }
 
 /// Piece numbers are 1-based and bounded well below the reorder parking offset
-/// (1,000,000) so index arithmetic can't overflow or collide (review #4).
-const MAX_INDEX: i32 = 999_999;
-
 fn validate_index(index: i32) -> Result<(), AppError> {
-    if (1..=MAX_INDEX).contains(&index) {
+    if collection_item::is_valid_index(index) {
         Ok(())
     } else {
-        Err(empty_field("index", "index must be between 1 and 999999"))
+        Err(empty_field(
+            "index",
+            &format!("index must be between 1 and {}", collection_item::MAX_INDEX),
+        ))
     }
 }
 

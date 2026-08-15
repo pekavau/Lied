@@ -462,7 +462,7 @@ async fn collection_detail_page(
                 }
                 label {
                     "Piece number "
-                    input type="number" name="index" min="1" value=(next_index);
+                    input type="number" name="index" min="1" max=(collection_item::MAX_INDEX) value=(next_index);
                 }
                 button type="submit" { "Add piece" }
             }
@@ -852,12 +852,15 @@ async fn add_item(
         .filter(|v| !v.is_empty())
     {
         Some(raw) => match raw.parse::<i32>() {
-            Ok(n) if n >= 1 => n,
+            Ok(n) if collection_item::is_valid_index(n) => n,
             _ => {
                 return error_page(
                     &ctx,
                     StatusCode::BAD_REQUEST,
-                    "The piece number must be a positive whole number.",
+                    &format!(
+                        "The piece number must be a whole number between 1 and {}.",
+                        collection_item::MAX_INDEX
+                    ),
                 )
             }
         },
