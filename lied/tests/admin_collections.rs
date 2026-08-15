@@ -733,3 +733,293 @@ async fn a_collection_id_from_another_org_is_not_found() {
         "the foreign collection is untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — slice 2: items & ordering
+// ---------------------------------------------------------------------------
+
+/// Add an arrangement to a collection through the console.
+async fn add_piece(ctx: &Ctx, browser: &Browser, org_id: Uuid, coll: Uuid, arr: Uuid) {
+    let detail_url = format!("/admin/orgs/{org_id}/collections/{coll}");
+    let (_, html) = load_page(&ctx.app, browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        browser,
+        &format!("{detail_url}/items"),
+        &[("arrangement_id", &arr.to_string())],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "adding a piece should succeed"
+    );
+}
+
+/// The collection's live items in index order.
+async fn items(ctx: &Ctx, coll: Uuid) -> Vec<lied::domain::collection_item::CollectionItemView> {
+    lied::domain::collection_item::list_for_collection(&ctx.pool, coll)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pieces_are_added_numbered_reordered_and_removed() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+
+    let bolero = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let egmont = seed_arrangement(&ctx.state, fx.org_id, "Egmont Overture").await;
+    let fifth = seed_arrangement(&ctx.state, fx.org_id, "Symphony No. 5").await;
+    for arr in [bolero, egmont, fifth] {
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+
+    // Appended in order, numbered from 1 with no gaps.
+    let live = items(&ctx, coll).await;
+    assert_eq!(live.len(), 3);
+    assert_eq!(
+        live.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "pieces append at the next free number"
+    );
+    assert_eq!(live[0].arrangement_title, "Bolero");
+    assert_eq!(audit_count(&ctx.pool, "collection_item.create").await, 3);
+
+    // ▼ on the first piece swaps it with the second.
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    let directive = format!("down:{}", live[0].item.id);
+    fields.push(("move", &directive));
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &fields,
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
+    let reordered = items(&ctx, coll).await;
+    assert_eq!(
+        reordered
+            .iter()
+            .map(|i| i.arrangement_title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Egmont Overture", "Bolero", "Symphony No. 5"],
+        "▼ moved the first piece down one slot"
+    );
+    assert_eq!(
+        reordered.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "reordering renumbers from 1 rather than leaving gaps"
+    );
+    assert_eq!(audit_count(&ctx.pool, "collection_item.reorder").await, 1);
+
+    // Remove the middle piece, then restore it.
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let victim = reordered[1].item.id;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{victim}/delete"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(items(&ctx, coll).await.len(), 2);
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert!(html.contains("Removed pieces"), "the restore list appears");
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{victim}/undelete"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(items(&ctx, coll).await.len(), 3, "the piece came back");
+    assert_eq!(
+        audit_count(&ctx.pool, "collection_item.soft_delete").await,
+        1
+    );
+    assert_eq!(audit_count(&ctx.pool, "collection_item.undelete").await, 1);
+}
+
+#[tokio::test]
+async fn the_end_pieces_have_no_arrow_off_the_end_and_a_forged_one_is_refused() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["Bolero", "Egmont Overture"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert!(
+        !html.contains(&format!("up:{}", live[0].item.id)),
+        "the first piece is not offered a ▲"
+    );
+    assert!(
+        !html.contains(&format!("down:{}", live[1].item.id)),
+        "the last piece is not offered a ▼"
+    );
+
+    // The page hides those arrows; a hand-crafted POST must still be refused.
+    let token = form_csrf(&html);
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let directive = format!("up:{}", live[0].item.id);
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    fields.push(("move", &directive));
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &fields,
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        items(&ctx, coll).await[0].item.id,
+        live[0].item.id,
+        "the refused move changed nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_order_that_no_longer_matches_the_collection_is_refused() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["Bolero", "Egmont Overture"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+
+    // This page is now stale: a third piece lands before the reorder is
+    // submitted, so the submitted order isn't the live set any more.
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let third = seed_arrangement(&ctx.state, fx.org_id, "Symphony No. 5").await;
+    add_piece(&ctx, &browser, fx.org_id, coll, third).await;
+
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let directive = format!("down:{}", live[0].item.id);
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    fields.push(("move", &directive));
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &fields,
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a partial order must not silently drop the piece it omits"
+    );
+    let html = body_text(response).await;
+    assert!(
+        html.contains("changed since the page was loaded"),
+        "got: {html}"
+    );
+    assert_eq!(
+        items(&ctx, coll).await.len(),
+        3,
+        "all three pieces are still in the collection"
+    );
+}
+
+#[tokio::test]
+async fn a_piece_whose_arrangement_was_deleted_renders_as_removed() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+
+    // Soft-deleting the arrangement must not silently drop it from the program:
+    // hide-with-references means the slot stays, marked.
+    arrangement::soft_delete(&ctx.pool, arr).await.unwrap();
+
+    let (status, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("[removed]") && html.contains("bolero"),
+        "a deleted arrangement shows as [removed] with its slug, got: {html}"
+    );
+    assert!(
+        !html.contains("Bolero</td>"),
+        "the deleted arrangement's title is not rendered as a live entry"
+    );
+    assert_eq!(
+        items(&ctx, coll).await.len(),
+        1,
+        "the item itself is untouched by the arrangement's deletion"
+    );
+}
+
+#[tokio::test]
+async fn an_arrangement_from_another_org_cannot_be_added() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+
+    let other_org = Uuid::now_v7();
+    organization::create(
+        &ctx.state.db,
+        other_org,
+        "Rival Orchestra",
+        &organization::slugify("Rival Orchestra"),
+        None,
+    )
+    .await
+    .expect("other org");
+    let foreign = seed_arrangement(&ctx.state, other_org, "Their Secret Piece").await;
+
+    let token = session_csrf(&ctx.app, &browser, &detail_url).await;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items"),
+        &[("arrangement_id", &foreign.to_string())],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "a forged arrangement id must not pull another org's piece into the program"
+    );
+    assert!(
+        items(&ctx, coll).await.is_empty(),
+        "nothing was added to the collection"
+    );
+}

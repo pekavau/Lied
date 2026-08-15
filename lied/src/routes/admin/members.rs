@@ -358,9 +358,10 @@ fn instrument_multiselect(
 }
 
 /// Extract all values submitted for `key` (a `<select multiple>` submits the
-/// key once per selected option). `serde_urlencoded` collapses repeated keys,
-/// so we deserialize the body as ordered pairs instead.
-fn multi(pairs: &[(String, String)], key: &str) -> Vec<String> {
+/// key once per selected option, and the collection screens submit one `order`
+/// per row). `serde_urlencoded` collapses repeated keys, so callers deserialize
+/// the body as ordered pairs and read it through these helpers instead.
+pub(crate) fn multi(pairs: &[(String, String)], key: &str) -> Vec<String> {
     pairs
         .iter()
         .filter(|(k, _)| k == key)
@@ -369,14 +370,14 @@ fn multi(pairs: &[(String, String)], key: &str) -> Vec<String> {
         .collect()
 }
 
-fn field<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(crate) fn field<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs
         .iter()
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
 
-fn parse_ids(values: &[String]) -> Option<Vec<Uuid>> {
+pub(crate) fn parse_ids(values: &[String]) -> Option<Vec<Uuid>> {
     values.iter().map(|v| Uuid::parse_str(v).ok()).collect()
 }
 

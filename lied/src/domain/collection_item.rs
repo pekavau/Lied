@@ -195,6 +195,74 @@ pub async fn list_for_collection(
         .collect())
 }
 
+/// A collection's soft-deleted items, most-recently-removed first, plus the
+/// total. Backs the console's "removed pieces" restore list. Paginated so the
+/// query stays bounded however often a program has been rebuilt.
+pub async fn list_deleted_for_collection(
+    pool: &PgPool,
+    collection_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<CollectionItemView>, i64), sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            ci.id, ci.collection_id, ci.arrangement_id, ci.index,
+            ci.created_at as "created_at: DateTime<Utc>",
+            ci.updated_at as "updated_at: DateTime<Utc>",
+            ci.created_by,
+            ci.deleted_at as "deleted_at: DateTime<Utc>",
+            a.slug as arrangement_slug,
+            a.title as arrangement_title,
+            (a.deleted_at IS NOT NULL) as "arrangement_removed!"
+        FROM collection_item ci
+        JOIN collection c ON c.id = ci.collection_id
+        JOIN arrangement a ON a.id = ci.arrangement_id
+        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL
+        ORDER BY ci.deleted_at DESC, ci.id ASC
+        LIMIT $2 OFFSET $3
+        "#,
+        collection_id,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let total = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) as "count!"
+        FROM collection_item ci
+        JOIN collection c ON c.id = ci.collection_id
+        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL
+        "#,
+        collection_id,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|r| CollectionItemView {
+            item: CollectionItem {
+                id: r.id,
+                collection_id: r.collection_id,
+                arrangement_id: r.arrangement_id,
+                index: r.index,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                created_by: r.created_by,
+                deleted_at: r.deleted_at,
+            },
+            arrangement_slug: r.arrangement_slug,
+            arrangement_title: r.arrangement_title,
+            arrangement_removed: r.arrangement_removed,
+        })
+        .collect();
+
+    Ok((items, total))
+}
+
 /// Move a single item to `new_index`. Maps a clash on the existing index to
 /// [`CollectionItemError::DuplicateIndex`]. Returns `None` if no live item
 /// matched.
