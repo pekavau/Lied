@@ -537,7 +537,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
   | `File` | `(arrangement_id, voice_id, name, format)` for voice files; `(arrangement_id, name, format) WHERE voice_id IS NULL` for full-score files (Postgres treats NULL as distinct, so a partial index covers the score case) |
   | `Membership` | `(user_id, organization_id)` |
   | `Collection` | `(organization_id, slug)` |
-  | `CollectionItem` | `(collection_id, index)` |
+  | `CollectionItem` | `(collection_id, index)`; `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
   | `PartAssignment` | `(collection_item_id, voice_id)` — one assignee per voice per item; reassignment replaces the row |
   | `Tag` | `(organization_id, name, kind)` |
   | `ArrangementTag` | `(arrangement_id, tag_id)` |
@@ -653,6 +653,7 @@ All collections are indexed by piece number local to the collection. `program` c
 **CollectionItem**
 An arrangement within a collection with its local index number.
 Fields: collection FK, arrangement FK, index number, audit fields, `deleted_at`.
+**Numbering is dense and follows the order**: adding appends at `max+1`, removing a piece closes its gap, restoring puts a piece back at the number it held (clamped to the end if the collection has shrunk), and reordering renumbers 1..n. A collection's numbers therefore always increase down its running order — for a program because the order *is* the concert, and for a standing collection because the numbers are what musicians are called to play.
 
 **PartAssignment**
 Which user plays which voice for a specific item in a collection.

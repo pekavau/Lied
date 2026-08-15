@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE collection_item SET deleted_at = NULL, index = $2, updated_at = now()\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0055ccd2f46b3f5909ffe60f8978240dd88adc9a3967701d17d77f9b7889abe7"
+}

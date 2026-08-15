@@ -911,6 +911,11 @@ async fn add_item(
             StatusCode::CONFLICT,
             "Another piece already holds that number — pick a free one or reorder afterwards.",
         ),
+        Err(collection_item::CollectionItemError::DuplicateArrangement) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "That piece is already in this collection.",
+        ),
         Err(collection_item::CollectionItemError::UnknownReference) => error_page(
             &ctx,
             StatusCode::NOT_FOUND,
@@ -1016,7 +1021,7 @@ async fn delete_item(
     ) {
         return response;
     }
-    match collection_item::soft_delete(&state.db, item_id).await {
+    match collection_item::remove(&state.db, collection_id, item_id).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1058,7 +1063,7 @@ async fn undelete_item(
     ) {
         return response;
     }
-    match collection_item::undelete(&state.db, item_id).await {
+    match collection_item::restore(&state.db, collection_id, item_id).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1071,11 +1076,12 @@ async fn undelete_item(
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
         }
-        // Its old piece number was taken by another piece while it was gone.
-        Err(collection_item::CollectionItemError::DuplicateIndex) => error_page(
+        // The same arrangement was added again while this one was removed.
+        Err(collection_item::CollectionItemError::DuplicateArrangement) => error_page(
             &ctx,
             StatusCode::CONFLICT,
-            "Another piece now holds that number — move it first, then restore this one.",
+            "That piece is already in this collection — remove the current copy first \
+             if you meant to restore this one.",
         ),
         Err(error) => {
             tracing::error!(%error, "failed to restore a collection item");

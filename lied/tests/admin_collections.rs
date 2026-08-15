@@ -1781,3 +1781,267 @@ async fn an_out_of_range_piece_number_is_refused_before_it_can_break_reordering(
         "and it renumbers as usual"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — removal and restore semantics
+// ---------------------------------------------------------------------------
+
+/// Remove a piece through the console.
+async fn remove_piece(ctx: &Ctx, browser: &Browser, org_id: Uuid, coll: Uuid, item: Uuid) {
+    let detail_url = format!("/admin/orgs/{org_id}/collections/{coll}");
+    let (_, html) = load_page(&ctx.app, browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        browser,
+        &format!("{detail_url}/items/{item}/delete"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn removing_a_piece_closes_the_gap_immediately() {
+    // Leaving 1, 2, 4, 5 until the next arrow press means the numbers on screen
+    // are not the collection's numbers — and a standing collection is drawn
+    // from by number.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    for title in ["A March", "B March", "C March", "D March", "E March"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+    assert_eq!(
+        live.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[2].item.id).await;
+
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after
+            .iter()
+            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "A March"),
+            (2, "B March"),
+            (3, "D March"),
+            (4, "E March"),
+        ],
+        "the pieces after the removed one shift down; no gap is left behind"
+    );
+}
+
+#[tokio::test]
+async fn restoring_a_piece_puts_it_back_where_it_was() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["A March", "B March", "C March", "D March"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+    let second = live[1].item.id;
+
+    remove_piece(&ctx, &browser, fx.org_id, coll, second).await;
+    assert_eq!(
+        items(&ctx, coll)
+            .await
+            .iter()
+            .map(|i| i.arrangement_title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A March", "C March", "D March"]
+    );
+
+    // Restoring is undoing the removal: it goes back to number 2 and pushes the
+    // rest up, rather than landing at the end.
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{second}/undelete"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after
+            .iter()
+            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "A March"),
+            (2, "B March"),
+            (3, "C March"),
+            (4, "D March"),
+        ],
+        "the piece is back at its old number with the others shifted up"
+    );
+}
+
+#[tokio::test]
+async fn a_restore_into_a_shrunken_collection_lands_at_the_end() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["A March", "B March", "C March"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+
+    // Remove the third, then the others: its old number no longer exists.
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[2].item.id).await;
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[1].item.id).await;
+    assert_eq!(items(&ctx, coll).await.len(), 1);
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{}/undelete", live[2].item.id),
+        &[],
+        &token,
+    )
+    .await;
+
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after
+            .iter()
+            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "A March"), (2, "C March")],
+        "a number past the end clamps to the end rather than leaving a gap"
+    );
+}
+
+#[tokio::test]
+async fn a_piece_cannot_be_in_a_collection_twice_however_it_gets_there() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "A March").await;
+    let other = seed_arrangement(&ctx.state, fx.org_id, "B March").await;
+    add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    add_piece(&ctx, &browser, fx.org_id, coll, other).await;
+    let live = items(&ctx, coll).await;
+    let first = live[0].item.id;
+
+    // The dropdown hides an arrangement that is already in the collection, but
+    // the route must refuse a crafted post too.
+    let token = session_csrf(&ctx.app, &browser, &detail_url).await;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items"),
+        &[("arrangement_id", &arr.to_string())],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "adding a piece already in the collection is refused"
+    );
+    assert_eq!(items(&ctx, coll).await.len(), 2);
+
+    // Remove it, add it back, and the removed row must not be restorable — that
+    // would list the same music under two numbers.
+    remove_piece(&ctx, &browser, fx.org_id, coll, first).await;
+    add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert!(
+        !html.contains(&format!("{first}/undelete")),
+        "a removed piece whose arrangement is back is not offered for restore"
+    );
+
+    let token = session_csrf(&ctx.app, &browser, &detail_url).await;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{first}/undelete"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "…and the route refuses it even though the button is gone"
+    );
+    let after = items(&ctx, coll).await;
+    assert_eq!(after.len(), 2, "the collection still holds two pieces");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|i| i.item.arrangement_id == arr)
+            .count(),
+        1,
+        "exactly one copy of the piece"
+    );
+}
+
+#[tokio::test]
+async fn the_removed_list_shows_one_restorable_entry_per_piece() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "A March").await;
+
+    // Add and remove the same piece twice: two soft-deleted rows, one piece.
+    for _ in 0..2 {
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+        let item = items(&ctx, coll).await[0].item.id;
+        remove_piece(&ctx, &browser, fx.org_id, coll, item).await;
+    }
+
+    let (rows, total) =
+        lied::domain::collection_item::list_deleted_for_collection(&ctx.pool, coll, 50, 0)
+            .await
+            .unwrap();
+    assert_eq!(total, 1, "one restorable entry, not one per removal");
+    assert_eq!(rows.len(), 1);
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert_eq!(
+        html.matches("/undelete").count(),
+        1,
+        "the screen offers exactly one Restore for that piece"
+    );
+
+    // Restoring the listed one works and brings the piece back once.
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{}/undelete", rows[0].item.id),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(items(&ctx, coll).await.len(), 1);
+}
