@@ -301,3 +301,79 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
         .await?;
     Ok(result.rows_affected() > 0)
 }
+
+/// One row of the console's per-item assignment matrix: a live voice of the
+/// item's arrangement, plus whoever is assigned to it (if anyone) and that
+/// assignment's distribution state.
+///
+/// The screen is voice-first — an unassigned voice is exactly the thing the
+/// archivist is looking for — so this is a LEFT JOIN from the voices, not a
+/// list of assignments. Resolving the assignee's name in the same query keeps
+/// the page to one round trip instead of an N+1 over `user::find_by_id`.
+#[derive(Debug, Clone)]
+pub struct VoiceAssignment {
+    pub voice_id: Uuid,
+    pub voice_name: String,
+    pub voice_slug: String,
+    pub assignment_id: Option<Uuid>,
+    pub assignee_user_id: Option<Uuid>,
+    pub assignee_username: Option<String>,
+    pub assignee_display_name: Option<String>,
+    pub notified_at: Option<DateTime<Utc>>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+    /// The assignment's `updated_at`, for the console's optimistic-concurrency
+    /// field. `None` when the voice is unassigned (nothing to be stale about).
+    pub assignment_updated_at: Option<DateTime<Utc>>,
+}
+
+/// Every live voice of `collection_item_id`'s arrangement with its assignment,
+/// ordered by voice name. Empty if the item is soft-deleted or absent.
+pub async fn voice_matrix_for_item(
+    pool: &PgPool,
+    collection_item_id: Uuid,
+) -> Result<Vec<VoiceAssignment>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            v.id as voice_id,
+            v.name as voice_name,
+            v.slug as voice_slug,
+            pa.id as "assignment_id?",
+            pa.user_id as "assignee_user_id?",
+            u.username as "assignee_username?",
+            u.display_name as "assignee_display_name?",
+            pa.notified_at as "notified_at: DateTime<Utc>",
+            pa.acknowledged_at as "acknowledged_at: DateTime<Utc>",
+            pa.updated_at as "assignment_updated_at?: DateTime<Utc>"
+        FROM collection_item ci
+        JOIN voice v
+          ON v.arrangement_id = ci.arrangement_id
+         AND v.deleted_at IS NULL
+        LEFT JOIN part_assignment pa
+          ON pa.collection_item_id = ci.id
+         AND pa.voice_id = v.id
+        LEFT JOIN "user" u ON u.id = pa.user_id
+        WHERE ci.id = $1 AND ci.deleted_at IS NULL
+        ORDER BY v.name ASC, v.id ASC
+        "#,
+        collection_item_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| VoiceAssignment {
+            voice_id: r.voice_id,
+            voice_name: r.voice_name,
+            voice_slug: r.voice_slug,
+            assignment_id: r.assignment_id,
+            assignee_user_id: r.assignee_user_id,
+            assignee_username: r.assignee_username,
+            assignee_display_name: r.assignee_display_name,
+            notified_at: r.notified_at,
+            acknowledged_at: r.acknowledged_at,
+            assignment_updated_at: r.assignment_updated_at,
+        })
+        .collect())
+}

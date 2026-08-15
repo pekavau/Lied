@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            v.id as voice_id,\n            v.name as voice_name,\n            v.slug as voice_slug,\n            pa.id as \"assignment_id?\",\n            pa.user_id as \"assignee_user_id?\",\n            u.username as \"assignee_username?\",\n            u.display_name as \"assignee_display_name?\",\n            pa.notified_at as \"notified_at: DateTime<Utc>\",\n            pa.acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            pa.updated_at as \"assignment_updated_at?: DateTime<Utc>\"\n        FROM collection_item ci\n        JOIN voice v\n          ON v.arrangement_id = ci.arrangement_id\n         AND v.deleted_at IS NULL\n        LEFT JOIN part_assignment pa\n          ON pa.collection_item_id = ci.id\n         AND pa.voice_id = v.id\n        LEFT JOIN \"user\" u ON u.id = pa.user_id\n        WHERE ci.id = $1 AND ci.deleted_at IS NULL\n        ORDER BY v.name ASC, v.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "voice_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "voice_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "voice_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "assignment_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "assignee_user_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "assignee_username?",
+        "type_info": {
+          "Custom": {
+            "name": "citext",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "assignee_display_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "notified_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "acknowledged_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "assignment_updated_at?: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "aff0a4ebd550835af674ba8031141c2cd1dc26044617b68a976946dcefc0d2fa"
+}
