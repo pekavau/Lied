@@ -267,22 +267,105 @@ pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
     ("createdAt", "a.created_at"),
     ("difficulty", "a.difficulty"),
     ("durationSeconds", "a.duration_seconds"),
+    ("relevance", RELEVANCE_FRAGMENT),
 ];
+
+/// The `relevance` sort fragment. `$5` is the `q` bind in [`list_for_org`]'s
+/// query — the ranking is only meaningful alongside the search term, which is
+/// why [`resolve_search_sort`] refuses to use it without one.
+///
+/// `ts_rank` first (weighted: a title hit beats an instrumentation hit), then
+/// trigram similarity so a fuzzy-only match — one the tsquery could not tokenise
+/// — still orders sensibly among its peers rather than tying at zero.
+const RELEVANCE_FRAGMENT: &str = "(ts_rank(a.search_vector, \
+     websearch_to_tsquery('simple', immutable_unaccent($5))) \
+     + similarity(immutable_unaccent(a.title), immutable_unaccent($5)))";
 
 /// Filter allowlist: `status` (exact match) plus the phase-1 `?q=` ILIKE
 /// search is handled separately (not via the `filter[...]` bracket syntax —
 /// CLAUDE.md: "Phase-1 ILIKE search stays a separate `?q=` param").
-pub const FILTER_ALLOWLIST: &[&str] = &["status"];
+pub const FILTER_ALLOWLIST: &[&str] = &[
+    "status",
+    "difficultyMin",
+    "difficultyMax",
+    "durationMinSeconds",
+    "durationMaxSeconds",
+    "tag",
+    "instrumentId",
+];
+
+/// The faceted search a caller asks for. Grouped into one parameter because
+/// `list_for_org` already carried eight arguments before search existed; six
+/// more positional `Option`s would be unreadable at every call site.
+///
+/// Every facet is optional and they AND together, composing with `q` — the
+/// conductor's actual question is "something festive, brass, grade 3-5, under
+/// five minutes", not any one of those alone.
+#[derive(Debug, Default, Clone)]
+pub struct ArrangementSearch<'a> {
+    /// Free-text query: full-text over title/composer/arranger/tags/
+    /// instrumentation, plus trigram fuzzy matching on title and composer.
+    pub q: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub difficulty_min: Option<i16>,
+    pub difficulty_max: Option<i16>,
+    pub duration_min_seconds: Option<i32>,
+    pub duration_max_seconds: Option<i32>,
+    /// Tags an arrangement must carry — **all** of them (AND), consistent with
+    /// how every other facet composes. The value syntax leaves room for an
+    /// explicit OR later without breaking this meaning.
+    pub tag_ids: Vec<Uuid>,
+    /// Instrumentation: the arrangement must have a live voice for this
+    /// instrument.
+    pub instrument_id: Option<Uuid>,
+}
+
+/// Resolve the sort for a search, applying the two rules `relevance` needs on
+/// top of the generic allowlist:
+///
+///  * bare `sort=relevance` means *best first*; the generic parser defaults a
+///    missing direction to ascending, which would put the worst matches on
+///    page one;
+///  * relevance without a `q` has nothing to rank, so it falls back to the
+///    default sort rather than erroring — a UI that keeps the sort while the
+///    user clears the search box should not 400 at them.
+pub fn resolve_search_sort<'a>(
+    raw: Option<&str>,
+    has_query: bool,
+    default: (&'a str, crate::listing::SortDirection),
+) -> Result<(&'a str, crate::listing::SortDirection), garde::Report> {
+    use crate::listing::SortDirection;
+
+    let asked_for_relevance = raw
+        .map(|value| value.split(':').next().unwrap_or("") == "relevance")
+        .unwrap_or(false);
+    if asked_for_relevance && !has_query {
+        return Ok(default);
+    }
+
+    let (fragment, direction) = crate::listing::resolve_sort(raw, SORT_ALLOWLIST, default)?;
+    let direction = if asked_for_relevance && raw.map(|v| !v.contains(':')).unwrap_or(false) {
+        SortDirection::Desc
+    } else {
+        direction
+    };
+    Ok((fragment, direction))
+}
 
 /// Fetch one page of an organization's arrangements plus the total live row
-/// count, with an allowlisted sort, optional exact `status` filter, and
-/// optional `q` ILIKE search over `Arrangement.title` and `Work.composer`
-/// (CLAUDE.md: "ILIKE search on `Arrangement.title` and `Work.composer`
-/// (via the optional Work join)"). Soft-deleted arrangements are always
-/// excluded; their join through the optional Work row is also excluded if
-/// that Work itself were ever made soft-deletable (it isn't, per the data
-/// model, so no `deleted_at` filter applies to `work`).
-#[allow(clippy::too_many_arguments)]
+/// count, with an allowlisted sort and the faceted search in
+/// [`ArrangementSearch`].
+///
+/// `q` matches three ways, OR'd together, so one box serves both "I know what
+/// it is called" and "I half-remember it":
+///   * the stored `search_vector` (title, composer, arranger, tag names,
+///     instrumentation) via `websearch_to_tsquery` — which, unlike
+///     `to_tsquery`, accepts whatever a human types without raising, and gives
+///     quoted phrases and `-exclusion` for free;
+///   * trigram similarity on the unaccented title and composer, which is what
+///     catches misspellings and partial words the tokeniser cannot.
+///
+/// Soft-deleted arrangements are always excluded.
 pub async fn list_for_org(
     pool: &PgPool,
     organization_id: Uuid,
@@ -290,10 +373,43 @@ pub async fn list_for_org(
     offset: i64,
     sort_column: &str,
     sort_direction: crate::listing::SortDirection,
-    status_filter: Option<&str>,
-    q: Option<&str>,
+    search: &ArrangementSearch<'_>,
 ) -> Result<(Vec<Arrangement>, i64), sqlx::Error> {
     let direction = sort_direction.as_sql();
+    // The WHERE body is identical for the page and the fallback count, and is
+    // the only place the facets are expressed — keeping them in one string
+    // stops the two queries drifting apart as facets are added.
+    const WHERE_BODY: &str = r#"
+          a.deleted_at IS NULL
+          AND ($4::text IS NULL OR a.status = $4)
+          AND ($5::text IS NULL OR (
+                  a.search_vector @@ websearch_to_tsquery('simple', immutable_unaccent($5))
+               OR immutable_unaccent(a.title) % immutable_unaccent($5)
+               OR immutable_unaccent(w.composer) % immutable_unaccent($5)
+          ))
+          AND ($6::smallint IS NULL OR a.difficulty >= $6)
+          AND ($7::smallint IS NULL OR a.difficulty <= $7)
+          AND ($8::integer IS NULL OR a.duration_seconds >= $8)
+          AND ($9::integer IS NULL OR a.duration_seconds <= $9)
+          AND (
+              $10::uuid[] IS NULL
+              OR (
+                  SELECT count(DISTINCT at.tag_id)
+                  FROM arrangement_tag at
+                  WHERE at.arrangement_id = a.id AND at.tag_id = ANY($10)
+              ) = cardinality($10)
+          )
+          AND (
+              $11::uuid IS NULL
+              OR EXISTS (
+                  SELECT 1 FROM voice v
+                  WHERE v.arrangement_id = a.id
+                    AND v.instrument_id = $11
+                    AND v.deleted_at IS NULL
+              )
+          )
+    "#;
+
     // Runtime `sqlx::query` (dynamic allowlisted ORDER BY) — see
     // `organization::list` for why building this with `format!` around
     // fixed, allowlisted fragments is safe.
@@ -308,21 +424,28 @@ pub async fn list_for_org(
             count(*) OVER() as total
         FROM arrangement a
         LEFT JOIN work w ON w.id = a.work_id
-        WHERE a.organization_id = $3
-          AND a.deleted_at IS NULL
-          AND ($4::text IS NULL OR a.status = $4)
-          AND ($5::text IS NULL OR a.title ILIKE '%' || $5 || '%' OR w.composer ILIKE '%' || $5 || '%')
+        WHERE a.organization_id = $3 AND {WHERE_BODY}
         ORDER BY {sort_column} {direction}, a.id ASC
         LIMIT $1 OFFSET $2
         "#
     );
 
+    // An empty tag list means "no tag facet", not "must carry zero tags".
+    let tag_ids: Option<&[Uuid]> =
+        (!search.tag_ids.is_empty()).then_some(search.tag_ids.as_slice());
+
     let rows = sqlx::query(&query)
         .bind(limit)
         .bind(offset)
         .bind(organization_id)
-        .bind(status_filter)
-        .bind(q)
+        .bind(search.status)
+        .bind(search.q)
+        .bind(search.difficulty_min)
+        .bind(search.difficulty_max)
+        .bind(search.duration_min_seconds)
+        .bind(search.duration_max_seconds)
+        .bind(tag_ids)
+        .bind(search.instrument_id)
         .fetch_all(pool)
         .await?;
 
@@ -330,18 +453,28 @@ pub async fn list_for_org(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            let count_query = r#"
-                SELECT count(*) FROM arrangement a
+            // Same predicate, same bind positions: $1/$2 are unused here but
+            // kept so the shared WHERE body needs no renumbering.
+            let count_query = format!(
+                r#"
+                SELECT count(*)
+                FROM arrangement a
                 LEFT JOIN work w ON w.id = a.work_id
-                WHERE a.organization_id = $1
-                  AND a.deleted_at IS NULL
-                  AND ($2::text IS NULL OR a.status = $2)
-                  AND ($3::text IS NULL OR a.title ILIKE '%' || $3 || '%' OR w.composer ILIKE '%' || $3 || '%')
-            "#;
-            sqlx::query_scalar::<_, i64>(count_query)
+                WHERE a.organization_id = $3 AND {WHERE_BODY}
+                "#
+            );
+            sqlx::query_scalar::<_, i64>(&count_query)
+                .bind(limit)
+                .bind(offset)
                 .bind(organization_id)
-                .bind(status_filter)
-                .bind(q)
+                .bind(search.status)
+                .bind(search.q)
+                .bind(search.difficulty_min)
+                .bind(search.difficulty_max)
+                .bind(search.duration_min_seconds)
+                .bind(search.duration_max_seconds)
+                .bind(tag_ids)
+                .bind(search.instrument_id)
                 .fetch_one(pool)
                 .await?
         }

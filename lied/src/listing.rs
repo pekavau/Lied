@@ -119,15 +119,20 @@ pub fn parse_filters(query: &str) -> RawFilters {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
-        let Some(field) = key
+        // Decode BEFORE matching the prefix: a browser submitting a GET form
+        // percent-encodes the brackets (`filter%5Bstatus%5D`), and matching the
+        // raw key would silently drop the filter — returning everything, which
+        // reads as "no results were excluded" rather than "your filter was
+        // ignored".
+        let decoded_key = percent_decode(key);
+        let Some(field) = decoded_key
             .strip_prefix("filter[")
             .and_then(|s| s.strip_suffix(']'))
         else {
             continue;
         };
-        let decoded_key = percent_decode(field);
         let decoded_value = percent_decode(value);
-        filters.insert(decoded_key, decoded_value);
+        filters.insert(field.to_string(), decoded_value);
     }
     filters
 }
@@ -239,6 +244,31 @@ mod tests {
     use chrono::TimeZone;
 
     const ALLOWLIST: &[(&str, &str)] = &[("name", "o.name"), ("createdAt", "o.created_at")];
+
+    #[test]
+    fn parse_filters_accepts_percent_encoded_brackets() {
+        // A browser GET form encodes the brackets; the hand-written curl in a
+        // test does not. Both must reach the same filter.
+        let literal = parse_filters("filter[status]=active&limit=50");
+        let encoded = parse_filters("filter%5Bstatus%5D=active&limit=50");
+        assert_eq!(literal.get("status").map(String::as_str), Some("active"));
+        assert_eq!(
+            encoded.get("status").map(String::as_str),
+            Some("active"),
+            "an encoded filter key must not be silently dropped"
+        );
+        assert_eq!(literal, encoded);
+    }
+
+    #[test]
+    fn parse_filters_decodes_keys_and_values() {
+        let filters = parse_filters("filter%5BdurationMaxSeconds%5D=300&filter[tag]=a%2Cb");
+        assert_eq!(
+            filters.get("durationMaxSeconds").map(String::as_str),
+            Some("300")
+        );
+        assert_eq!(filters.get("tag").map(String::as_str), Some("a,b"));
+    }
 
     #[test]
     fn resolve_sort_defaults_when_absent() {

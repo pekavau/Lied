@@ -507,6 +507,79 @@ fn arrangement_error_to_app_error(err: arrangement::ArrangementError) -> AppErro
     }
 }
 
+/// A single-field `garde::Report`, for the filter parse errors below.
+fn field_report(field: &str, message: &str) -> garde::Report {
+    let mut report = garde::Report::new();
+    report.append(
+        garde::Path::new(field),
+        garde::Error::new(message.to_string()),
+    );
+    report
+}
+
+/// Turn allowlisted `filter[...]` pairs into an [`arrangement::ArrangementSearch`].
+///
+/// A value that cannot be parsed is a **400**, never a silently dropped facet:
+/// a search that quietly ignores `difficultyMin=easy` and returns everything is
+/// worse than one that says what it did not understand (the same class of bug
+/// the voice-filter fix in #6 addressed).
+fn build_search<'a>(
+    filters: &'a [(String, String)],
+    q: Option<&'a str>,
+) -> Result<arrangement::ArrangementSearch<'a>, AppError> {
+    fn value<'a>(filters: &'a [(String, String)], field: &str) -> Option<&'a str> {
+        filters
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn parse<T: std::str::FromStr>(
+        filters: &[(String, String)],
+        field: &str,
+        expected: &str,
+    ) -> Result<Option<T>, AppError> {
+        match value(filters, field) {
+            None => Ok(None),
+            Some(raw) => raw.parse::<T>().map(Some).map_err(|_| {
+                validation_error(field_report(
+                    &format!("filter[{field}]"),
+                    &format!("expected {expected}, got '{raw}'"),
+                ))
+            }),
+        }
+    }
+
+    let tag_ids = match value(filters, "tag") {
+        None => Vec::new(),
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                Uuid::parse_str(part).map_err(|_| {
+                    validation_error(field_report(
+                        "filter[tag]",
+                        &format!("expected a comma-separated list of tag ids, got '{part}'"),
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    Ok(arrangement::ArrangementSearch {
+        q: q.filter(|value| !value.is_empty()),
+        status: value(filters, "status"),
+        difficulty_min: parse(filters, "difficultyMin", "a whole number")?,
+        difficulty_max: parse(filters, "difficultyMax", "a whole number")?,
+        duration_min_seconds: parse(filters, "durationMinSeconds", "a whole number of seconds")?,
+        duration_max_seconds: parse(filters, "durationMaxSeconds", "a whole number of seconds")?,
+        tag_ids,
+        instrument_id: parse(filters, "instrumentId", "a tag id")?,
+    })
+}
+
 /// List arrangements in an organization (requires `musician` role).
 #[utoipa::path(
     get,
@@ -548,9 +621,9 @@ async fn list_arrangements(
     }
     .resolve(state.config.default_page_size, state.config.max_page_size);
 
-    let (sort_column, sort_direction) = listing::resolve_sort(
+    let (sort_column, sort_direction) = arrangement::resolve_search_sort(
         q.sort.as_deref(),
-        arrangement::SORT_ALLOWLIST,
+        q.q.as_deref().is_some_and(|value| !value.is_empty()),
         ("a.title", SortDirection::Asc),
     )
     .map_err(validation_error)?;
@@ -558,10 +631,7 @@ async fn list_arrangements(
     let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, arrangement::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
-    let status_filter = filters
-        .iter()
-        .find(|(field, _)| field == "status")
-        .map(|(_, value)| value.as_str());
+    let search = build_search(&filters, q.q.as_deref())?;
 
     let (items, total) = arrangement::list_for_org(
         &state.db,
@@ -570,8 +640,7 @@ async fn list_arrangements(
         i64::from(offset),
         sort_column,
         sort_direction,
-        status_filter,
-        q.q.as_deref(),
+        &search,
     )
     .await?;
 
