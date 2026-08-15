@@ -1441,3 +1441,283 @@ async fn an_item_or_assignment_from_another_collection_is_not_found() {
         "the assignment is untouched"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — review findings
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_standing_collection_numbers_pieces_directly_instead_of_renumbering_the_book() {
+    // A standing collection is a numbered book: musicians call out "number 12",
+    // so moving one piece must not renumber the rest. Programs are a sequence
+    // and do get the arrows.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "March Book", "standing").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["Bolero", "Egmont Overture", "Radetzky March"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert!(
+        !html.contains("value=\"down:"),
+        "a standing collection offers no ▼ — reordering would renumber the book"
+    );
+    assert!(
+        html.contains("Set number"),
+        "…it offers a direct piece-number editor instead"
+    );
+
+    // Renumbering piece 3 to 12 leaves the others exactly where they were.
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{}/number", live[2].item.id),
+        &[("index", "12")],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        vec![1, 2, 12],
+        "only the edited piece moved; the rest kept their numbers"
+    );
+    assert_eq!(
+        audit_count(&ctx.pool, "collection_item.update_index").await,
+        1
+    );
+
+    // A number already in use is refused rather than silently swapping.
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/{}/number", live[0].item.id),
+        &[("index", "2")],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        items(&ctx, coll).await[0].item.index,
+        1,
+        "the refused renumber changed nothing"
+    );
+
+    // …and a program still gets arrows.
+    let program = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Eine kleine Nachtmusik").await;
+    add_piece(&ctx, &browser, fx.org_id, program, arr).await;
+    let second = seed_arrangement(&ctx.state, fx.org_id, "Water Music").await;
+    add_piece(&ctx, &browser, fx.org_id, program, second).await;
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{program}", fx.org_id),
+    )
+    .await;
+    assert!(
+        html.contains("value=\"down:"),
+        "a program is a sequence and keeps the arrows"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_submitted_order_is_a_bad_request_not_a_silent_no_op() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+
+    let token = session_csrf(&ctx.app, &browser, &detail_url).await;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "a reorder that names no rows is malformed, not a no-op"
+    );
+    assert_eq!(items(&ctx, coll).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_piece_whose_arrangement_was_removed_takes_no_new_assignees() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    seed_user(&ctx.state, "player").await;
+
+    // Assign one part while the arrangement is live…
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[("voice_id", &voices[0].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    let existing = assignment_for(&ctx, item, voices[0]).await.unwrap();
+
+    // …then remove the arrangement from the catalog. Its files are hidden
+    // through it, so a new assignment would grant access to nothing.
+    let arr_id = lied::domain::collection_item::find_by_id(&ctx.pool, item)
+        .await
+        .unwrap()
+        .unwrap()
+        .arrangement_id;
+    arrangement::soft_delete(&ctx.pool, arr_id).await.unwrap();
+
+    let (status, html) = load_page(&ctx.app, &browser, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("was removed from the catalog"),
+        "the screen says why it is read-only, got: {html}"
+    );
+    assert!(
+        !html.contains("name=\"username\""),
+        "no assign control is offered for a removed arrangement"
+    );
+
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[("voice_id", &voices[1].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "the route holds the line even though the control is hidden"
+    );
+    assert!(assignment_for(&ctx, item, voices[1]).await.is_none());
+
+    // Existing parts can still be cleaned up.
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{url}/{}/unassign", existing.id),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "unassigning stays possible so the archivist can tidy up"
+    );
+}
+
+#[tokio::test]
+async fn the_assignee_datalist_lists_org_members_in_one_query() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, _) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+
+    // A user with no membership must not be offered — but must still be
+    // assignable by typing the name (the guest path, covered elsewhere).
+    seed_user(&ctx.state, "outsider").await;
+
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!(
+            "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+            fx.org_id
+        ),
+    )
+    .await;
+    for member in ["arch", "cond", "mus"] {
+        assert!(
+            html.contains(&format!("<option value=\"{member}\">")),
+            "{member} should be offered in the datalist"
+        );
+    }
+    assert!(
+        !html.contains("<option value=\"outsider\">"),
+        "a non-member is not offered, though they remain assignable by name"
+    );
+
+    // The list comes from one JOIN, not a query per member.
+    let usernames = lied::domain::membership::member_usernames(&ctx.pool, fx.org_id, 50)
+        .await
+        .unwrap();
+    assert_eq!(usernames, vec!["arch", "cond", "mus"]);
+}
+
+#[tokio::test]
+async fn the_reorder_audit_records_the_resulting_order() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    for title in ["Bolero", "Egmont Overture"] {
+        let arr = seed_arrangement(&ctx.state, fx.org_id, title).await;
+        add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
+    }
+    let live = items(&ctx, coll).await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    let token = form_csrf(&html);
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let directive = format!("down:{}", live[0].item.id);
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    fields.push(("move", &directive));
+    post_form(
+        &ctx.app,
+        &browser,
+        &format!("{detail_url}/items/reorder"),
+        &fields,
+        &token,
+    )
+    .await;
+
+    // The audit payload must carry the order that was applied — "someone
+    // reordered this" is not enough to reconstruct a concert running order.
+    let payload: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT payload FROM audit_log WHERE action = 'collection_item.reorder'
+           ORDER BY at DESC LIMIT 1"#,
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let recorded: Vec<String> = payload["order"]
+        .as_array()
+        .expect("the payload records an order")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![live[1].item.id.to_string(), live[0].item.id.to_string()],
+        "the audit row records the swapped order, not the submitted one"
+    );
+}

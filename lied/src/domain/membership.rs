@@ -566,6 +566,33 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<UserOrg>,
         .collect())
 }
 
+/// The usernames of an org's members, alphabetical — the console's assignee
+/// autocomplete list.
+///
+/// One JOIN rather than a `list_for_org` followed by a `user::find_by_id` per
+/// row: the list is decoration on a form, and it must not cost a query per
+/// member to render.
+pub async fn member_usernames(
+    pool: &PgPool,
+    organization_id: Uuid,
+    limit: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT u.username as "username!"
+        FROM membership m
+        JOIN "user" u ON u.id = m.user_id
+        WHERE m.organization_id = $1
+        ORDER BY u.username ASC
+        LIMIT $2
+        "#,
+        organization_id,
+        limit,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -149,6 +149,14 @@ pub async fn find_by_id_including_deleted(
 /// List a collection's live items in index order, each with its arrangement's
 /// display info (surfacing soft-deleted arrangements as removed). Items are
 /// hidden if the collection itself is soft-deleted.
+///
+/// **Deliberately unpaginated.** Every caller needs the whole set to be
+/// correct, not merely complete: the console renders one reorder form over all
+/// rows and submits their ids as the new order, and the domain's [`reorder`]
+/// rejects anything that is not a permutation of the live items — so a page of
+/// them would be refused by construction. The bound is the collection itself: a
+/// program is a concert and a standing collection a book, both of which are
+/// tens of entries, not thousands.
 pub async fn list_for_collection(
     pool: &PgPool,
     collection_id: Uuid,
