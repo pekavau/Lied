@@ -228,6 +228,48 @@ pub async fn list_for_org(
     Ok((items, total))
 }
 
+/// The org's soft-deleted collections, most-recently-deleted first, plus the
+/// total count. Powers the console's "recently deleted" restore list. Paginated
+/// so the query stays bounded however long an org has been curating.
+pub async fn list_deleted_for_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<Collection>, i64), sqlx::Error> {
+    let rows = sqlx::query_as!(
+        Collection,
+        r#"
+        SELECT
+            id, organization_id, name, slug,
+            type as "collection_type!",
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>",
+            created_by,
+            deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection
+        WHERE organization_id = $1 AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC, id ASC
+        LIMIT $2 OFFSET $3
+        "#,
+        organization_id,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let total = sqlx::query_scalar!(
+        r#"SELECT count(*) as "count!" FROM collection
+           WHERE organization_id = $1 AND deleted_at IS NOT NULL"#,
+        organization_id,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok((rows, total))
+}
+
 /// Update a collection's mutable fields (`name`, `type`). `slug` is immutable.
 /// Returns `None` if no live row matched.
 pub async fn update(
