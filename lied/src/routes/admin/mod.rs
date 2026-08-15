@@ -11,6 +11,7 @@ pub mod files;
 pub mod layout;
 pub mod members;
 pub mod orgs;
+pub mod search;
 pub mod tags;
 
 use axum::extract::State;
@@ -59,6 +60,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(files::router())
         // Collection & part-assignment screens (issue #33).
         .merge(collections::router())
+        // Archive search (issue #34).
+        .merge(search::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,

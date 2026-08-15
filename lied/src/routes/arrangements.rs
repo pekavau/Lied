@@ -591,11 +591,28 @@ fn build_search<'a>(
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `title` (default asc), `created_at`, `status`."),
+            description = "Sort field and direction. Allowed: `title` (default asc), `createdAt`, \
+                           `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` means \
+                           best-match first; without `q` it falls back to `title:asc`."),
+        ("q" = Option<String>, Query,
+            description = "Search across title, composer, arranger, tag names and instrumentation \
+                           (full text, accent-insensitive), plus fuzzy matching on title and \
+                           composer so a misspelling still finds the piece. Supports quoted \
+                           phrases and `-exclusion`."),
         ("filter[status]" = Option<String>, Query,
             description = "Filter by status: `active` or `archived`"),
-        ("q" = Option<String>, Query,
-            description = "ILIKE search across title and composer"),
+        ("filter[difficultyMin]" = Option<i16>, Query,
+            description = "Lowest ABRSM difficulty to include"),
+        ("filter[difficultyMax]" = Option<i16>, Query,
+            description = "Highest ABRSM difficulty to include"),
+        ("filter[durationMinSeconds]" = Option<i32>, Query,
+            description = "Shortest duration to include, in seconds"),
+        ("filter[durationMaxSeconds]" = Option<i32>, Query,
+            description = "Longest duration to include, in seconds"),
+        ("filter[tag]" = Option<String>, Query,
+            description = "Comma-separated tag IDs; an arrangement must carry ALL of them"),
+        ("filter[instrumentId]" = Option<Uuid>, Query,
+            description = "Only arrangements having a live voice for this instrument"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(

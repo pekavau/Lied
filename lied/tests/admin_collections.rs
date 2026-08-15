@@ -2045,3 +2045,123 @@ async fn the_removed_list_shows_one_restorable_entry_per_piece() {
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
     assert_eq!(items(&ctx, coll).await.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Console archive search (issue #34, slice 3) — the conductor's planning screen
+// ---------------------------------------------------------------------------
+
+async fn seed_searchable_arrangement(
+    state: &AppState,
+    org_id: Uuid,
+    title: &str,
+    difficulty: Option<i16>,
+    duration_seconds: Option<i32>,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    arrangement::create(
+        &state.db,
+        id,
+        org_id,
+        &arrangement::slugify(title),
+        arrangement::ArrangementFields {
+            title,
+            work_id: None,
+            instrumentation: None,
+            arranger: None,
+            publisher: None,
+            purchase_date: None,
+            license_notes: None,
+            copy_count_allowed: None,
+            status: "active",
+            duration_seconds,
+            difficulty,
+            difficulty_ratings: None,
+            difficulty_notes: None,
+        },
+        None,
+    )
+    .await
+    .expect("arrangement");
+    id
+}
+
+#[tokio::test]
+async fn the_search_screen_finds_pieces_and_narrows_by_facet() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "cond").await;
+    let search_url = format!("/admin/orgs/{}/search", fx.org_id);
+
+    seed_searchable_arrangement(&ctx.state, fx.org_id, "Boléro", Some(6), Some(900)).await;
+    seed_searchable_arrangement(&ctx.state, fx.org_id, "Easy Fanfare", Some(2), Some(120)).await;
+
+    // An untouched form browses the whole catalogue.
+    let (status, html) = load_page(&ctx.app, &browser, &search_url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(html.contains("All arrangements"));
+    assert!(html.contains("Boléro") && html.contains("Easy Fanfare"));
+
+    // The query box reaches the same search /v1 does — accents optional.
+    let (_, html) = load_page(&ctx.app, &browser, &format!("{search_url}?q=bolero")).await;
+    assert!(html.contains("Boléro"), "accent-folded match, got: {html}");
+    assert!(!html.contains("Easy Fanfare"));
+
+    // Facets arrive percent-encoded from a browser GET form; they must apply.
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("{search_url}?difficulty_min=5"),
+    )
+    .await;
+    assert!(html.contains("Boléro") && !html.contains("Easy Fanfare"));
+
+    // A misspelling still finds it — the reason trigram matching is there.
+    let (_, html) = load_page(&ctx.app, &browser, &format!("{search_url}?q=bolerro")).await;
+    assert!(html.contains("Boléro"));
+
+    // Nothing matched reads as nothing matched, not as an error.
+    let (_, html) = load_page(&ctx.app, &browser, &format!("{search_url}?q=tubaconcerto")).await;
+    assert!(html.contains("Nothing matched"), "got: {html}");
+}
+
+#[tokio::test]
+async fn a_search_facet_that_cannot_be_parsed_is_reported_not_silently_dropped() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let search_url = format!("/admin/orgs/{}/search", fx.org_id);
+    seed_searchable_arrangement(&ctx.state, fx.org_id, "Boléro", Some(6), None).await;
+
+    // The console keeps rendering (unlike /v1, which 400s) but must say which
+    // box it ignored — a search that quietly drops a filter and returns
+    // everything is the failure mode this screen must not have.
+    let (status, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("{search_url}?difficulty_min=easy"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("that filter was ignored"),
+        "the page must disclose the ignored filter, got: {html}"
+    );
+    assert!(html.contains("Boléro"), "the rest of the search still ran");
+}
+
+#[tokio::test]
+async fn the_search_screen_is_staff_only() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let search_url = format!("/admin/orgs/{}/search", fx.org_id);
+
+    // Search is the conductor's planning surface, so a conductor gets it…
+    let conductor = Browser::login(&ctx.app, "cond").await;
+    let (status, _) = load_page(&ctx.app, &conductor, &search_url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // …while a plain musician does not: they reach their parts over WebDAV.
+    let musician = Browser::login(&ctx.app, "mus").await;
+    let (status, _) = load_page(&ctx.app, &musician, &search_url).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+}
