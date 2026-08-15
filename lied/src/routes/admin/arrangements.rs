@@ -403,8 +403,7 @@ async fn list_page(
         0,
         "title",
         SortDirection::Asc,
-        None,
-        None,
+        &arrangement::ArrangementSearch::default(),
     )
     .await
     {

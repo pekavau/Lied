@@ -314,6 +314,7 @@ async fn collection_detail_page(
     let page_size = i64::from(state.config.max_page_size);
     // Three independent loads — issue them together rather than in series (the
     // pattern the #30 review established for the console's page loads).
+    let all_arrangements = arrangement::ArrangementSearch::default();
     let (items, removed_result, candidates_result) = tokio::join!(
         collection_item::list_for_collection(&state.db, collection_id),
         collection_item::list_deleted_for_collection(&state.db, collection_id, page_size, 0),
@@ -324,8 +325,7 @@ async fn collection_detail_page(
             0,
             "title",
             SortDirection::Asc,
-            None,
-            None,
+            &all_arrangements,
         ),
     );
     let items = match items {
