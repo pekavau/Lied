@@ -1447,10 +1447,11 @@ async fn an_item_or_assignment_from_another_collection_is_not_found() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_standing_collection_numbers_pieces_directly_instead_of_renumbering_the_book() {
-    // A standing collection is a numbered book: musicians call out "number 12",
-    // so moving one piece must not renumber the rest. Programs are a sequence
-    // and do get the arrows.
+async fn reordering_a_standing_collection_renumbers_it_so_the_numbers_follow_the_order() {
+    // A march book is drawn from by piece number, so the numbers have to agree
+    // with the running order: reorder the book and the numbering must reflect
+    // it, always increasing down the list. This holds for a standing collection
+    // exactly as it does for a program — there is one ordering story.
     let ctx = Ctx::new().await;
     let fx = seed(&ctx.state).await;
     let browser = Browser::login(&ctx.app, "arch").await;
@@ -1464,69 +1465,41 @@ async fn a_standing_collection_numbers_pieces_directly_instead_of_renumbering_th
 
     let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
     assert!(
-        !html.contains("value=\"down:"),
-        "a standing collection offers no ▼ — reordering would renumber the book"
-    );
-    assert!(
-        html.contains("Set number"),
-        "…it offers a direct piece-number editor instead"
+        html.contains("value=\"down:"),
+        "a standing collection is reordered with the same arrows a program uses"
     );
 
-    // Renumbering piece 3 to 12 leaves the others exactly where they were.
+    // Move the last piece to the front.
     let token = form_csrf(&html);
+    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
+    let directive = format!("up:{}", live[2].item.id);
+    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
+    fields.push(("move", &directive));
     let response = post_form(
         &ctx.app,
         &browser,
-        &format!("{detail_url}/items/{}/number", live[2].item.id),
-        &[("index", "12")],
+        &format!("{detail_url}/items/reorder"),
+        &fields,
         &token,
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
     let after = items(&ctx, coll).await;
     assert_eq!(
-        after.iter().map(|i| i.item.index).collect::<Vec<_>>(),
-        vec![1, 2, 12],
-        "only the edited piece moved; the rest kept their numbers"
+        after
+            .iter()
+            .map(|i| i.arrangement_title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Bolero", "Radetzky March", "Egmont Overture"],
+        "the third piece moved up one"
     );
-    assert_eq!(
-        audit_count(&ctx.pool, "collection_item.update_index").await,
-        1
-    );
-
-    // A number already in use is refused rather than silently swapping.
-    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
-    let token = form_csrf(&html);
-    let response = post_form(
-        &ctx.app,
-        &browser,
-        &format!("{detail_url}/items/{}/number", live[0].item.id),
-        &[("index", "2")],
-        &token,
-    )
-    .await;
-    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-    assert_eq!(
-        items(&ctx, coll).await[0].item.index,
-        1,
-        "the refused renumber changed nothing"
-    );
-
-    // …and a program still gets arrows.
-    let program = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
-    let arr = seed_arrangement(&ctx.state, fx.org_id, "Eine kleine Nachtmusik").await;
-    add_piece(&ctx, &browser, fx.org_id, program, arr).await;
-    let second = seed_arrangement(&ctx.state, fx.org_id, "Water Music").await;
-    add_piece(&ctx, &browser, fx.org_id, program, second).await;
-    let (_, html) = load_page(
-        &ctx.app,
-        &browser,
-        &format!("/admin/orgs/{}/collections/{program}", fx.org_id),
-    )
-    .await;
+    // The invariant: numbering reflects the new order, and increases.
+    let numbers: Vec<i32> = after.iter().map(|i| i.item.index).collect();
+    assert_eq!(numbers, vec![1, 2, 3], "the book is renumbered to match");
     assert!(
-        html.contains("value=\"down:"),
-        "a program is a sequence and keeps the arrows"
+        numbers.windows(2).all(|w| w[0] < w[1]),
+        "piece numbers increase down the book: {numbers:?}"
     );
 }
 

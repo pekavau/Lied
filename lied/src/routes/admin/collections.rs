@@ -59,10 +59,6 @@ pub fn router() -> Router<AppState> {
             post(reorder_items),
         )
         .route(
-            "/orgs/:org_id/collections/:collection_id/items/:item_id/number",
-            post(set_item_number),
-        )
-        .route(
             "/orgs/:org_id/collections/:collection_id/items/:item_id/delete",
             post(delete_item),
         )
@@ -357,7 +353,6 @@ async fn collection_detail_page(
         }
     };
     let next_index = items.iter().map(|i| i.item.index).max().unwrap_or(0) + 1;
-    let is_program = c.collection_type == "program";
     let items_base = format!("{}/items", detail_url(org_id, collection_id));
 
     let body = html! {
@@ -373,23 +368,13 @@ async fn collection_detail_page(
         }
 
         h2 { "Pieces" }
-        // A program is a sequence: what matters is what follows what, so ▲/▼
-        // (which renumber 1..n) are the right control. A standing collection is
-        // a numbered book — musicians call out "number 47" — so its numbers are
-        // stable handles, and renumbering the book because one piece moved
-        // would invalidate everyone's memory of it. There, each piece's number
-        // is edited directly instead.
-        @if is_program {
-            p class="muted" {
-                "A program is played in order — use ▲/▼ to rearrange it. "
-                "Pieces are renumbered from 1 on every move."
-            }
-        } @else {
-            p class="muted" {
-                "A standing collection is drawn from by piece number, so the "
-                "numbers are fixed handles: set a piece's number directly "
-                "rather than reordering the book around it."
-            }
+        // Piece numbers follow the order, for a program and a standing
+        // collection alike: reordering renumbers from 1 so the numbers always
+        // increase down the list. A book whose numbers disagreed with its own
+        // sequence would be worse than one that renumbers.
+        p class="muted" {
+            "Use ▲/▼ to rearrange. Pieces are renumbered from 1 on every move, "
+            "so the numbers always follow the running order."
         }
         // ONE form for the whole table: every row contributes a hidden `order`
         // value (the sequence as rendered), and each ▲/▼ is a submit button
@@ -399,7 +384,7 @@ async fn collection_detail_page(
         // added or removed a piece it is no longer a permutation of the live
         // set, and the domain's reorder refuses it.
         form method="post" action=(format!("{items_base}/reorder")) {
-            @if is_program { (layout::csrf_field(&token)) }
+            (layout::csrf_field(&token))
             table {
                 thead { tr { th { "#" } th { "Piece" } th { "Order" } th {} } }
                 tbody {
@@ -416,18 +401,14 @@ async fn collection_detail_page(
                                 }
                             }
                             td {
-                                @if is_program {
-                                    input type="hidden" name="order" value=(view.item.id);
-                                    @if pos > 0 {
-                                        button type="submit" name="move"
-                                               value=(format!("up:{}", view.item.id)) { "▲" }
-                                    }
-                                    @if pos + 1 < items.len() {
-                                        button type="submit" name="move"
-                                               value=(format!("down:{}", view.item.id)) { "▼" }
-                                    }
-                                } @else {
-                                    span class="muted" { "set below" }
+                                input type="hidden" name="order" value=(view.item.id);
+                                @if pos > 0 {
+                                    button type="submit" name="move"
+                                           value=(format!("up:{}", view.item.id)) { "▲" }
+                                }
+                                @if pos + 1 < items.len() {
+                                    button type="submit" name="move"
+                                           value=(format!("down:{}", view.item.id)) { "▼" }
                                 }
                             }
                             td {
@@ -441,27 +422,6 @@ async fn collection_detail_page(
             }
         }
         @if items.is_empty() { p class="muted" { "No pieces yet." } }
-
-        @if !is_program && !items.is_empty() {
-            p class="muted" { "Set a piece number:" }
-            @for view in &items {
-                form class="inline" method="post"
-                     action=(format!("{items_base}/{}/number", view.item.id)) {
-                    (layout::csrf_field(&token))
-                    span {
-                        @if view.arrangement_removed {
-                            (view.arrangement_slug)
-                        } @else {
-                            (view.arrangement_title)
-                        }
-                        " "
-                    }
-                    input type="number" name="index" min="1" value=(view.item.index);
-                    button type="submit" { "Set number" }
-                }
-                br;
-            }
-        }
 
         // Removing a piece is its own form: it must not ride the reorder form's
         // submit, and a urlencoded POST carries its CSRF token in the body.
@@ -1030,78 +990,6 @@ async fn reorder_items(
                 &ctx,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Could not save the new order.",
-            )
-        }
-    }
-}
-
-/// Set one piece's number directly, without touching any other piece.
-///
-/// This is the ordering control for a **standing** collection: its numbers are
-/// the handles musicians call out during a performance, so the reorder path
-/// (which renumbers 1..n) would invalidate the whole book to move one piece.
-/// Programs use the arrows instead.
-async fn set_item_number(
-    State(state): State<AppState>,
-    auth: Option<AuthSession>,
-    Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
-    RequestId(request_id): RequestId,
-    Form(pairs): Form<Vec<(String, String)>>,
-) -> Response {
-    let (ctx, _) = match enter_collection(&state, auth, org_id, collection_id).await {
-        Ok(pair) => pair,
-        Err(response) => return response,
-    };
-    if let Err(response) = require_found(
-        scoped_item(&state, collection_id, item_id).await,
-        &ctx,
-        Section::Collections,
-        "Piece not found in this collection.",
-    ) {
-        return response;
-    }
-    let Some(index) = field(&pairs, "index")
-        .map(str::trim)
-        .and_then(|raw| raw.parse::<i32>().ok())
-        .filter(|n| *n >= 1)
-    else {
-        return error_page(
-            &ctx,
-            StatusCode::BAD_REQUEST,
-            "The piece number must be a positive whole number.",
-        );
-    };
-
-    match collection_item::update_index(&state.db, item_id, index).await {
-        Ok(Some(_)) => {
-            audit(
-                &state.db,
-                &audit_ctx(&ctx, request_id),
-                "collection_item.update_index",
-                "collection_item",
-                Some(item_id),
-                serde_json::json!({ "collectionId": collection_id, "index": index }),
-            )
-            .await;
-            Redirect::to(&detail_url(org_id, collection_id)).into_response()
-        }
-        Ok(None) => error_page(
-            &ctx,
-            StatusCode::NOT_FOUND,
-            "Piece not found in this collection.",
-        ),
-        Err(collection_item::CollectionItemError::DuplicateIndex) => error_page(
-            &ctx,
-            StatusCode::CONFLICT,
-            "Another piece already holds that number — give that one a different \
-             number first.",
-        ),
-        Err(error) => {
-            tracing::error!(%error, "failed to set a piece number");
-            error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not set the piece number.",
             )
         }
     }
