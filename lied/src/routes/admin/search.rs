@@ -15,25 +15,31 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use maud::html;
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::extractors::AuthSession;
 use crate::domain::{arrangement, instrument, tag};
 use crate::listing::SortDirection;
 use crate::routes::admin::console::{self, Section};
+use crate::routes::admin::members::{field, multi};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/orgs/:org_id/search", get(search_page))
 }
 
-/// The search form, straight off the query string. Every field is a `String`
-/// so a half-typed number renders back into the form instead of 400-ing the
-/// page the user is still filling in — the console validates leniently and
-/// tells them, where `/v1` rejects.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+/// The search form, read off the query string as ordered pairs.
+///
+/// Not `Query<SearchForm>` with a `Vec<String>` field: `serde_urlencoded` has no
+/// sequence support, so a repeated `tag=` — which is exactly what a
+/// `<select multiple>` submits — makes the whole extractor fail with a 400
+/// before any handler code runs. The same reason `members.rs` reads its
+/// instrument multi-selects as pairs; those helpers are reused here.
+///
+/// Every field stays a `String` so a half-typed number renders back into the
+/// form instead of 400-ing the page the user is still filling in: the console
+/// validates leniently and says what it ignored, where `/v1` rejects.
+#[derive(Debug, Default)]
 struct SearchForm {
     q: String,
     status: String,
@@ -43,6 +49,22 @@ struct SearchForm {
     tag: Vec<String>,
     instrument_id: String,
     sort: String,
+}
+
+impl SearchForm {
+    fn from_pairs(pairs: &[(String, String)]) -> Self {
+        let one = |key: &str| field(pairs, key).unwrap_or_default().to_string();
+        Self {
+            q: one("q"),
+            status: one("status"),
+            difficulty_min: one("difficulty_min"),
+            difficulty_max: one("difficulty_max"),
+            duration_max_minutes: one("duration_max_minutes"),
+            tag: multi(pairs, "tag"),
+            instrument_id: one("instrument_id"),
+            sort: one("sort"),
+        }
+    }
 }
 
 impl SearchForm {
@@ -90,12 +112,32 @@ fn parse_number<T: std::str::FromStr>(
     }
 }
 
+/// Parse an id facet, complaining rather than dropping it. These arrive from
+/// `<select>`s, so a bad value means a hand-edited URL — which is exactly when
+/// being told beats being quietly ignored.
+fn parse_id(raw: &str, field: &'static str, complaints: &mut Vec<Complaint>) -> Option<Uuid> {
+    match Uuid::parse_str(raw.trim()) {
+        Ok(id) => Some(id),
+        Err(_) => {
+            complaints.push(Complaint {
+                field,
+                message: format!(
+                    "'{}' is not a valid id — that filter was ignored.",
+                    raw.trim()
+                ),
+            });
+            None
+        }
+    }
+}
+
 async fn search_page(
     State(state): State<AppState>,
     auth: Option<AuthSession>,
     Path(org_id): Path<Uuid>,
-    Query(form): Query<SearchForm>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    let form = SearchForm::from_pairs(&pairs);
     let ctx = match console::enter(&state, auth, org_id).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
@@ -125,7 +167,7 @@ async fn search_page(
         .tag
         .iter()
         .filter(|value| !value.is_empty())
-        .filter_map(|value| Uuid::parse_str(value).ok())
+        .filter_map(|value| parse_id(value, "Tags", &mut complaints))
         .collect();
     let duration_max_seconds = parse_number::<i32>(
         &form.duration_max_minutes,
@@ -153,7 +195,9 @@ async fn search_page(
         duration_min_seconds: None,
         duration_max_seconds,
         tag_ids,
-        instrument_id: Uuid::parse_str(form.instrument_id.trim()).ok(),
+        instrument_id: Some(form.instrument_id.trim())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| parse_id(value, "Instrument", &mut complaints)),
     };
 
     let has_query = search.q.is_some();
