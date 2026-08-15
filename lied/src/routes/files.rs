@@ -141,6 +141,10 @@ fn upload_error_to_app_error(err: file_service::UploadError) -> AppError {
         E::UnsupportedMime(mime) => {
             AppError::UnsupportedMediaType(format!("mime type '{mime}' is not a stored format"))
         }
+        // A corrupt stored row, not a client error: 500, not 415.
+        E::StoredMimeUnknown(mime) => AppError::Internal(anyhow::anyhow!(
+            "stored file has an unrecognized mime type '{mime}'"
+        )),
         E::EmptyName => AppError::Validation(field_report("file", "missing filename")),
         E::FormatMismatch { expected } => AppError::Conflict(format!(
             "a replacement must keep the original's format {expected}; upload a new file instead"
@@ -221,7 +225,7 @@ async fn do_upload(
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let (created, bytes) = file_service::store_upload(
+        let stored = file_service::store_upload(
             &state,
             arr_id,
             voice_id,
@@ -242,11 +246,16 @@ async fn do_upload(
             },
             "file.create",
             "file",
-            Some(created.id),
-            serde_json::json!({ "name": created.name, "format": created.format, "bytes": bytes }),
+            Some(stored.file.id),
+            serde_json::json!({
+                "name": stored.file.name,
+                "format": stored.file.format,
+                "key": stored.key,
+                "bytes": stored.bytes,
+            }),
         )
         .await;
-        return Ok((StatusCode::CREATED, Json(FileResponse::from(created))).into_response());
+        return Ok((StatusCode::CREATED, Json(FileResponse::from(stored.file))).into_response());
     }
 
     Err(AppError::Validation(field_report(
@@ -649,7 +658,7 @@ async fn do_replace(
             .map(str::to_string)
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        let (new, bytes) =
+        let stored =
             file_service::store_replacement(&state, &old, &new_mime, Some(auth.user.id), field)
                 .await
                 .map_err(upload_error_to_app_error)?;
@@ -663,12 +672,17 @@ async fn do_replace(
             },
             "file.replace",
             "file",
-            Some(new.id),
-            serde_json::json!({ "replaced": old.id, "name": old.name, "bytes": bytes }),
+            Some(stored.file.id),
+            serde_json::json!({
+                "replaced": old.id,
+                "name": old.name,
+                "key": stored.key,
+                "bytes": stored.bytes,
+            }),
         )
         .await;
 
-        return Ok((StatusCode::OK, Json(FileResponse::from(new))).into_response());
+        return Ok((StatusCode::OK, Json(FileResponse::from(stored.file))).into_response());
     }
 
     Err(AppError::Validation(field_report(
@@ -881,4 +895,63 @@ async fn delete_voice_file(
         file_id,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_error_to_app_error;
+    use crate::file_service::UploadError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    fn status_of(err: UploadError) -> StatusCode {
+        upload_error_to_app_error(err).into_response().status()
+    }
+
+    #[test]
+    fn a_bad_upload_blames_the_client_but_a_corrupt_stored_row_does_not() {
+        // The client sent a media type we don't store: their problem, 415.
+        assert_eq!(
+            status_of(UploadError::UnsupportedMime("text/plain".to_string())),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        // The *stored* row carries a mime that isn't in the lookup table — it
+        // passed that same table on write, so this is our data bug. Reporting
+        // 415 would blame the caller for a media type they never sent.
+        assert_eq!(
+            status_of(UploadError::StoredMimeUnknown(
+                "application/whatever".to_string()
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn the_remaining_store_failures_keep_their_documented_statuses() {
+        assert_eq!(
+            status_of(UploadError::EmptyName),
+            StatusCode::BAD_REQUEST,
+            "a nameless part is a malformed request"
+        );
+        assert_eq!(
+            status_of(UploadError::FormatMismatch {
+                expected: "pdf (.pdf)".to_string()
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(status_of(UploadError::Duplicate), StatusCode::CONFLICT);
+        assert_eq!(status_of(UploadError::NotFound), StatusCode::NOT_FOUND);
+        assert_eq!(
+            status_of(UploadError::ReplaceTargetGone),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_of(UploadError::TooLarge { limit: 1024 }),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            status_of(UploadError::Storage("connection reset".to_string())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 }

@@ -50,6 +50,10 @@ struct Ctx {
 
 impl Ctx {
     async fn new(max_upload_bytes: u64) -> Self {
+        Self::with_page_size(max_upload_bytes, 200).await
+    }
+
+    async fn with_page_size(max_upload_bytes: u64, max_page_size: u32) -> Self {
         let pg = Postgres::default()
             .with_tag("16-alpine")
             .start()
@@ -73,7 +77,10 @@ impl Ctx {
         let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
         let endpoint = format!("http://127.0.0.1:{minio_port}");
 
-        let state = test_state(pool.clone(), test_config(endpoint, max_upload_bytes));
+        let state = test_state(
+            pool.clone(),
+            test_config(endpoint, max_upload_bytes, max_page_size),
+        );
         state
             .s3
             .create_bucket()
@@ -93,7 +100,7 @@ impl Ctx {
     }
 }
 
-fn test_config(s3_endpoint: String, max_upload_bytes: u64) -> AppConfig {
+fn test_config(s3_endpoint: String, max_upload_bytes: u64, max_page_size: u32) -> AppConfig {
     AppConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url: Secret::from("postgres://unused/unused".to_string()),
@@ -108,7 +115,7 @@ fn test_config(s3_endpoint: String, max_upload_bytes: u64) -> AppConfig {
         max_request_bytes: 256 * 1024,
         max_files_per_voice: 50,
         max_arrangements_per_org: None,
-        max_page_size: 200,
+        max_page_size,
         default_page_size: 50,
         ratelimit_auth_per_min: 120,
         ratelimit_anon_per_min: 20,
@@ -448,6 +455,38 @@ async fn audit_count(pool: &PgPool, action: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+/// The payload of the most recent audit row for `action`.
+async fn latest_audit_payload(pool: &PgPool, action: &str) -> serde_json::Value {
+    sqlx::query_scalar(
+        r#"SELECT payload FROM audit_log WHERE action = $1 ORDER BY at DESC LIMIT 1"#,
+    )
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Upload one file through the console, returning the page HTML afterwards.
+async fn upload(app: &axum::Router, browser: &Browser, files_url: &str, filename: &str) {
+    let (_, html) = load_page(app, browser, files_url).await;
+    let token = upload_csrf(&html);
+    let response = app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}?csrf={token}"),
+            filename,
+            "application/pdf",
+            PDF,
+        ))
+        .await
+        .expect("upload runs");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SEE_OTHER,
+        "upload of {filename} should succeed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -827,11 +866,11 @@ async fn unsupported_format_and_oversize_uploads_render_friendly_errors() {
     // the rollback hard-deletes the row it optimistically created.
     let (live, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
     assert!(live.is_empty(), "no live row from a failed upload");
+    let (phantoms, _) = file::list_deleted(&ctx.pool, fx.arr_id, None, 50, 0)
+        .await
+        .unwrap();
     assert!(
-        file::list_deleted(&ctx.pool, fx.arr_id, None)
-            .await
-            .unwrap()
-            .is_empty(),
+        phantoms.is_empty(),
         "no restorable phantom row from a failed upload"
     );
     let key = file::derived_key(&fx.org_slug, &fx.arr_slug, None, "score", "pdf");
@@ -841,4 +880,394 @@ async fn unsupported_format_and_oversize_uploads_render_friendly_errors() {
             .is_err(),
         "no object written for an over-limit upload"
     );
+}
+
+#[tokio::test]
+async fn writes_record_the_object_key_they_touched_in_the_audit_log() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+
+    upload(&ctx.app, &browser, &files_url, "score.pdf").await;
+
+    // The audit row must name the object the write landed on: when the DB and
+    // MinIO disagree later, this is the field that resolves which is stale.
+    let expected_key = file::derived_key(&fx.org_slug, &fx.arr_slug, None, "score", "pdf");
+    let payload = latest_audit_payload(&ctx.pool, "file.create").await;
+    assert_eq!(
+        payload["key"].as_str(),
+        Some(expected_key.as_str()),
+        "file.create payload must carry the storage key, got {payload}"
+    );
+    assert_eq!(payload["bytes"].as_u64(), Some(PDF.len() as u64));
+
+    // …and the same for a replace, which writes to that same key.
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    let token = upload_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}/{}/replace?csrf={token}", files[0].id),
+            "score.pdf",
+            "application/pdf",
+            PDF_V2,
+        ))
+        .await
+        .expect("replace runs");
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let payload = latest_audit_payload(&ctx.pool, "file.replace").await;
+    assert_eq!(payload["key"].as_str(), Some(expected_key.as_str()));
+    assert_eq!(
+        payload["replaced"].as_str(),
+        Some(files[0].id.to_string()).as_deref()
+    );
+}
+
+#[tokio::test]
+async fn a_list_longer_than_the_configured_page_says_so_instead_of_truncating_silently() {
+    // The console pages at the operator's `LIED_MAX_PAGE_SIZE`, not a literal.
+    let ctx = Ctx::with_page_size(200 * 1024 * 1024, 2).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+
+    for name in ["a.pdf", "b.pdf", "c.pdf"] {
+        upload(&ctx.app, &browser, &files_url, name).await;
+    }
+
+    let (status, html) = load_page(&ctx.app, &browser, &files_url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("Showing the first 2 of 3 files"),
+        "an over-long list must disclose the truncation, got: {html}"
+    );
+
+    // Raising the ceiling shows everything — i.e. the cap really is the config
+    // value and not a hard-coded number that happens to match.
+    let ctx = Ctx::with_page_size(200 * 1024 * 1024, 50).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+    for name in ["a.pdf", "b.pdf", "c.pdf"] {
+        upload(&ctx.app, &browser, &files_url, name).await;
+    }
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    assert!(
+        !html.contains("Showing the first"),
+        "a list within the page size shows no truncation notice"
+    );
+}
+
+#[tokio::test]
+async fn the_deleted_versions_list_is_paginated_and_scoped_to_its_own_voice() {
+    let ctx = Ctx::with_page_size(200 * 1024 * 1024, 2).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let score_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+    let voice_url = format!(
+        "/admin/orgs/{}/arrangements/{}/voices/{}/files",
+        fx.org_id, fx.arr_id, fx.voice_id
+    );
+
+    // Three deleted score files (the set that grows without bound in real use,
+    // one row per replace) and one deleted voice file.
+    for name in ["a.pdf", "b.pdf", "c.pdf"] {
+        upload(&ctx.app, &browser, &score_url, name).await;
+    }
+    upload(&ctx.app, &browser, &voice_url, "part.pdf").await;
+
+    let (score_files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    let (voice_files, _) = file::list(&ctx.pool, fx.arr_id, Some(fx.voice_id), 50, 0)
+        .await
+        .unwrap();
+    for f in score_files.iter().chain(voice_files.iter()) {
+        let (_, html) = load_page(&ctx.app, &browser, &score_url).await;
+        let token = form_csrf(&html);
+        let base = if f.voice_id.is_some() {
+            &voice_url
+        } else {
+            &score_url
+        };
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(browser.post_form(
+                &format!("{base}/{}/delete", f.id),
+                format!("csrf_token={token}"),
+            ))
+            .await
+            .expect("delete runs");
+        assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    }
+
+    let (rows, total) = file::list_deleted(&ctx.pool, fx.arr_id, None, 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "the query respects its limit");
+    assert_eq!(total, 3, "…and reports the full count behind it");
+    assert!(
+        rows.iter().all(|f| f.voice_id.is_none()),
+        "a voice's deleted files must not leak into the score list"
+    );
+
+    let (voice_rows, voice_total) =
+        file::list_deleted(&ctx.pool, fx.arr_id, Some(fx.voice_id), 2, 0)
+            .await
+            .unwrap();
+    assert_eq!(voice_total, 1, "the voice list holds only its own file");
+    assert_eq!(voice_rows[0].name, "part");
+
+    let (_, html) = load_page(&ctx.app, &browser, &score_url).await;
+    assert!(
+        html.contains("Showing the 2 most recently deleted of 3"),
+        "the restore list discloses its own truncation, got: {html}"
+    );
+}
+
+#[tokio::test]
+async fn a_file_id_from_another_org_is_not_found() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+
+    // A second org, with its own arrangement and file, that our archivist has
+    // no membership in.
+    let other_org_id = Uuid::now_v7();
+    let other_slug = organization::slugify("Rival Orchestra");
+    organization::create(
+        &ctx.state.db,
+        other_org_id,
+        "Rival Orchestra",
+        &other_slug,
+        None,
+    )
+    .await
+    .expect("other org");
+    let other_arr = Uuid::now_v7();
+    arrangement::create(
+        &ctx.state.db,
+        other_arr,
+        other_org_id,
+        "secret",
+        arrangement::ArrangementFields {
+            title: "Secret",
+            work_id: None,
+            instrumentation: None,
+            arranger: None,
+            publisher: None,
+            purchase_date: None,
+            license_notes: None,
+            copy_count_allowed: None,
+            status: "active",
+            duration_seconds: None,
+            difficulty: None,
+            difficulty_ratings: None,
+            difficulty_notes: None,
+        },
+        None,
+    )
+    .await
+    .expect("other arrangement");
+    let foreign_file = file::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        file::NewFile {
+            arrangement_id: other_arr,
+            voice_id: None,
+            name: "secret",
+            format: "pdf",
+            mime_type: "application/pdf",
+            derived_from_file_id: None,
+            conversion_quality: None,
+            created_by: None,
+        },
+    )
+    .await
+    .expect("foreign file");
+
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+    // Our own (empty) screen renders no per-row form, so take the session's
+    // token from the cookie: these requests must fail on scoping, not CSRF.
+    let form_token = session_csrf(&ctx.app, &browser, &files_url).await;
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let upload_token = upload_csrf(&html);
+
+    // A file id is only ever reachable through its own org's arrangement: the
+    // nested-resource IDOR class this repo has been bitten by before.
+    for (uri, body) in [
+        (format!("{files_url}/{}/delete", foreign_file.id), Some(())),
+        (
+            format!("{files_url}/{}/undelete", foreign_file.id),
+            Some(()),
+        ),
+    ] {
+        let _ = body;
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(browser.post_form(&uri, format!("csrf_token={form_token}")))
+            .await
+            .expect("request runs");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{uri} must not reach another org's file"
+        );
+    }
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!(
+                "{files_url}/{}/replace?csrf={upload_token}",
+                foreign_file.id
+            ),
+            "score.pdf",
+            "application/pdf",
+            PDF,
+        ))
+        .await
+        .expect("replace runs");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "replace must not reach another org's file"
+    );
+
+    // The foreign arrangement is equally unreachable through our org's URL.
+    let (status, _) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/arrangements/{other_arr}/files", fx.org_id),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_replacement_of_a_different_format_is_refused() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+
+    upload(&ctx.app, &browser, &files_url, "score.pdf").await;
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    let original = files[0].clone();
+
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = upload_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}/{}/replace?csrf={token}", original.id),
+            "score.png",
+            "image/png",
+            b"\x89PNG\r\n\x1a\n",
+        ))
+        .await
+        .expect("replace runs");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a replacement must keep the original's format"
+    );
+    let html = body_text(response).await;
+    assert!(html.contains("format"), "the page explains why: {html}");
+
+    // Nothing changed: same live row, and the PDF object still holds PDF bytes.
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].id, original.id,
+        "the rejected replace kept the row"
+    );
+    let key = file::derived_key(&fx.org_slug, &fx.arr_slug, None, "score", "pdf");
+    let head = storage::head_object(&ctx.state.s3, BUCKET, &key)
+        .await
+        .expect("the original object is untouched");
+    assert_eq!(head.size, PDF.len() as u64);
+}
+
+#[tokio::test]
+async fn restoring_a_file_whose_storage_slot_was_taken_is_refused() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!("/admin/orgs/{}/arrangements/{}/files", fx.org_id, fx.arr_id);
+
+    // Upload, then replace: the original row is soft-deleted and a newer row
+    // now owns the derived key (whose object holds the NEW bytes).
+    upload(&ctx.app, &browser, &files_url, "score.pdf").await;
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    let original = files[0].clone();
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = upload_csrf(&html);
+    ctx.app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}/{}/replace?csrf={token}", original.id),
+            "score.pdf",
+            "application/pdf",
+            PDF_V2,
+        ))
+        .await
+        .expect("replace runs");
+
+    // Free the slot so the unique index alone would allow the restore…
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    let replacement = files[0].clone();
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = form_csrf(&html);
+    ctx.app
+        .clone()
+        .oneshot(browser.post_form(
+            &format!("{files_url}/{}/delete", replacement.id),
+            format!("csrf_token={token}"),
+        ))
+        .await
+        .expect("delete runs");
+
+    // …restoring the ORIGINAL would then serve the replacement's bytes under
+    // the original's identity. Refuse it.
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = form_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_form(
+            &format!("{files_url}/{}/undelete", original.id),
+            format!("csrf_token={token}"),
+        ))
+        .await
+        .expect("undelete runs");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::CONFLICT,
+        "restoring a superseded file must be refused, not silently serve the wrong bytes"
+    );
+    let (live, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    assert!(live.is_empty(), "the refused restore left the row deleted");
+
+    // The newest row in the slot is still restorable — the guard is about
+    // "something newer exists", not a blanket ban.
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = form_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_form(
+            &format!("{files_url}/{}/undelete", replacement.id),
+            format!("csrf_token={token}"),
+        ))
+        .await
+        .expect("undelete runs");
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let (live, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, replacement.id);
 }

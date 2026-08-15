@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE file SET deleted_at = NULL, updated_at = now()\n        WHERE id = $1\n          AND deleted_at IS NOT NULL\n          AND NOT EXISTS (\n              SELECT 1 FROM file newer\n              WHERE newer.arrangement_id = (SELECT arrangement_id FROM file WHERE id = $1)\n                AND newer.voice_id IS NOT DISTINCT FROM (SELECT voice_id FROM file WHERE id = $1)\n                AND newer.name = (SELECT name FROM file WHERE id = $1)\n                AND newer.format = (SELECT format FROM file WHERE id = $1)\n                AND newer.id <> $1\n                AND newer.created_at > (SELECT created_at FROM file WHERE id = $1)\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c36f57dcd544c007d2478c163f0fb6aee9c3a2528c4cd90c10cf2cd19a6902a0"
+}

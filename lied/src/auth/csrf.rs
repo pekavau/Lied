@@ -29,6 +29,11 @@ pub const CSRF_HEADER_NAME: &str = "hx-csrf";
 /// Hidden form-field name carrying the token on server-rendered admin `<form>`
 /// submits (the JS-free double-submit half).
 pub const CSRF_FORM_FIELD: &str = "csrf_token";
+/// Query-parameter name carrying the token on `multipart/*` submits, whose body
+/// can't hold a form field. Public because the request-logging layer redacts it
+/// (see `crate::routes::sanitized_uri`) — a token in a URL must never be
+/// persisted to logs.
+pub const CSRF_QUERY_PARAM: &str = "csrf";
 
 /// Generate a fresh CSRF token (32 random bytes, base64url, no padding).
 fn generate_token() -> String {
@@ -133,21 +138,25 @@ pub async fn csrf_middleware(
             return csrf_rejection("CSRF token mismatch or missing csrf_token field");
         }
 
-        // Non-urlencoded body (the multipart file-upload/replace forms, issue
-        // #32): the body IS the streamed file, so the token can't live in a
-        // urlencoded field and the JS-free UI can't set `HX-CSRF`. Accept a
-        // matching `csrf` query param instead — reading it needs no body
-        // buffering, so the streaming path is untouched. This branch is
-        // deliberately reached ONLY for non-urlencoded requests, so ordinary
-        // admin forms never put the token in a URL.
-        let query_ok = request
-            .uri()
-            .query()
-            .and_then(|q| form_field(q.as_bytes(), "csrf"))
-            .as_deref()
-            == Some(expected.as_str());
-        if query_ok {
-            return next.run(request).await;
+        // Multipart body (the file-upload/replace forms, issue #32): the body
+        // IS the streamed file, so the token can't live in a urlencoded field
+        // and the JS-free UI can't set `HX-CSRF`. Accept a matching `csrf`
+        // query param instead — reading it needs no body buffering, so the
+        // streaming path is untouched. Scoped to `multipart/*` specifically
+        // (not merely "not urlencoded"): a future JSON-bodied admin endpoint
+        // must not silently inherit the URL-borne token, which is the weaker
+        // carrier (it lands in history and, but for the redaction in
+        // `routes::sanitized_uri`, in logs).
+        if is_multipart(&request) {
+            let query_ok = request
+                .uri()
+                .query()
+                .and_then(|q| form_field(q.as_bytes(), CSRF_QUERY_PARAM))
+                .as_deref()
+                == Some(expected.as_str());
+            if query_ok {
+                return next.run(request).await;
+            }
         }
 
         return csrf_rejection(
@@ -190,6 +199,17 @@ fn request_carries_csrf_cookie(request: &Request) -> bool {
 
 /// Whether the request body is an `application/x-www-form-urlencoded` form
 /// (the only body shape the CSRF middleware buffers to read its token field).
+/// Whether the request carries a `multipart/*` body — the only body shape
+/// allowed to present its CSRF token as a query parameter (see the middleware).
+fn is_multipart(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.trim_start().starts_with("multipart/"))
+        .unwrap_or(false)
+}
+
 fn is_form_urlencoded(request: &Request) -> bool {
     request
         .headers()
@@ -298,5 +318,39 @@ mod tests {
         let header = csrf_cookie_header("abc", false);
         let value = header.to_str().unwrap();
         assert!(!value.contains("Secure"));
+    }
+
+    fn request_with_content_type(content_type: Option<&str>) -> Request {
+        let mut builder = Request::builder().method("POST").uri("/admin/x");
+        if let Some(ct) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, ct);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn only_multipart_bodies_may_present_the_token_in_the_query() {
+        // The query-token carrier exists solely for streamed multipart bodies,
+        // which can hold neither a form field nor (JS-free) a header.
+        assert!(is_multipart(&request_with_content_type(Some(
+            "multipart/form-data; boundary=abc"
+        ))));
+        assert!(is_multipart(&request_with_content_type(Some(
+            "multipart/mixed"
+        ))));
+
+        // Everything else must fall through to the body/header carriers, so a
+        // future JSON admin endpoint can't inherit the URL-borne token.
+        assert!(!is_multipart(&request_with_content_type(Some(
+            "application/json"
+        ))));
+        assert!(!is_multipart(&request_with_content_type(Some(
+            "application/x-www-form-urlencoded"
+        ))));
+        assert!(!is_multipart(&request_with_content_type(None)));
+        // Not fooled by a type that merely mentions multipart later on.
+        assert!(!is_multipart(&request_with_content_type(Some(
+            "text/plain; x=multipart/form-data"
+        ))));
     }
 }

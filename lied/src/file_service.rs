@@ -14,11 +14,28 @@ use crate::domain::file;
 use crate::state::AppState;
 use crate::storage::{self, ChunkSource};
 
+/// A stored file: the row, the byte count that reached object storage, and the
+/// derived object key. The key is returned (not just used internally) so every
+/// caller can record it in the audit payload — when the DB and MinIO disagree,
+/// "which object did this write touch" is the field that resolves it.
+#[derive(Debug)]
+pub struct Stored {
+    pub file: file::File,
+    pub bytes: u64,
+    pub key: String,
+}
+
 /// Why a store operation failed, independent of the HTTP surface.
 #[derive(thiserror::Error, Debug)]
 pub enum UploadError {
     #[error("mime type '{0}' is not a stored format")]
     UnsupportedMime(String),
+    /// The *stored* file's `mime_type` is not in the lookup table — a
+    /// corrupt-row bug on our side, not a bad request. Kept distinct from
+    /// [`UploadError::UnsupportedMime`] so it surfaces as a 500 rather than
+    /// blaming the client for a media type they never sent.
+    #[error("stored file has an unrecognized mime type '{0}'")]
+    StoredMimeUnknown(String),
     #[error("the file needs a name")]
     EmptyName,
     #[error("a replacement must keep the original's format ({expected})")]
@@ -43,7 +60,7 @@ fn map_file_error(err: file::FileError) -> UploadError {
         file::FileError::ReplaceTargetGone | file::FileError::Superseded => {
             UploadError::ReplaceTargetGone
         }
-        file::FileError::UnsupportedMime => UploadError::UnsupportedMime("stored file".to_string()),
+        file::FileError::UnsupportedMime => UploadError::StoredMimeUnknown("unknown".to_string()),
         file::FileError::Database(e) => UploadError::Db(e),
     }
 }
@@ -58,7 +75,6 @@ fn map_storage_error(err: storage::StorageError) -> UploadError {
 /// Store an uploaded file: validate the mime/name, insert the row (cheap
 /// duplicate detection), then stream the bytes to MinIO. On a streaming
 /// failure the never-written row is **hard-deleted** so no phantom remains.
-/// Returns the created row and the byte count.
 pub async fn store_upload(
     state: &AppState,
     arrangement_id: Uuid,
@@ -67,7 +83,7 @@ pub async fn store_upload(
     mime: &str,
     created_by: Option<Uuid>,
     chunk: impl ChunkSource,
-) -> Result<(file::File, u64), UploadError> {
+) -> Result<Stored, UploadError> {
     let (format, ext) = file::format_and_ext_for_mime(mime)
         .ok_or_else(|| UploadError::UnsupportedMime(mime.to_string()))?;
     let name = file::name_stem(file_name).ok_or(UploadError::EmptyName)?;
@@ -110,11 +126,25 @@ pub async fn store_upload(
     )
     .await
     {
-        Ok(bytes) => Ok((created, bytes)),
+        Ok(bytes) => Ok(Stored {
+            file: created,
+            bytes,
+            key,
+        }),
         Err(error) => {
             // The row references an object that was never written — remove it
-            // entirely (not soft-delete) so it can't be listed/restored.
-            let _ = file::hard_delete(&state.db, id).await;
+            // entirely (not soft-delete) so it can't be listed/restored. If the
+            // compensating delete ALSO fails we have a phantom row pointing at
+            // nothing, which is exactly the state an operator must be able to
+            // find later — never swallow it.
+            if let Err(rollback_error) = file::hard_delete(&state.db, id).await {
+                tracing::error!(
+                    %rollback_error,
+                    file_id = %id,
+                    key = %key,
+                    "failed to roll back the row for an upload that never stored its bytes"
+                );
+            }
             Err(map_storage_error(error))
         }
     }
@@ -132,9 +162,11 @@ pub async fn store_replacement(
     mime: &str,
     created_by: Option<Uuid>,
     chunk: impl ChunkSource,
-) -> Result<(file::File, u64), UploadError> {
+) -> Result<Stored, UploadError> {
+    // An unrecognized mime on the STORED row is our data bug (it passed this
+    // same table on write), not a client error — see `StoredMimeUnknown`.
     let (old_format, old_ext) = file::format_and_ext_for_mime(&old.mime_type)
-        .ok_or_else(|| UploadError::UnsupportedMime(old.mime_type.clone()))?;
+        .ok_or_else(|| UploadError::StoredMimeUnknown(old.mime_type.clone()))?;
     let new_pair = file::format_and_ext_for_mime(mime)
         .ok_or_else(|| UploadError::UnsupportedMime(mime.to_string()))?;
     if new_pair != (old_format, old_ext) {
@@ -184,10 +216,24 @@ pub async fn store_replacement(
     )
     .await
     {
-        Ok(bytes) => Ok((created, bytes)),
+        Ok(bytes) => Ok(Stored {
+            file: created,
+            bytes,
+            key,
+        }),
         Err(error) => {
-            // Undo the row swap: drop the new row, re-live the old one.
-            let _ = file::restore_replaced(&state.db, old.id, new_id).await;
+            // Undo the row swap: drop the new row, re-live the old one. A
+            // failure here leaves the file soft-deleted with its bytes intact
+            // and no live row — recoverable, but only if it's visible.
+            if let Err(rollback_error) = file::restore_replaced(&state.db, old.id, new_id).await {
+                tracing::error!(
+                    %rollback_error,
+                    old_file_id = %old.id,
+                    new_file_id = %new_id,
+                    key = %key,
+                    "failed to undo a replace whose bytes never stored; the old file is left soft-deleted"
+                );
+            }
             Err(map_storage_error(error))
         }
     }

@@ -20,6 +20,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::stream::StreamExt;
 use maud::html;
 use uuid::Uuid;
 
@@ -179,7 +180,12 @@ async fn files_page(
     };
     let can_edit = ctx.can_edit_arrangements();
 
-    let (files, _total) = match file::list(&state.db, arr_id, voice_id, 200, 0).await {
+    // One screenful is the operator-configured page ceiling (CLAUDE.md: every
+    // limit is documented and configurable — never a literal here). The total
+    // is kept so a list longer than the page says so instead of silently
+    // truncating.
+    let page_size = i64::from(state.config.max_page_size);
+    let (files, total) = match file::list(&state.db, arr_id, voice_id, page_size, 0).await {
         Ok(result) => result,
         Err(error) => {
             tracing::error!(%error, "failed to list files");
@@ -190,12 +196,14 @@ async fn files_page(
             );
         }
     };
-    let deleted = if can_edit {
-        file::list_deleted(&state.db, arr_id, voice_id)
+    let (deleted, deleted_total) = if can_edit {
+        // Bounded by the same ceiling: a heavily-replaced file accumulates one
+        // soft-deleted row per replace, forever.
+        file::list_deleted(&state.db, arr_id, voice_id, page_size, 0)
             .await
             .unwrap_or_default()
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
     let sizes = collect_sizes(&state, arr_id, voice_id, &files).await;
 
@@ -252,6 +260,12 @@ async fn files_page(
             }
         }
         @if files.is_empty() { p class="muted" { "No files yet." } }
+        @if total > files.len() as i64 {
+            p class="muted" {
+                "Showing the first " (files.len()) " of " (total) " files "
+                "(the server's page limit)."
+            }
+        }
 
         @if can_edit {
             h2 { "Upload a file" }
@@ -267,6 +281,12 @@ async fn files_page(
 
             @if !deleted.is_empty() {
                 h2 { "Previous / deleted versions" }
+                @if deleted_total > deleted.len() as i64 {
+                    p class="muted" {
+                        "Showing the " (deleted.len()) " most recently deleted of "
+                        (deleted_total) "."
+                    }
+                }
                 table {
                     thead { tr { th { "Name" } th { "Format" } th { "Deleted" } th {} } }
                     tbody {
@@ -297,11 +317,21 @@ async fn files_page(
     Html(console::console_page(&ctx, Section::Arrangements, body).into_string()).into_response()
 }
 
+/// How many object HEADs a single file screen may have in flight. Bounded so a
+/// full page doesn't open a request per row against the object store at once;
+/// sizes are decoration, not the point of the screen.
+const SIZE_LOOKUP_CONCURRENCY: usize = 8;
+
+/// How long the whole size-lookup pass may take. Sizes are best-effort, so a
+/// slow or unreachable object store renders "?" instead of stalling the page.
+const SIZE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Best-effort object sizes for a file list. The path slugs are identical for
 /// every file (same arrangement/voice), so they're resolved once; each key is
 /// derived from the in-hand row (no per-file DB refetch), and the MinIO HEADs
-/// run concurrently. A file with no HEAD result is simply absent from the map
-/// (rendered "?").
+/// run concurrently but capped at [`SIZE_LOOKUP_CONCURRENCY`] and bounded by
+/// [`SIZE_LOOKUP_TIMEOUT`]. A file with no HEAD result is simply absent from
+/// the map (rendered "?").
 async fn collect_sizes(
     state: &AppState,
     arr_id: Uuid,
@@ -311,29 +341,45 @@ async fn collect_sizes(
     let Ok(Some(slugs)) = file::resolve_path_slugs(&state.db, arr_id, voice_id).await else {
         return std::collections::HashMap::new();
     };
-    let heads = files.iter().filter_map(|f| {
-        let (_format, ext) = file::format_and_ext_for_mime(&f.mime_type)?;
-        let key = file::derived_key(
-            &slugs.org_slug,
-            &slugs.arrangement_slug,
-            slugs.voice_slug.as_deref(),
-            &f.name,
-            ext,
-        );
-        let id = f.id;
-        Some(async move {
+    // Owned (id, key) pairs first: the lookup futures must not borrow `files`,
+    // or the resulting stream isn't `'static` enough for the router's handler
+    // bounds.
+    let keys: Vec<(Uuid, String)> = files
+        .iter()
+        .filter_map(|f| {
+            let (_format, ext) = file::format_and_ext_for_mime(&f.mime_type)?;
+            Some((
+                f.id,
+                file::derived_key(
+                    &slugs.org_slug,
+                    &slugs.arrangement_slug,
+                    slugs.voice_slug.as_deref(),
+                    &f.name,
+                    ext,
+                ),
+            ))
+        })
+        .collect();
+
+    let lookups = futures_util::stream::iter(keys)
+        .map(|(id, key)| async move {
             let size = storage::head_object(&state.s3, &state.config.s3_bucket, &key)
                 .await
                 .ok()
                 .map(|h| h.size);
             (id, size)
         })
-    });
-    futures_util::future::join_all(heads)
-        .await
-        .into_iter()
-        .filter_map(|(id, size)| size.map(|s| (id, s)))
-        .collect()
+        .buffer_unordered(SIZE_LOOKUP_CONCURRENCY)
+        .filter_map(|(id, size)| async move { size.map(|s| (id, s)) })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    match tokio::time::timeout(SIZE_LOOKUP_TIMEOUT, lookups).await {
+        Ok(sizes) => sizes,
+        Err(_) => {
+            tracing::warn!("object size lookup timed out; rendering the file list without sizes");
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 fn human_size(bytes: u64) -> String {
@@ -403,14 +449,19 @@ async fn do_upload(
         )
         .await
         {
-            Ok((created, bytes)) => {
+            Ok(stored) => {
                 audit(
                     &state.db,
                     &audit_ctx(&ctx, request_id),
                     "file.create",
                     "file",
-                    Some(created.id),
-                    serde_json::json!({ "name": created.name, "format": created.format, "bytes": bytes }),
+                    Some(stored.file.id),
+                    serde_json::json!({
+                        "name": stored.file.name,
+                        "format": stored.file.format,
+                        "key": stored.key,
+                        "bytes": stored.bytes,
+                    }),
                 )
                 .await;
                 Redirect::to(&target.base_url()).into_response()
@@ -429,6 +480,16 @@ fn upload_error_page(ctx: &ConsoleCtx, err: file_service::UploadError) -> Respon
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             format!("'{mime}' is not a stored format — use LilyPond, MusicXML, PDF, or an image."),
         ),
+        // Our stored row is wrong, not the operator's upload.
+        E::StoredMimeUnknown(mime) => {
+            tracing::error!(%mime, "stored file has an unrecognized mime type");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "This file's stored type is unrecognized, so it can't be replaced. \
+                 Please report this — the file's metadata needs fixing."
+                    .to_string(),
+            )
+        }
         E::EmptyName => (
             StatusCode::BAD_REQUEST,
             "The file needs a name.".to_string(),
@@ -522,14 +583,19 @@ async fn do_replace(
         )
         .await
         {
-            Ok((created, bytes)) => {
+            Ok(stored) => {
                 audit(
                     &state.db,
                     &audit_ctx(&ctx, request_id),
                     "file.replace",
                     "file",
-                    Some(created.id),
-                    serde_json::json!({ "name": old.name, "replaced": old.id, "bytes": bytes }),
+                    Some(stored.file.id),
+                    serde_json::json!({
+                        "name": old.name,
+                        "replaced": old.id,
+                        "key": stored.key,
+                        "bytes": stored.bytes,
+                    }),
                 )
                 .await;
                 Redirect::to(&target.base_url()).into_response()
