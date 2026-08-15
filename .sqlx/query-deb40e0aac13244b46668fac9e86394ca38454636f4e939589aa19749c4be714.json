@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT u.username as \"username!\"\n        FROM membership m\n        JOIN \"user\" u ON u.id = m.user_id\n        WHERE m.organization_id = $1\n        ORDER BY u.username ASC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "username!",
+        "type_info": {
+          "Custom": {
+            "name": "citext",
+            "kind": "Simple"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "deb40e0aac13244b46668fac9e86394ca38454636f4e939589aa19749c4be714"
+}

@@ -328,6 +328,11 @@ pub struct VoiceAssignment {
 
 /// Every live voice of `collection_item_id`'s arrangement with its assignment,
 /// ordered by voice name. Empty if the item is soft-deleted or absent.
+///
+/// **Deliberately unpaginated**, for the same reason the screen exists: "which
+/// voices are still unassigned" is only answerable over the whole set, and the
+/// bound is an arrangement's voice count — a large orchestral work is dozens of
+/// voices, and `LIED_MAX_FILES_PER_VOICE`-scale growth does not apply here.
 pub async fn voice_matrix_for_item(
     pool: &PgPool,
     collection_item_id: Uuid,

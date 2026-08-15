@@ -59,6 +59,10 @@ pub fn router() -> Router<AppState> {
             post(reorder_items),
         )
         .route(
+            "/orgs/:org_id/collections/:collection_id/items/:item_id/number",
+            post(set_item_number),
+        )
+        .route(
             "/orgs/:org_id/collections/:collection_id/items/:item_id/delete",
             post(delete_item),
         )
@@ -311,7 +315,24 @@ async fn collection_detail_page(
         Err(response) => return response,
     };
 
-    let items = match collection_item::list_for_collection(&state.db, collection_id).await {
+    let page_size = i64::from(state.config.max_page_size);
+    // Three independent loads — issue them together rather than in series (the
+    // pattern the #30 review established for the console's page loads).
+    let (items, removed_result, candidates_result) = tokio::join!(
+        collection_item::list_for_collection(&state.db, collection_id),
+        collection_item::list_deleted_for_collection(&state.db, collection_id, page_size, 0),
+        arrangement::list_for_org(
+            &state.db,
+            org_id,
+            page_size,
+            0,
+            "title",
+            SortDirection::Asc,
+            None,
+            None,
+        ),
+    );
+    let items = match items {
         Ok(items) => items,
         Err(error) => {
             tracing::error!(%error, "failed to list collection items");
@@ -322,28 +343,13 @@ async fn collection_detail_page(
             );
         }
     };
-    let page_size = i64::from(state.config.max_page_size);
-    let (removed, removed_total) =
-        collection_item::list_deleted_for_collection(&state.db, collection_id, page_size, 0)
-            .await
-            .unwrap_or_default();
+    let (removed, removed_total) = removed_result.unwrap_or_default();
     // Candidate pieces to add: the org's live arrangements, minus the ones
     // already in this collection (an arrangement may appear once per index, but
     // offering a duplicate by default is a trap rather than a feature).
     let present: std::collections::HashSet<Uuid> =
         items.iter().map(|i| i.item.arrangement_id).collect();
-    let candidates = match arrangement::list_for_org(
-        &state.db,
-        org_id,
-        page_size,
-        0,
-        "title",
-        SortDirection::Asc,
-        None,
-        None,
-    )
-    .await
-    {
+    let candidates = match candidates_result {
         Ok((rows, _)) => rows,
         Err(error) => {
             tracing::error!(%error, "failed to list arrangements for the item picker");
@@ -351,6 +357,7 @@ async fn collection_detail_page(
         }
     };
     let next_index = items.iter().map(|i| i.item.index).max().unwrap_or(0) + 1;
+    let is_program = c.collection_type == "program";
     let items_base = format!("{}/items", detail_url(org_id, collection_id));
 
     let body = html! {
@@ -366,9 +373,23 @@ async fn collection_detail_page(
         }
 
         h2 { "Pieces" }
-        p class="muted" {
-            "Ordered by piece number. Use ▲/▼ to reorder — the numbers are "
-            "renumbered from 1 on every move."
+        // A program is a sequence: what matters is what follows what, so ▲/▼
+        // (which renumber 1..n) are the right control. A standing collection is
+        // a numbered book — musicians call out "number 47" — so its numbers are
+        // stable handles, and renumbering the book because one piece moved
+        // would invalidate everyone's memory of it. There, each piece's number
+        // is edited directly instead.
+        @if is_program {
+            p class="muted" {
+                "A program is played in order — use ▲/▼ to rearrange it. "
+                "Pieces are renumbered from 1 on every move."
+            }
+        } @else {
+            p class="muted" {
+                "A standing collection is drawn from by piece number, so the "
+                "numbers are fixed handles: set a piece's number directly "
+                "rather than reordering the book around it."
+            }
         }
         // ONE form for the whole table: every row contributes a hidden `order`
         // value (the sequence as rendered), and each ▲/▼ is a submit button
@@ -378,7 +399,7 @@ async fn collection_detail_page(
         // added or removed a piece it is no longer a permutation of the live
         // set, and the domain's reorder refuses it.
         form method="post" action=(format!("{items_base}/reorder")) {
-            (layout::csrf_field(&token))
+            @if is_program { (layout::csrf_field(&token)) }
             table {
                 thead { tr { th { "#" } th { "Piece" } th { "Order" } th {} } }
                 tbody {
@@ -395,14 +416,18 @@ async fn collection_detail_page(
                                 }
                             }
                             td {
-                                input type="hidden" name="order" value=(view.item.id);
-                                @if pos > 0 {
-                                    button type="submit" name="move"
-                                           value=(format!("up:{}", view.item.id)) { "▲" }
-                                }
-                                @if pos + 1 < items.len() {
-                                    button type="submit" name="move"
-                                           value=(format!("down:{}", view.item.id)) { "▼" }
+                                @if is_program {
+                                    input type="hidden" name="order" value=(view.item.id);
+                                    @if pos > 0 {
+                                        button type="submit" name="move"
+                                               value=(format!("up:{}", view.item.id)) { "▲" }
+                                    }
+                                    @if pos + 1 < items.len() {
+                                        button type="submit" name="move"
+                                               value=(format!("down:{}", view.item.id)) { "▼" }
+                                    }
+                                } @else {
+                                    span class="muted" { "set below" }
                                 }
                             }
                             td {
@@ -416,6 +441,27 @@ async fn collection_detail_page(
             }
         }
         @if items.is_empty() { p class="muted" { "No pieces yet." } }
+
+        @if !is_program && !items.is_empty() {
+            p class="muted" { "Set a piece number:" }
+            @for view in &items {
+                form class="inline" method="post"
+                     action=(format!("{items_base}/{}/number", view.item.id)) {
+                    (layout::csrf_field(&token))
+                    span {
+                        @if view.arrangement_removed {
+                            (view.arrangement_slug)
+                        } @else {
+                            (view.arrangement_title)
+                        }
+                        " "
+                    }
+                    input type="number" name="index" min="1" value=(view.item.index);
+                    button type="submit" { "Set number" }
+                }
+                br;
+            }
+        }
 
         // Removing a piece is its own form: it must not ride the reorder form's
         // submit, and a urlencoded POST carries its CSRF token in the body.
@@ -829,15 +875,16 @@ async fn add_item(
     };
     // The arrangement must be this org's — otherwise a forged id would pull a
     // foreign piece into the program (and leak its title through the listing).
-    if require_found(
+    // Propagate `require_found`'s own response: it distinguishes a missing row
+    // (404) from a DB failure (500), and rebuilding a flat 404 here would tell
+    // the archivist their arrangement is gone when the database merely blinked.
+    if let Err(response) = require_found(
         scoped_arrangement(&state, &ctx, arrangement_id, false).await,
         &ctx,
         Section::Collections,
         "Arrangement not found.",
-    )
-    .is_err()
-    {
-        return error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found.");
+    ) {
+        return response;
     }
 
     let index = match field(&pairs, "index")
@@ -937,7 +984,11 @@ async fn reorder_items(
         );
     };
     if order.is_empty() {
-        return Redirect::to(&detail_url(org_id, collection_id)).into_response();
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "The submitted order was empty — reload the collection and try again.",
+        );
     }
     // A `move` directive is the arrow-button path; without one the submitted
     // order is taken as-is (the shape a future drag-and-drop enhancement would
@@ -979,6 +1030,78 @@ async fn reorder_items(
                 &ctx,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Could not save the new order.",
+            )
+        }
+    }
+}
+
+/// Set one piece's number directly, without touching any other piece.
+///
+/// This is the ordering control for a **standing** collection: its numbers are
+/// the handles musicians call out during a performance, so the reorder path
+/// (which renumbers 1..n) would invalidate the whole book to move one piece.
+/// Programs use the arrows instead.
+async fn set_item_number(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let (ctx, _) = match enter_collection(&state, auth, org_id, collection_id).await {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_found(
+        scoped_item(&state, collection_id, item_id).await,
+        &ctx,
+        Section::Collections,
+        "Piece not found in this collection.",
+    ) {
+        return response;
+    }
+    let Some(index) = field(&pairs, "index")
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .filter(|n| *n >= 1)
+    else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "The piece number must be a positive whole number.",
+        );
+    };
+
+    match collection_item::update_index(&state.db, item_id, index).await {
+        Ok(Some(_)) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "collection_item.update_index",
+                "collection_item",
+                Some(item_id),
+                serde_json::json!({ "collectionId": collection_id, "index": index }),
+            )
+            .await;
+            Redirect::to(&detail_url(org_id, collection_id)).into_response()
+        }
+        Ok(None) => error_page(
+            &ctx,
+            StatusCode::NOT_FOUND,
+            "Piece not found in this collection.",
+        ),
+        Err(collection_item::CollectionItemError::DuplicateIndex) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "Another piece already holds that number — give that one a different \
+             number first.",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to set a piece number");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not set the piece number.",
             )
         }
     }
@@ -1196,33 +1319,26 @@ async fn assignments_page(
             );
         }
     };
-    let arrangement_title = arrangement::find_by_id(&state.db, item.arrangement_id)
+    // A soft-deleted arrangement keeps its slot in the collection
+    // (hide-with-references) but must not take NEW assignees: its files are
+    // hidden through it, so an assignment would grant access to nothing.
+    // Existing assignments stay visible and removable so the archivist can
+    // clean up.
+    let live_arrangement = arrangement::find_by_id(&state.db, item.arrangement_id)
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let arrangement_removed = live_arrangement.is_none();
+    let arrangement_title = live_arrangement
         .map(|a| a.title)
         .unwrap_or_else(|| "[removed]".to_string());
     // Members are offered as a convenience list; the field itself accepts any
     // username, which is how a guest or substitute with no membership gets a
     // part (CLAUDE.md: a PartAssignment grants read access on its own).
-    let members = membership::list_for_org(
-        &state.db,
-        org_id,
-        i64::from(state.config.max_page_size),
-        0,
-        "role",
-        SortDirection::Asc,
-        None,
-    )
-    .await
-    .map(|(rows, _)| rows)
-    .unwrap_or_default();
-    let mut member_usernames = Vec::new();
-    for m in &members {
-        if let Ok(Some(u)) = user::find_by_id(&state.db, m.user_id).await {
-            member_usernames.push(u.username);
-        }
-    }
+    let member_usernames =
+        membership::member_usernames(&state.db, org_id, i64::from(state.config.max_page_size))
+            .await
+            .unwrap_or_default();
 
     let base = assignments_url(org_id, collection_id, item_id);
     let body = html! {
@@ -1232,6 +1348,14 @@ async fn assignments_page(
             "arrangement is listed; assigning one grants that person access to "
             "the voice's files, whether or not they are a member of this "
             "organization."
+        }
+
+        @if arrangement_removed {
+            p class="error" {
+                "This piece's arrangement was removed from the catalog. Existing "
+                "parts can still be unassigned, but no new ones can be handed out "
+                "until it is restored."
+            }
         }
 
         datalist id="member-usernames" {
@@ -1292,6 +1416,7 @@ async fn assignments_page(
                             }
                         }
                         td {
+                            @if !arrangement_removed {
                             form class="inline" method="post" action=(&base) {
                                 (layout::csrf_field(&token))
                                 input type="hidden" name="voice_id" value=(row.voice_id);
@@ -1307,6 +1432,7 @@ async fn assignments_page(
                                 button type="submit" {
                                     @if row.assignment_id.is_some() { "Reassign" } @else { "Assign" }
                                 }
+                            }
                             }
                             @if let Some(id) = row.assignment_id {
                                 " "
@@ -1340,7 +1466,7 @@ async fn assign_part(
     RequestId(request_id): RequestId,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    let (ctx, _, _) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
+    let (ctx, _, item) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
         Ok(triple) => triple,
         Err(response) => return response,
     };
@@ -1349,6 +1475,28 @@ async fn assign_part(
     let Some(voice_id) = field(&pairs, "voice_id").and_then(|v| Uuid::parse_str(v).ok()) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Choose a voice to assign.");
     };
+    // The screen hides the control, but the route must hold the line: handing
+    // someone a part on a removed arrangement would grant access to files that
+    // are hidden through it.
+    match arrangement::find_by_id(&state.db, item.arrangement_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_page(
+                &ctx,
+                StatusCode::CONFLICT,
+                "This piece's arrangement was removed from the catalog — restore it \
+                 before assigning parts.",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to check the piece's arrangement");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not check this piece's arrangement.",
+            );
+        }
+    }
     let Some(username) = field(&pairs, "username")
         .map(str::trim)
         .filter(|v| !v.is_empty())
