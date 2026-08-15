@@ -1023,3 +1023,421 @@ async fn an_arrangement_from_another_org_cannot_be_added() {
         "nothing was added to the collection"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tests — slice 3: part assignments
+// ---------------------------------------------------------------------------
+
+async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
+    let id = Uuid::now_v7();
+    let instrument_id = sqlx::query_scalar!(r#"SELECT id FROM instrument ORDER BY key LIMIT 1"#)
+        .fetch_one(&state.db)
+        .await
+        .expect("instrument");
+    lied::domain::voice::create(
+        &state.db,
+        id,
+        arr_id,
+        name,
+        &lied::domain::voice::slugify(name),
+        instrument_id,
+        None,
+    )
+    .await
+    .expect("voice");
+    id
+}
+
+/// A collection with one piece that has two voices — the shape the assignment
+/// matrix is built for. Returns (collection, item, voice ids).
+async fn seed_program_with_voices(
+    ctx: &Ctx,
+    browser: &Browser,
+    org_id: Uuid,
+) -> (Uuid, Uuid, Vec<Uuid>) {
+    let coll = create_collection(ctx, browser, org_id, "Spring Concert", "program").await;
+    let arr = seed_arrangement(&ctx.state, org_id, "Bolero").await;
+    let flute = seed_voice(&ctx.state, arr, "Flute 1").await;
+    let trumpet = seed_voice(&ctx.state, arr, "Trumpet 1").await;
+    add_piece(ctx, browser, org_id, coll, arr).await;
+    let item = items(ctx, coll).await[0].item.id;
+    (coll, item, vec![flute, trumpet])
+}
+
+async fn assignment_for(
+    ctx: &Ctx,
+    item: Uuid,
+    voice: Uuid,
+) -> Option<lied::domain::part_assignment::PartAssignment> {
+    lied::domain::part_assignment::find_by_item_voice(&ctx.pool, item, voice)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn every_voice_is_listed_and_a_guest_can_hold_a_part() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+
+    // The matrix is voice-first: an unassigned voice is exactly what the
+    // archivist is looking for, so it must be visible, not absent.
+    let (status, html) = load_page(&ctx.app, &browser, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(html.contains("Flute 1") && html.contains("Trumpet 1"));
+    assert_eq!(html.matches("unassigned").count(), 2);
+
+    // A substitute with NO membership in this org can take a part — that is how
+    // guests get access at all (the assignment itself grants the read).
+    seed_user(&ctx.state, "guest-sub").await;
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &voices[0].to_string()),
+            ("username", "guest-sub"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
+    let assigned = assignment_for(&ctx, item, voices[0])
+        .await
+        .expect("assigned");
+    assert!(assigned.notified_at.is_none());
+    assert_eq!(audit_count(&ctx.pool, "part_assignment.create").await, 1);
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    assert!(html.contains("guest-sub"), "the assignee is shown");
+    assert_eq!(
+        html.matches("unassigned").count(),
+        1,
+        "the other voice is still open"
+    );
+
+    // Unassigning frees the voice again.
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{url}/{}/unassign", assigned.id),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert!(assignment_for(&ctx, item, voices[0]).await.is_none());
+    assert_eq!(audit_count(&ctx.pool, "part_assignment.delete").await, 1);
+}
+
+#[tokio::test]
+async fn a_reassignment_from_a_stale_form_is_refused() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    seed_user(&ctx.state, "first-player").await;
+    seed_user(&ctx.state, "second-player").await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &voices[0].to_string()),
+            ("username", "first-player"),
+        ],
+        &token,
+    )
+    .await;
+    let current = assignment_for(&ctx, item, voices[0]).await.unwrap();
+
+    // A reassignment carrying a stale version must not silently overwrite an
+    // assignment that changed since the page rendered.
+    let stale = (current.updated_at.timestamp_millis() - 1).to_string();
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &voices[0].to_string()),
+            ("username", "second-player"),
+            ("expected_version", &stale),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::PRECONDITION_FAILED,
+        "a stale reassignment must be refused"
+    );
+    assert_eq!(
+        assignment_for(&ctx, item, voices[0]).await.unwrap().user_id,
+        current.user_id,
+        "the refused reassignment changed nothing"
+    );
+
+    // With the current version it goes through, and replaces rather than
+    // duplicating (one assignee per voice per piece).
+    let fresh = current.updated_at.timestamp_millis().to_string();
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &voices[0].to_string()),
+            ("username", "second-player"),
+            ("expected_version", &fresh),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let replaced = assignment_for(&ctx, item, voices[0]).await.unwrap();
+    assert_ne!(replaced.user_id, current.user_id, "the assignee changed");
+    assert_eq!(audit_count(&ctx.pool, "part_assignment.reassign").await, 1);
+}
+
+#[tokio::test]
+async fn distribution_state_is_stamped_from_the_console() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    seed_user(&ctx.state, "player").await;
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[("voice_id", &voices[0].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    let assignment = assignment_for(&ctx, item, voices[0]).await.unwrap();
+
+    for (action, check) in [("notified", "notified"), ("acknowledged", "acknowledged")] {
+        let (_, html) = load_page(&ctx.app, &browser, &url).await;
+        let token = form_csrf(&html);
+        let response = post_form(
+            &ctx.app,
+            &browser,
+            &format!("{url}/{}/{action}", assignment.id),
+            &[],
+            &token,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SEE_OTHER,
+            "marking {check} should succeed"
+        );
+    }
+
+    let stamped = assignment_for(&ctx, item, voices[0]).await.unwrap();
+    assert!(stamped.notified_at.is_some(), "notifiedAt was stamped");
+    assert!(
+        stamped.acknowledged_at.is_some(),
+        "acknowledgedAt was stamped"
+    );
+    assert_eq!(
+        audit_count(&ctx.pool, "part_assignment.update_state").await,
+        2
+    );
+
+    // Once set, the timestamp is rendered rather than offered as a button —
+    // the domain has no way to clear it back to NULL.
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    assert!(
+        !html.contains("Mark notified"),
+        "a stamped assignment stops offering the button"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_username_or_a_foreign_voice_is_refused() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
+
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &voices[0].to_string()),
+            ("username", "nobody-by-that-name"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let html_body = body_text(response).await;
+    assert!(
+        html_body.contains("No user with that username"),
+        "got: {html_body}"
+    );
+
+    // A voice from a different arrangement must not be assignable on this piece
+    // — the domain enforces it inside the INSERT; the console must surface it.
+    let other_arr = seed_arrangement(&ctx.state, fx.org_id, "Egmont Overture").await;
+    let foreign_voice = seed_voice(&ctx.state, other_arr, "Horn 1").await;
+    seed_user(&ctx.state, "player").await;
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[
+            ("voice_id", &foreign_voice.to_string()),
+            ("username", "player"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "a voice outside this piece's arrangement is not assignable"
+    );
+    assert!(assignment_for(&ctx, item, foreign_voice).await.is_none());
+}
+
+#[tokio::test]
+async fn a_conductor_may_assign_parts_and_a_musician_may_not() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let archivist = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &archivist, fx.org_id).await;
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    seed_user(&ctx.state, "player").await;
+
+    // Part assignments are a conductor capability per the matrix.
+    let conductor = Browser::login(&ctx.app, "cond").await;
+    let (status, html) = load_page(&ctx.app, &conductor, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &conductor,
+        &url,
+        &[("voice_id", &voices[0].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert!(assignment_for(&ctx, item, voices[0]).await.is_some());
+
+    // A plain musician reaches neither the screen nor the write.
+    let musician = Browser::login(&ctx.app, "mus").await;
+    let (status, _) = load_page(&ctx.app, &musician, &url).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    let token = session_csrf(&ctx.app, &musician, "/admin").await;
+    let response = post_form(
+        &ctx.app,
+        &musician,
+        &url,
+        &[("voice_id", &voices[1].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "refused with the musician's own valid CSRF token, so this pins authorization"
+    );
+    assert!(assignment_for(&ctx, item, voices[1]).await.is_none());
+}
+
+#[tokio::test]
+async fn an_item_or_assignment_from_another_collection_is_not_found() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item, voices) = seed_program_with_voices(&ctx, &browser, fx.org_id).await;
+
+    // A second collection, with its own piece and assignment.
+    let other = create_collection(&ctx, &browser, fx.org_id, "Autumn Concert", "program").await;
+    let other_arr = seed_arrangement(&ctx.state, fx.org_id, "Egmont Overture").await;
+    seed_voice(&ctx.state, other_arr, "Horn 1").await;
+    add_piece(&ctx, &browser, fx.org_id, other, other_arr).await;
+    let other_item = items(&ctx, other).await[0].item.id;
+
+    // The other collection's item must not resolve under this collection's URL.
+    let crossed = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{other_item}/assignments",
+        fx.org_id
+    );
+    let (status, _) = load_page(&ctx.app, &browser, &crossed).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    // …nor an assignment belonging to a different item.
+    let url = format!(
+        "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
+        fx.org_id
+    );
+    seed_user(&ctx.state, "player").await;
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        &browser,
+        &url,
+        &[("voice_id", &voices[0].to_string()), ("username", "player")],
+        &token,
+    )
+    .await;
+    let mine = assignment_for(&ctx, item, voices[0]).await.unwrap();
+
+    let other_url = format!(
+        "/admin/orgs/{}/collections/{other}/items/{other_item}/assignments",
+        fx.org_id
+    );
+    for action in ["unassign", "notified", "acknowledged"] {
+        let response = post_form(
+            &ctx.app,
+            &browser,
+            &format!("{other_url}/{}/{action}", mine.id),
+            &[],
+            &token,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "{action} must not reach an assignment on another piece"
+        );
+    }
+    assert!(
+        assignment_for(&ctx, item, voices[0]).await.is_some(),
+        "the assignment is untouched"
+    );
+}

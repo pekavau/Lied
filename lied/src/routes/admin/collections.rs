@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
-use crate::domain::{arrangement, collection, collection_item};
+use crate::domain::{arrangement, collection, collection_item, membership, part_assignment, user};
 use crate::listing::{check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, require_found, scoped_arrangement,
@@ -65,6 +65,23 @@ pub fn router() -> Router<AppState> {
         .route(
             "/orgs/:org_id/collections/:collection_id/items/:item_id/undelete",
             post(undelete_item),
+        )
+        // Part assignments: the per-item voice matrix.
+        .route(
+            "/orgs/:org_id/collections/:collection_id/items/:item_id/assignments",
+            get(assignments_page).post(assign_part),
+        )
+        .route(
+            "/orgs/:org_id/collections/:collection_id/items/:item_id/assignments/:assignment_id/unassign",
+            post(unassign_part),
+        )
+        .route(
+            "/orgs/:org_id/collections/:collection_id/items/:item_id/assignments/:assignment_id/notified",
+            post(mark_notified),
+        )
+        .route(
+            "/orgs/:org_id/collections/:collection_id/items/:item_id/assignments/:assignment_id/acknowledged",
+            post(mark_acknowledged),
         )
 }
 
@@ -1102,4 +1119,456 @@ mod tests {
             assert_eq!(candidate, order, "{directive:?} must not reorder anything");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Part assignments — the per-item voice matrix
+// ---------------------------------------------------------------------------
+
+/// Enter, gate, resolve the collection *and* the item. Shared by the assignment
+/// screen and its writes.
+async fn enter_item(
+    state: &AppState,
+    auth: Option<AuthSession>,
+    org_id: Uuid,
+    collection_id: Uuid,
+    item_id: Uuid,
+) -> Result<
+    (
+        ConsoleCtx,
+        collection::Collection,
+        collection_item::CollectionItem,
+    ),
+    Response,
+> {
+    let (ctx, c) = enter_collection(state, auth, org_id, collection_id).await?;
+    let item = require_found(
+        scoped_item(state, collection_id, item_id).await,
+        &ctx,
+        Section::Collections,
+        "Piece not found in this collection.",
+    )?;
+    Ok((ctx, c, item))
+}
+
+/// Fetch an assignment, confirming it belongs to this collection item — an
+/// assignment id from another item (or org) must 404.
+async fn scoped_assignment(
+    state: &AppState,
+    item_id: Uuid,
+    assignment_id: Uuid,
+) -> Result<Option<part_assignment::PartAssignment>, sqlx::Error> {
+    Ok(part_assignment::find_by_id(&state.db, assignment_id)
+        .await?
+        .filter(|a| a.collection_item_id == item_id))
+}
+
+fn assignments_url(org_id: Uuid, collection_id: Uuid, item_id: Uuid) -> String {
+    format!(
+        "{}/items/{item_id}/assignments",
+        detail_url(org_id, collection_id)
+    )
+}
+
+async fn assignments_page(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    session: Session,
+) -> Response {
+    let (ctx, c, item) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
+        Ok(triple) => triple,
+        Err(response) => return response,
+    };
+    let token = match csrf_token(&ctx, &session).await {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+
+    let matrix = match part_assignment::voice_matrix_for_item(&state.db, item_id).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(%error, "failed to load the assignment matrix");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load the parts for this piece.",
+            );
+        }
+    };
+    let arrangement_title = arrangement::find_by_id(&state.db, item.arrangement_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|a| a.title)
+        .unwrap_or_else(|| "[removed]".to_string());
+    // Members are offered as a convenience list; the field itself accepts any
+    // username, which is how a guest or substitute with no membership gets a
+    // part (CLAUDE.md: a PartAssignment grants read access on its own).
+    let members = membership::list_for_org(
+        &state.db,
+        org_id,
+        i64::from(state.config.max_page_size),
+        0,
+        "role",
+        SortDirection::Asc,
+        None,
+    )
+    .await
+    .map(|(rows, _)| rows)
+    .unwrap_or_default();
+    let mut member_usernames = Vec::new();
+    for m in &members {
+        if let Ok(Some(u)) = user::find_by_id(&state.db, m.user_id).await {
+            member_usernames.push(u.username);
+        }
+    }
+
+    let base = assignments_url(org_id, collection_id, item_id);
+    let body = html! {
+        h2 { "Parts — " (arrangement_title) }
+        p class="muted" {
+            "Piece " (item.index) " of " (c.name) ". Every live voice of the "
+            "arrangement is listed; assigning one grants that person access to "
+            "the voice's files, whether or not they are a member of this "
+            "organization."
+        }
+
+        datalist id="member-usernames" {
+            @for username in &member_usernames { option value=(username); }
+        }
+
+        table {
+            thead {
+                tr {
+                    th { "Voice" } th { "Assigned to" } th { "Notified" }
+                    th { "Acknowledged" } th { "Assign / reassign" }
+                }
+            }
+            tbody {
+                @for row in &matrix {
+                    tr {
+                        td { (row.voice_name) }
+                        td {
+                            @match &row.assignee_username {
+                                Some(username) => {
+                                    (row.assignee_display_name.clone().unwrap_or_else(|| username.clone()))
+                                    " "
+                                    span class="muted" { "(" (username) ")" }
+                                }
+                                None => span class="muted" { "unassigned" },
+                            }
+                        }
+                        td {
+                            @match row.notified_at {
+                                Some(at) => (at.format("%Y-%m-%d %H:%M").to_string()),
+                                None => {
+                                    @if let Some(id) = row.assignment_id {
+                                        form class="inline" method="post"
+                                             action=(format!("{base}/{id}/notified")) {
+                                            (layout::csrf_field(&token))
+                                            button type="submit" { "Mark notified" }
+                                        }
+                                    } @else {
+                                        span class="muted" { "—" }
+                                    }
+                                }
+                            }
+                        }
+                        td {
+                            @match row.acknowledged_at {
+                                Some(at) => (at.format("%Y-%m-%d %H:%M").to_string()),
+                                None => {
+                                    @if let Some(id) = row.assignment_id {
+                                        form class="inline" method="post"
+                                             action=(format!("{base}/{id}/acknowledged")) {
+                                            (layout::csrf_field(&token))
+                                            button type="submit" { "Mark acknowledged" }
+                                        }
+                                    } @else {
+                                        span class="muted" { "—" }
+                                    }
+                                }
+                            }
+                        }
+                        td {
+                            form class="inline" method="post" action=(&base) {
+                                (layout::csrf_field(&token))
+                                input type="hidden" name="voice_id" value=(row.voice_id);
+                                // Present only when replacing an existing
+                                // assignee: the same If-Match contract `/v1`
+                                // enforces on a reassignment.
+                                @if let Some(updated_at) = row.assignment_updated_at {
+                                    input type="hidden" name="expected_version"
+                                          value=(updated_at.timestamp_millis());
+                                }
+                                input type="text" name="username" list="member-usernames"
+                                      placeholder="username" required;
+                                button type="submit" {
+                                    @if row.assignment_id.is_some() { "Reassign" } @else { "Assign" }
+                                }
+                            }
+                            @if let Some(id) = row.assignment_id {
+                                " "
+                                form class="inline" method="post"
+                                     action=(format!("{base}/{id}/unassign")) {
+                                    (layout::csrf_field(&token))
+                                    button type="submit" { "Unassign" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        @if matrix.is_empty() {
+            p class="muted" {
+                "This arrangement has no voices yet — add them in the catalog "
+                "before assigning parts."
+            }
+        }
+
+        p { a href=(detail_url(org_id, collection_id)) { "← Back to the collection" } }
+    };
+    Html(console::console_page(&ctx, Section::Collections, body).into_string()).into_response()
+}
+
+async fn assign_part(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let (ctx, _, _) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
+        Ok(triple) => triple,
+        Err(response) => return response,
+    };
+    let back = assignments_url(org_id, collection_id, item_id);
+
+    let Some(voice_id) = field(&pairs, "voice_id").and_then(|v| Uuid::parse_str(v).ok()) else {
+        return error_page(&ctx, StatusCode::BAD_REQUEST, "Choose a voice to assign.");
+    };
+    let Some(username) = field(&pairs, "username")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Enter the username of the person taking this part.",
+        );
+    };
+    // By username, not id: it is what the archivist knows, and it is what makes
+    // a guest assignable — no membership is required to hold a part.
+    let assignee = match user::find_by_username(&state.db, username).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return error_page(
+            &ctx,
+            StatusCode::NOT_FOUND,
+            "No user with that username. They need an account before they can be assigned a part.",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to look up the assignee");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not look up that user.",
+            );
+        }
+    };
+
+    // Replacing an existing assignee is the concurrency-sensitive case (the
+    // previous assignee may have been notified since this page rendered), so it
+    // carries the same If-Match contract `/v1` enforces.
+    let existing = match part_assignment::find_by_item_voice(&state.db, item_id, voice_id).await {
+        Ok(existing) => existing,
+        Err(error) => {
+            tracing::error!(%error, "failed to check the current assignee");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not check the current assignee.",
+            );
+        }
+    };
+    if let Some(ref current) = existing {
+        if check_if_match(field(&pairs, "expected_version"), current.updated_at).is_err() {
+            return console::precondition_page(&ctx, Section::Collections, "assignment", &back);
+        }
+    }
+
+    match part_assignment::assign(
+        &state.db,
+        Uuid::now_v7(),
+        item_id,
+        voice_id,
+        assignee.id,
+        Some(ctx.user().id),
+    )
+    .await
+    {
+        Ok((created, was_insert)) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                if was_insert {
+                    "part_assignment.create"
+                } else {
+                    "part_assignment.reassign"
+                },
+                "part_assignment",
+                Some(created.id),
+                serde_json::json!({
+                    "collectionItemId": item_id,
+                    "voiceId": voice_id,
+                    "userId": assignee.id,
+                }),
+            )
+            .await;
+            Redirect::to(&back).into_response()
+        }
+        Err(part_assignment::PartAssignmentError::VoiceNotInArrangement) => error_page(
+            &ctx,
+            StatusCode::NOT_FOUND,
+            "That voice does not belong to this piece's arrangement.",
+        ),
+        Err(part_assignment::PartAssignmentError::UnknownReference) => error_page(
+            &ctx,
+            StatusCode::NOT_FOUND,
+            "The piece, voice, or user no longer exists.",
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to assign a part");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not assign the part.",
+            )
+        }
+    }
+}
+
+async fn unassign_part(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path((org_id, collection_id, item_id, assignment_id)): Path<(Uuid, Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+) -> Response {
+    let (ctx, _, _) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
+        Ok(triple) => triple,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_found(
+        scoped_assignment(&state, item_id, assignment_id).await,
+        &ctx,
+        Section::Collections,
+        "Assignment not found.",
+    ) {
+        return response;
+    }
+    match part_assignment::delete(&state.db, assignment_id).await {
+        Ok(_) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "part_assignment.delete",
+                "part_assignment",
+                Some(assignment_id),
+                serde_json::json!({ "collectionItemId": item_id }),
+            )
+            .await;
+            Redirect::to(&assignments_url(org_id, collection_id, item_id)).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to unassign a part");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not unassign the part.",
+            )
+        }
+    }
+}
+
+/// Which distribution timestamp a "mark …" button stamps.
+#[derive(Clone, Copy)]
+enum StateStamp {
+    Notified,
+    Acknowledged,
+}
+
+async fn mark_state(
+    state: AppState,
+    auth: Option<AuthSession>,
+    ids: (Uuid, Uuid, Uuid, Uuid),
+    request_id: Uuid,
+    stamp: StateStamp,
+) -> Response {
+    let (org_id, collection_id, item_id, assignment_id) = ids;
+    let (ctx, _, _) = match enter_item(&state, auth, org_id, collection_id, item_id).await {
+        Ok(triple) => triple,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_found(
+        scoped_assignment(&state, item_id, assignment_id).await,
+        &ctx,
+        Section::Collections,
+        "Assignment not found.",
+    ) {
+        return response;
+    }
+
+    // Stamping is "now", not a chosen time: `update_state` treats `None` as
+    // "leave unchanged", so there is no way to clear or backdate one of these
+    // without new domain semantics. Distribution *delivery* stays phase 3; this
+    // is the archivist recording what they did out of band.
+    let now = chrono::Utc::now();
+    let (notified, acknowledged) = match stamp {
+        StateStamp::Notified => (Some(now), None),
+        StateStamp::Acknowledged => (None, Some(now)),
+    };
+    match part_assignment::update_state(&state.db, assignment_id, notified, acknowledged).await {
+        Ok(_) => {
+            audit(
+                &state.db,
+                &audit_ctx(&ctx, request_id),
+                "part_assignment.update_state",
+                "part_assignment",
+                Some(assignment_id),
+                serde_json::json!({
+                    "notifiedAt": notified,
+                    "acknowledgedAt": acknowledged,
+                }),
+            )
+            .await;
+            Redirect::to(&assignments_url(org_id, collection_id, item_id)).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to update the assignment state");
+            error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not record that.",
+            )
+        }
+    }
+}
+
+async fn mark_notified(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path(ids): Path<(Uuid, Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+) -> Response {
+    mark_state(state, auth, ids, request_id, StateStamp::Notified).await
+}
+
+async fn mark_acknowledged(
+    State(state): State<AppState>,
+    auth: Option<AuthSession>,
+    Path(ids): Path<(Uuid, Uuid, Uuid, Uuid)>,
+    RequestId(request_id): RequestId,
+) -> Response {
+    mark_state(state, auth, ids, request_id, StateStamp::Acknowledged).await
 }
