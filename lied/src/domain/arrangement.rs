@@ -339,11 +339,14 @@ pub fn resolve_search_sort<'a>(
     let asked_for_relevance = raw
         .map(|value| value.split(':').next().unwrap_or("") == "relevance")
         .unwrap_or(false);
+
+    // Validate first, always: falling back early would let a malformed spec
+    // like `relevance:sideways` through with a 200 and the default sort, when
+    // the conventions promise a 400 for an unknown direction.
+    let (fragment, direction) = crate::listing::resolve_sort(raw, SORT_ALLOWLIST, default)?;
     if asked_for_relevance && !has_query {
         return Ok(default);
     }
-
-    let (fragment, direction) = crate::listing::resolve_sort(raw, SORT_ALLOWLIST, default)?;
     let direction = if asked_for_relevance && raw.map(|v| !v.contains(':')).unwrap_or(false) {
         SortDirection::Desc
     } else {
@@ -384,6 +387,17 @@ pub async fn list_for_org(
           AND ($4::text IS NULL OR a.status = $4)
           AND ($5::text IS NULL OR (
                   a.search_vector @@ websearch_to_tsquery('simple', immutable_unaccent($5))
+               -- The `%` OPERATOR, not `similarity(...) >= threshold`: only the
+               -- operator form can use the trigram GIN indexes (the function
+               -- form plans as a sequential scan even with `enable_seqscan=off`,
+               -- which is the whole reason those indexes exist).
+               --
+               -- Its cutoff therefore comes from `pg_trgm.similarity_threshold`
+               -- (default 0.3) rather than from this query. That is a deliberate
+               -- trade of determinism for the index: an operator who retunes the
+               -- GUC changes how forgiving search is, so
+               -- `fuzzy_matching_holds_at_the_default_threshold` pins the
+               -- behaviour we ship with and will fail loudly if it moves.
                OR immutable_unaccent(a.title) % immutable_unaccent($5)
                OR immutable_unaccent(w.composer) % immutable_unaccent($5)
           ))
@@ -453,8 +467,11 @@ pub async fn list_for_org(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            // Same predicate, same bind positions: $1/$2 are unused here but
-            // kept so the shared WHERE body needs no renumbering.
+            // The shared WHERE body numbers its binds from $3 (the page query
+            // spends $1/$2 on LIMIT/OFFSET). Rather than bind two values this
+            // statement never references, keep the positions and let the two
+            // leading binds be explicit placeholders — NULL costs nothing and
+            // makes the shared numbering visible instead of implied.
             let count_query = format!(
                 r#"
                 SELECT count(*)
@@ -464,8 +481,8 @@ pub async fn list_for_org(
                 "#
             );
             sqlx::query_scalar::<_, i64>(&count_query)
-                .bind(limit)
-                .bind(offset)
+                .bind(None::<i64>)
+                .bind(None::<i64>)
                 .bind(organization_id)
                 .bind(search.status)
                 .bind(search.q)

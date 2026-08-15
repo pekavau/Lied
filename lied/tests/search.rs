@@ -877,3 +877,131 @@ async fn relevance_puts_the_best_match_first_and_is_ignored_without_a_query() {
         "falls back to title:asc"
     );
 }
+
+#[tokio::test]
+async fn fuzzy_matching_holds_at_the_default_threshold() {
+    // The `%` operator reads its cutoff from `pg_trgm.similarity_threshold`
+    // (default 0.3) rather than from our SQL — the operator form is the only one
+    // the trigram index can serve. This pins the recall we ship with: if the
+    // GUC is ever retuned, or the default changes across a Postgres version,
+    // this fails rather than search quietly becoming stricter or looser.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Search Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    seed_searchable(&db.pool, org_id, "Boléro", None, None, None, None, None).await;
+    seed_searchable(
+        &db.pool,
+        org_id,
+        "Nutcracker Suite",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let threshold: f32 = sqlx::query_scalar("SELECT show_limit()")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the trigram threshold");
+    assert!(
+        (threshold - 0.3).abs() < f32::EPSILON,
+        "these expectations assume the stock 0.3 threshold, found {threshold}"
+    );
+
+    // Close enough to find.
+    for typo in ["bolerro", "boler", "nutcraker"] {
+        assert!(
+            !search_titles(&app, &token, org_id, &format!("q={typo}"))
+                .await
+                .is_empty(),
+            "'{typo}' should still find its piece"
+        );
+    }
+    // Far enough away not to.
+    for miss in ["trumpet", "xylophone"] {
+        assert!(
+            search_titles(&app, &token, org_id, &format!("q={miss}"))
+                .await
+                .is_empty(),
+            "'{miss}' must not fuzzily match an unrelated title"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bad_sort_direction_is_refused_even_when_relevance_falls_back() {
+    // `relevance` without a query falls back to the default sort rather than
+    // erroring — but the fallback must not swallow a malformed spec on the way,
+    // which it did by returning before the allowlist ran.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Search Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    seed_searchable(&db.pool, org_id, "Anything", None, None, None, None, None).await;
+
+    assert_eq!(
+        search_status(&app, &token, org_id, "sort=relevance:sideways").await,
+        400,
+        "an unknown direction is a 400 even without a query to rank"
+    );
+    assert_eq!(
+        search_status(&app, &token, org_id, "q=any&sort=relevance:sideways").await,
+        400
+    );
+    // The legitimate fallback still works.
+    assert_eq!(
+        search_status(&app, &token, org_id, "sort=relevance").await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_filter_error_names_the_field_it_is_talking_about() {
+    // The instrumentId branch reported "expected a tag id", copy-pasted from the
+    // line above — a message that sends the reader looking in the wrong place.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Search Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+
+    let request = bearer_request(
+        "GET",
+        &format!("/v1/orgs/{org_id}/arrangements?filter[instrumentId]=nope"),
+        &token,
+    )
+    .body(axum::body::Body::empty())
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains("an instrument id"),
+        "the message must name the instrument facet, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("a tag id"),
+        "…and must not send the caller looking at tags: {rendered}"
+    );
+}

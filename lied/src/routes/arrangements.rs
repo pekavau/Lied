@@ -576,7 +576,7 @@ fn build_search<'a>(
         duration_min_seconds: parse(filters, "durationMinSeconds", "a whole number of seconds")?,
         duration_max_seconds: parse(filters, "durationMaxSeconds", "a whole number of seconds")?,
         tag_ids,
-        instrument_id: parse(filters, "instrumentId", "a tag id")?,
+        instrument_id: parse(filters, "instrumentId", "an instrument id")?,
     })
 }
 
