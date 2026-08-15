@@ -38,6 +38,49 @@ use crate::state::AppState;
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Query parameters whose values must never reach a log sink, keyed by the
+/// exact parameter name. Currently just the CSRF token that `multipart/*`
+/// admin submits carry in the URL (see [`crate::auth::csrf`]): logs are
+/// long-lived and widely readable, and a session's CSRF token stays valid for
+/// that session's lifetime, so persisting one would hand a log reader the
+/// secret half of the double-submit pair.
+const REDACTED_QUERY_PARAMS: &[&str] = &[crate::auth::csrf::CSRF_QUERY_PARAM];
+
+/// The request URI as it is safe to log: path plus query, with the value of any
+/// [`REDACTED_QUERY_PARAMS`] replaced by `[redacted]` (the key is kept so the
+/// log still shows the parameter was present — same convention as the audit
+/// log's payload redaction).
+pub fn sanitized_uri(uri: &axum::http::Uri) -> String {
+    let Some(query) = uri.query() else {
+        return uri.to_string();
+    };
+    if !REDACTED_QUERY_PARAMS
+        .iter()
+        .any(|name| query.split('&').any(|pair| is_param(pair, name)))
+    {
+        return uri.to_string();
+    }
+    let redacted = query
+        .split('&')
+        .map(|pair| {
+            match REDACTED_QUERY_PARAMS
+                .iter()
+                .find(|name| is_param(pair, name))
+            {
+                Some(name) => format!("{name}=[redacted]"),
+                None => pair.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{}?{redacted}", uri.path())
+}
+
+/// Whether a `key=value` (or bare `key`) query pair names `param`.
+fn is_param(pair: &str, param: &str) -> bool {
+    pair.split_once('=').map(|(k, _)| k).unwrap_or(pair) == param
+}
+
 /// The current request's id, parsed from the `x-request-id` header that
 /// [`SetRequestIdLayer`] stamps on every inbound request (and that the trace
 /// span logs). Handlers take this extractor and pass it into [`audit`] so the
@@ -105,10 +148,58 @@ pub fn build_router(state: AppState) -> Router {
                     "request",
                     request_id = %request_id,
                     method = %request.method(),
-                    uri = %request.uri(),
+                    uri = %sanitized_uri(request.uri()),
                 )
             }),
         )
         .layer(PropagateRequestIdLayer::new(header_name.clone()))
         .layer(SetRequestIdLayer::new(header_name, MakeRequestUuid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitized_uri;
+
+    fn sanitize(uri: &str) -> String {
+        sanitized_uri(&uri.parse().unwrap())
+    }
+
+    #[test]
+    fn sanitized_uri_redacts_the_csrf_token_but_keeps_the_rest() {
+        // The console's multipart forms carry the session's CSRF token in the
+        // URL; the request log must never persist its value.
+        assert_eq!(
+            sanitize("/admin/orgs/1/arrangements/2/files?csrf=SECRET-TOKEN"),
+            "/admin/orgs/1/arrangements/2/files?csrf=[redacted]"
+        );
+        // The key survives (so the log still shows it was sent) and unrelated
+        // params stay readable for debugging.
+        assert_eq!(
+            sanitize("/admin/files?limit=50&csrf=SECRET-TOKEN&sort=name"),
+            "/admin/files?limit=50&csrf=[redacted]&sort=name"
+        );
+        // A valueless or repeated occurrence is still covered.
+        assert_eq!(
+            sanitize("/admin/files?csrf"),
+            "/admin/files?csrf=[redacted]"
+        );
+        assert_eq!(
+            sanitize("/admin/files?csrf=a&csrf=b"),
+            "/admin/files?csrf=[redacted]&csrf=[redacted]"
+        );
+    }
+
+    #[test]
+    fn sanitized_uri_leaves_untainted_uris_untouched() {
+        assert_eq!(sanitize("/admin/orgs"), "/admin/orgs");
+        assert_eq!(
+            sanitize("/v1/arrangements?q=mozart&limit=50"),
+            "/v1/arrangements?q=mozart&limit=50"
+        );
+        // A param that merely *contains* the name is not the token.
+        assert_eq!(
+            sanitize("/v1/x?csrfish=keep&my_csrf=keep"),
+            "/v1/x?csrfish=keep&my_csrf=keep"
+        );
+    }
 }

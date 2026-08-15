@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            f.id, f.arrangement_id, f.voice_id, f.name, f.format, f.mime_type,\n            f.derived_from_file_id, f.conversion_quality,\n            f.created_at as \"created_at: DateTime<Utc>\",\n            f.updated_at as \"updated_at: DateTime<Utc>\",\n            f.created_by,\n            f.deleted_at as \"deleted_at: DateTime<Utc>\"\n        FROM file f\n        JOIN arrangement a ON a.id = f.arrangement_id\n        WHERE f.arrangement_id = $1\n          AND f.deleted_at IS NOT NULL\n          AND a.deleted_at IS NULL\n          AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)\n        ORDER BY f.deleted_at DESC, f.id ASC\n        ",
+  "query": "\n        SELECT\n            f.id, f.arrangement_id, f.voice_id, f.name, f.format, f.mime_type,\n            f.derived_from_file_id, f.conversion_quality,\n            f.created_at as \"created_at: DateTime<Utc>\",\n            f.updated_at as \"updated_at: DateTime<Utc>\",\n            f.created_by,\n            f.deleted_at as \"deleted_at: DateTime<Utc>\"\n        FROM file f\n        JOIN arrangement a ON a.id = f.arrangement_id\n        WHERE f.arrangement_id = $1\n          AND f.deleted_at IS NOT NULL\n          AND a.deleted_at IS NULL\n          AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)\n        ORDER BY f.deleted_at DESC, f.id ASC\n        LIMIT $3 OFFSET $4\n        ",
   "describe": {
     "columns": [
       {
@@ -67,7 +67,9 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid"
+        "Uuid",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
@@ -85,5 +87,5 @@
       true
     ]
   },
-  "hash": "a0e5aec56c06d20348b6e838a0ac256615feb0fb7979108811cdb08f076ca7f3"
+  "hash": "6fc859e5837ad5f818bd78290d76ca584ecc35f73194d89a7cb0719ddb4068e6"
 }

@@ -417,15 +417,21 @@ pub async fn list(
 }
 
 /// The soft-deleted files for an arrangement (or one of its voices when
-/// `voice_id` is `Some`), most-recently-deleted first. Powers the console's
-/// "previous / deleted versions" list — a replaced file leaves its old row
-/// soft-deleted here, and each is restorable. The parent arrangement must be
-/// live (a soft-deleted arrangement hides its whole subtree).
+/// `voice_id` is `Some`), most-recently-deleted first, plus the total count.
+/// Powers the console's "previous / deleted versions" list — a replaced file
+/// leaves its old row soft-deleted here, and each is restorable. The parent
+/// arrangement must be live (a soft-deleted arrangement hides its whole
+/// subtree).
+///
+/// Paginated because this set only ever grows: every replace of a file adds a
+/// row, so an unbounded query would degrade with the file's edit history.
 pub async fn list_deleted(
     pool: &PgPool,
     arrangement_id: Uuid,
     voice_id: Option<Uuid>,
-) -> Result<Vec<File>, sqlx::Error> {
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<File>, i64), sqlx::Error> {
     let rows = sqlx::query_as!(
         File,
         r#"
@@ -443,13 +449,33 @@ pub async fn list_deleted(
           AND a.deleted_at IS NULL
           AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)
         ORDER BY f.deleted_at DESC, f.id ASC
+        LIMIT $3 OFFSET $4
+        "#,
+        arrangement_id,
+        voice_id,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let total = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) as "count!"
+        FROM file f
+        JOIN arrangement a ON a.id = f.arrangement_id
+        WHERE f.arrangement_id = $1
+          AND f.deleted_at IS NOT NULL
+          AND a.deleted_at IS NULL
+          AND ($2::uuid IS NULL AND f.voice_id IS NULL OR f.voice_id = $2)
         "#,
         arrangement_id,
         voice_id,
     )
-    .fetch_all(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(rows)
+
+    Ok((rows, total))
 }
 
 /// Atomically replace a file: soft-delete `old_id` and insert a new row that
@@ -535,53 +561,55 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 /// [`FileError::Duplicate`] (the caller shows a "a current file already holds
 /// that name/format" message). Returns `false` if no soft-deleted row matched.
 pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
-    let Some(target) = find_by_id_including_deleted(pool, id).await? else {
-        return Ok(false);
-    };
-    if target.deleted_at.is_none() {
-        return Ok(false); // already live
-    }
     // The object at the derived key belongs to whichever file was written to
     // that `(arrangement, voice, name, format)` slot most recently. If a newer
     // file (live or since-deleted) took the slot, restoring THIS older row
     // would silently serve the newer file's bytes — refuse it.
-    // Read the target's `created_at` via a subquery rather than binding a
-    // `DateTime<Utc>` — the transitively-enabled sqlx `time` feature would
-    // otherwise demand a `time::OffsetDateTime` for the timestamptz param.
-    let superseded = sqlx::query_scalar!(
-        r#"
-        SELECT EXISTS(
-            SELECT 1 FROM file f
-            WHERE f.arrangement_id = $1
-              AND f.voice_id IS NOT DISTINCT FROM $2
-              AND f.name = $3
-              AND f.format = $4
-              AND f.id <> $5
-              AND f.created_at > (SELECT created_at FROM file WHERE id = $5)
-        ) AS "superseded!"
-        "#,
-        target.arrangement_id,
-        target.voice_id,
-        target.name,
-        target.format,
-        target.id,
-    )
-    .fetch_one(pool)
-    .await?;
-    if superseded {
-        return Err(FileError::Superseded);
-    }
+    //
+    // The guard is part of the UPDATE, not a preceding SELECT: as two
+    // statements, an upload landing in the slot between them would slip past a
+    // check that had already passed. Here the row is only revived if no newer
+    // sibling exists at the instant of the write. The target's own columns are
+    // read via subqueries rather than bound — the transitively-enabled sqlx
+    // `time` feature would otherwise demand a `time::OffsetDateTime` for the
+    // `created_at` param.
+    //
     // The partial unique index still backstops the live-slot case; map its
     // violation to `Duplicate`.
     let res = sqlx::query!(
-        r#"UPDATE file SET deleted_at = NULL, updated_at = now()
-           WHERE id = $1 AND deleted_at IS NOT NULL"#,
+        r#"
+        UPDATE file SET deleted_at = NULL, updated_at = now()
+        WHERE id = $1
+          AND deleted_at IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM file newer
+              WHERE newer.arrangement_id = (SELECT arrangement_id FROM file WHERE id = $1)
+                AND newer.voice_id IS NOT DISTINCT FROM (SELECT voice_id FROM file WHERE id = $1)
+                AND newer.name = (SELECT name FROM file WHERE id = $1)
+                AND newer.format = (SELECT format FROM file WHERE id = $1)
+                AND newer.id <> $1
+                AND newer.created_at > (SELECT created_at FROM file WHERE id = $1)
+          )
+        "#,
         id,
     )
     .execute(pool)
     .await
     .map_err(map_write_error)?;
-    Ok(res.rows_affected() > 0)
+    if res.rows_affected() > 0 {
+        return Ok(true);
+    }
+
+    // Nothing was restored. Re-read to say *why* — this classification races
+    // with concurrent writes, but only the error message is at stake; the
+    // decision not to restore was made atomically above.
+    let Some(target) = find_by_id_including_deleted(pool, id).await? else {
+        return Ok(false); // no such file
+    };
+    if target.deleted_at.is_none() {
+        return Ok(false); // already live
+    }
+    Err(FileError::Superseded)
 }
 
 /// Hard-delete a file **row** (no MinIO operation). Used to roll back a
