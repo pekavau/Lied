@@ -45,6 +45,27 @@ pub struct CollectionItemView {
     pub arrangement_removed: bool,
 }
 
+/// Highest allowed piece number.
+///
+/// [`reorder`] parks every index at `index + INDEX_PARK_OFFSET` to clear the
+/// unique `(collection_id, index)` space before renumbering, so an index near
+/// `i32::MAX` would overflow Postgres `integer` mid-transaction. Capping well
+/// below that keeps the arithmetic safe, and a collection with a million pieces
+/// is not a thing.
+pub const MAX_INDEX: i32 = 999_999;
+
+/// The offset [`reorder`] parks indices at. Must exceed any legal index so the
+/// parked values cannot collide with un-parked ones.
+const INDEX_PARK_OFFSET: i32 = 1_000_000;
+
+/// Whether `index` is a usable piece number: positive and within [`MAX_INDEX`].
+/// Both write surfaces validate through this — the console form and `/v1` had
+/// drifted, and the console's missing cap turned into a 500 on the next
+/// reorder.
+pub fn is_valid_index(index: i32) -> bool {
+    (1..=MAX_INDEX).contains(&index)
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum CollectionItemError {
     #[error("database error")]
@@ -339,9 +360,10 @@ pub async fn reorder(
 
     // Park every live item's index far out of range to clear the space.
     sqlx::query!(
-        r#"UPDATE collection_item SET index = index + 1000000
+        r#"UPDATE collection_item SET index = index + $2
            WHERE collection_id = $1 AND deleted_at IS NULL"#,
         collection_id,
+        INDEX_PARK_OFFSET,
     )
     .execute(&mut *tx)
     .await?;
