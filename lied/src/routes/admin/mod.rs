@@ -5,6 +5,7 @@
 //! sharing the `layout` submodule's maud page shell.
 
 pub mod arrangements;
+pub mod collections;
 pub mod console;
 pub mod files;
 pub mod layout;
@@ -56,6 +57,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(members::router())
         // File management screens (issue #32).
         .merge(files::router())
+        // Collection & part-assignment screens (issue #33).
+        .merge(collections::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
