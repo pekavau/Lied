@@ -104,6 +104,52 @@ pub async fn require_org_role_v1(
     require_org_role(state, &auth.user, organization_id, minimum).await
 }
 
+/// Which coverage a caller is entitled to see.
+///
+/// The view and the authorization are the same decision — a principal is not
+/// "allowed to see coverage" in general, they are allowed to see *their
+/// section's* — so resolving them together makes the narrower view impossible
+/// to forget at a call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageScope {
+    /// Every voice of every piece: staff and system admins.
+    FullProgram,
+    /// Only these instruments: a principal's own `principal_instrument_ids`.
+    Section(Vec<Uuid>),
+}
+
+/// Resolve the caller's coverage scope, or `403`.
+///
+/// This is the one non-staff-facing view phase 2 adds (CLAUDE.md, Phase 2 cut):
+/// a `musician` with `is_principal` may read their section's coverage and
+/// nothing else. A plain musician, and a non-member, get `403`.
+///
+/// Two deliberate edges:
+///   * a principal with **no** `principal_instrument_ids` gets
+///     `Section(vec![])` — an empty report, not an error. "Your section has no
+///     instruments configured" is a true answer they can act on; a 403 would
+///     send them to complain to the wrong person.
+///   * staff who are *also* principals get [`CoverageScope::FullProgram`]. The
+///     wider view is the one they are entitled to, and silently narrowing it
+///     would make an archivist think their programme were smaller than it is.
+pub async fn require_coverage_viewer_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+) -> Result<CoverageScope, AppError> {
+    if auth.user.is_system_admin {
+        return Ok(CoverageScope::FullProgram);
+    }
+    let found = membership::find_by_user_and_org(&state.db, auth.user.id, organization_id)
+        .await
+        .map_err(AppError::from)?;
+    match found {
+        Some(m) if m.role.is_staff() => Ok(CoverageScope::FullProgram),
+        Some(m) if m.is_principal => Ok(CoverageScope::Section(m.principal_instrument_ids)),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
 /// Require the caller to be able to **build/edit collections** in the org
 /// (CLAUDE.md Permission matrix: `owner`, `archivist`, *or* `conductor`). This
 /// is not a single `at_least` threshold — archivist and conductor are
