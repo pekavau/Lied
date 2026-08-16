@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        FROM part_assignment\n        WHERE collection_item_id = $1 AND voice_id = $2\n        ORDER BY created_at ASC, id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "voice_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "notified_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "acknowledged_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "d49206db24195e23585fb288d755dada58537baf56e5a9f42119d6d15b7d02c7"
+}
