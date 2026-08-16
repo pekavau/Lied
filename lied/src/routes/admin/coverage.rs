@@ -18,9 +18,11 @@ use axum::Router;
 use maud::{html, Markup};
 use uuid::Uuid;
 
+use crate::auth::authz::{coverage_scope_for, CoverageScope};
 use crate::auth::extractors::AuthSession;
+use crate::domain::collection;
 use crate::domain::coverage::{self, CoverageReport, VoiceState};
-use crate::domain::{collection, membership};
+use crate::error::AppError;
 use crate::listing::SortDirection;
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::state::AppState;
@@ -47,22 +49,29 @@ async fn enter(
     org_id: Uuid,
 ) -> Result<(ConsoleCtx, coverage::Required), Response> {
     let ctx = console::enter(state, auth, org_id).await?;
-    if !ctx.can_view_coverage() {
-        return Err(console::section_forbidden(&ctx));
-    }
-    if ctx.is_staff() {
-        return Ok((ctx, coverage::Required::EveryVoice));
-    }
-    // A principal: scope to their own instruments. The membership is re-read
-    // rather than carried on `ConsoleCtx`, which holds capabilities and not the
-    // instrument lists.
-    let section = membership::find_by_user_and_org(&state.db, ctx.user().id, org_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|m| m.principal_instrument_ids)
-        .unwrap_or_default();
-    Ok((ctx, coverage::Required::Instruments(section)))
+    // The same rule `/v1` applies, not a second copy of it: staff see the
+    // programme, a principal sees their section, everyone else is refused.
+    let scope = match coverage_scope_for(state, ctx.user(), org_id).await {
+        Ok(scope) => scope,
+        Err(AppError::Forbidden) => return Err(console::section_forbidden(&ctx)),
+        Err(error) => {
+            // A database failure must not masquerade as an empty section — a
+            // principal would read that as "nothing of mine is in this
+            // programme", which is a different and much worse answer.
+            tracing::error!(%error, "failed to resolve the coverage scope");
+            return Err(console::error_page(
+                &ctx,
+                Section::Coverage,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not work out which coverage you may see. Please retry.",
+            ));
+        }
+    };
+    let required = match scope {
+        CoverageScope::FullProgram => coverage::Required::EveryVoice,
+        CoverageScope::Section(instrument_ids) => coverage::Required::Instruments(instrument_ids),
+    };
+    Ok((ctx, required))
 }
 
 fn is_section_view(required: &coverage::Required) -> bool {
@@ -98,17 +107,22 @@ async fn dashboard(
     };
 
     let page_size = i64::from(state.config.max_page_size);
-    let collections = match collection::list_for_org(
-        &state.db,
-        org_id,
-        page_size,
-        0,
-        "name",
-        SortDirection::Asc,
-        None,
-    )
-    .await
-    {
+    // One query for the whole org, not one per collection: this page exists to
+    // be scanned, and a five-way join per row would make it the slowest screen
+    // in the console.
+    let (collections, reports) = tokio::join!(
+        collection::list_for_org(
+            &state.db,
+            org_id,
+            page_size,
+            0,
+            "name",
+            SortDirection::Asc,
+            None,
+        ),
+        coverage::for_org(&state.db, org_id, &required),
+    );
+    let collections = match collections {
         Ok((rows, _)) => rows,
         Err(error) => {
             tracing::error!(%error, "failed to list collections for coverage");
@@ -120,16 +134,40 @@ async fn dashboard(
             );
         }
     };
-
-    let mut reports = Vec::new();
-    for c in collections {
-        match coverage::for_collection(&state.db, c.id, &required).await {
-            Ok(report) => reports.push((c, report)),
-            Err(error) => {
-                tracing::error!(%error, collection_id = %c.id, "coverage query failed");
-            }
+    // A dashboard whose whole job is "what still needs attention" must not drop
+    // a row it could not compute — a missing collection reads as nothing to
+    // worry about.
+    let reports = match reports {
+        Ok(reports) => reports,
+        Err(error) => {
+            tracing::error!(%error, "coverage query failed");
+            return console::error_page(
+                &ctx,
+                Section::Coverage,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not work out coverage. The numbers would have been wrong, \
+                 so none are shown.",
+            );
         }
-    }
+    };
+
+    let mut reports: Vec<(collection::Collection, CoverageReport)> = collections
+        .into_iter()
+        .map(|c| {
+            let report = reports
+                .iter()
+                .find(|r| r.collection_id == c.id)
+                .cloned()
+                .unwrap_or_else(|| CoverageReport {
+                    collection_id: c.id,
+                    items: Vec::new(),
+                    required: 0,
+                    assigned: 0,
+                    rehearsed: 0,
+                });
+            (c, report)
+        })
+        .collect();
     // Worst first: the programme that needs work should not be below the fold.
     // Collections requiring nothing sink to the bottom rather than reading as
     // perfectly covered.

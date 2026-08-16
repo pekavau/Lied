@@ -189,11 +189,7 @@ pub async fn for_collection(
             continue;
         };
 
-        let state = match (row.assignment_id, row.acknowledged_at) {
-            (None, _) => VoiceState::Unassigned,
-            (Some(_), None) => VoiceState::Assigned,
-            (Some(_), Some(_)) => VoiceState::Rehearsed,
-        };
+        let state = classify(row.assignment_id, row.acknowledged_at);
         item.required += 1;
         match state {
             VoiceState::Unassigned => {}
@@ -229,4 +225,143 @@ pub async fn for_collection(
         assigned: assigned_total,
         rehearsed: rehearsed_total,
     })
+}
+
+/// Coverage for **every** collection in an org, in one query.
+///
+/// The dashboard renders one row per collection, and looping
+/// [`for_collection`] over them would issue a five-way join per row — the N+1
+/// that #33's review caught in the assignee list, with a heavier query behind
+/// it. The grouping below is the same as [`for_collection`]'s with one more
+/// level on top.
+///
+/// Collections with no live items still appear (with zero tallies): "this
+/// programme is empty" is something the dashboard must be able to say.
+pub async fn for_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+    required: &Required,
+) -> Result<Vec<CoverageReport>, sqlx::Error> {
+    let instrument_filter: Option<Vec<Uuid>> = match required {
+        Required::EveryVoice => None,
+        Required::Instruments(ids) => Some(ids.clone()),
+    };
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            c.id as collection_id,
+            ci.id as "item_id?",
+            ci.index as "item_index?",
+            a.id as "arrangement_id?",
+            a.title as "arrangement_title?",
+            a.slug as "arrangement_slug?",
+            (a.deleted_at IS NOT NULL) as "arrangement_removed?",
+            v.id as "voice_id?",
+            v.name as "voice_name?",
+            v.instrument_id as "instrument_id?",
+            u.username as "assignee_username?",
+            u.display_name as "assignee_display_name?",
+            pa.id as "assignment_id?",
+            pa.notified_at as "notified_at?: DateTime<Utc>",
+            pa.acknowledged_at as "acknowledged_at?: DateTime<Utc>"
+        FROM collection c
+        LEFT JOIN collection_item ci
+          ON ci.collection_id = c.id AND ci.deleted_at IS NULL
+        LEFT JOIN arrangement a ON a.id = ci.arrangement_id
+        LEFT JOIN voice v
+          ON v.arrangement_id = a.id
+         AND v.deleted_at IS NULL
+         AND a.deleted_at IS NULL
+         AND ($2::uuid[] IS NULL OR v.instrument_id = ANY($2))
+        LEFT JOIN part_assignment pa
+          ON pa.collection_item_id = ci.id AND pa.voice_id = v.id
+        LEFT JOIN "user" u ON u.id = pa.user_id
+        WHERE c.organization_id = $1 AND c.deleted_at IS NULL
+        ORDER BY c.name ASC, c.id ASC, ci.index ASC, ci.id ASC, v.name ASC, v.id ASC
+        "#,
+        organization_id,
+        instrument_filter.as_deref(),
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut reports: Vec<CoverageReport> = Vec::new();
+    for row in rows {
+        if reports.last().map(|r| r.collection_id) != Some(row.collection_id) {
+            reports.push(CoverageReport {
+                collection_id: row.collection_id,
+                items: Vec::new(),
+                required: 0,
+                assigned: 0,
+                rehearsed: 0,
+            });
+        }
+        let report = reports.last_mut().expect("just pushed");
+
+        // A collection with no live items yields one all-NULL row.
+        let (Some(item_id), Some(index), Some(arrangement_id)) =
+            (row.item_id, row.item_index, row.arrangement_id)
+        else {
+            continue;
+        };
+        if report.items.last().map(|i| i.item_id) != Some(item_id) {
+            report.items.push(ItemCoverage {
+                item_id,
+                index,
+                arrangement_id,
+                arrangement_title: row.arrangement_title.unwrap_or_default(),
+                arrangement_slug: row.arrangement_slug.unwrap_or_default(),
+                arrangement_removed: row.arrangement_removed.unwrap_or(false),
+                voices: Vec::new(),
+                required: 0,
+                assigned: 0,
+                rehearsed: 0,
+            });
+        }
+        let item = report.items.last_mut().expect("just pushed");
+
+        let (Some(voice_id), Some(voice_name), Some(instrument_id)) =
+            (row.voice_id, row.voice_name, row.instrument_id)
+        else {
+            continue;
+        };
+        let state = classify(row.assignment_id, row.acknowledged_at);
+        item.required += 1;
+        match state {
+            VoiceState::Unassigned => {}
+            VoiceState::Assigned => item.assigned += 1,
+            VoiceState::Rehearsed => {
+                item.assigned += 1;
+                item.rehearsed += 1;
+            }
+        }
+        item.voices.push(VoiceCoverage {
+            voice_id,
+            voice_name,
+            instrument_id,
+            state,
+            assignee_username: row.assignee_username,
+            assignee_display_name: row.assignee_display_name,
+            notified_at: row.notified_at,
+            acknowledged_at: row.acknowledged_at,
+        });
+    }
+
+    for report in &mut reports {
+        report.required = report.items.iter().map(|i| i.required).sum();
+        report.assigned = report.items.iter().map(|i| i.assigned).sum();
+        report.rehearsed = report.items.iter().map(|i| i.rehearsed).sum();
+    }
+    Ok(reports)
+}
+
+/// The one place a `(assignment, acknowledged_at)` pair becomes a state, shared
+/// by both queries so they cannot classify differently.
+fn classify(assignment_id: Option<Uuid>, acknowledged_at: Option<DateTime<Utc>>) -> VoiceState {
+    match (assignment_id, acknowledged_at) {
+        (None, _) => VoiceState::Unassigned,
+        (Some(_), None) => VoiceState::Assigned,
+        (Some(_), Some(_)) => VoiceState::Rehearsed,
+    }
 }
