@@ -116,9 +116,15 @@ pub struct ItemCoverage {
     /// them.
     pub required: usize,
     pub covered: usize,
-    /// Players: how many musicians are assigned across those parts, and how
-    /// many have acknowledged. A different question with a different
-    /// denominator — the two must be labelled wherever they are shown.
+    /// Players: how many **distinct people** are assigned across those parts,
+    /// and how many of them have acknowledged everything they hold. A different
+    /// question with a different denominator from the part counts, so the two
+    /// must be labelled wherever they are shown.
+    ///
+    /// Distinct people, not assignment rows: somebody holding two voices of
+    /// this piece is one musician who cannot be in two places — which is what
+    /// `conflicts` says — and counting them twice would inflate a section that
+    /// is in fact short-handed.
     pub players: usize,
     pub players_acknowledged: usize,
     /// Musicians holding more than one voice in *this* piece.
@@ -160,22 +166,36 @@ impl CoverageReport {
 /// The ORDER BY in both queries guarantees rows arrive grouped.
 struct Grouper;
 
+/// One query row's voice-and-player half, named so the ten nullable columns
+/// cannot be passed in the wrong order — `username` and `display_name` are both
+/// `Option<String>`, and swapping them would compile and be wrong forever.
+pub(crate) struct VoiceRow {
+    pub voice_id: Option<Uuid>,
+    pub voice_name: Option<String>,
+    pub instrument_id: Option<Uuid>,
+    pub assignment_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub notified_at: Option<DateTime<Utc>>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+}
+
 impl Grouper {
     /// Add a voice row to `item`, starting a new voice when the id changes and
     /// appending a player when the row carries one.
-    #[allow(clippy::too_many_arguments)]
-    fn push_voice(
-        item: &mut ItemCoverage,
-        voice_id: Option<Uuid>,
-        voice_name: Option<String>,
-        instrument_id: Option<Uuid>,
-        assignment_id: Option<Uuid>,
-        user_id: Option<Uuid>,
-        username: Option<String>,
-        display_name: Option<String>,
-        notified_at: Option<DateTime<Utc>>,
-        acknowledged_at: Option<DateTime<Utc>>,
-    ) {
+    fn push_voice(item: &mut ItemCoverage, row: VoiceRow) {
+        let VoiceRow {
+            voice_id,
+            voice_name,
+            instrument_id,
+            assignment_id,
+            user_id,
+            username,
+            display_name,
+            notified_at,
+            acknowledged_at,
+        } = row;
         // An all-NULL voice marks a piece with nothing required (no live
         // voices, or a removed arrangement) — not a voice.
         let (Some(voice_id), Some(voice_name), Some(instrument_id)) =
@@ -216,6 +236,10 @@ impl Grouper {
     /// this same structure.
     fn finish_item(item: &mut ItemCoverage) {
         if item.arrangement_removed {
+            // Requires nothing, and its players are not counted anywhere. The
+            // voices themselves stay in `voices` so whoever holds them can be
+            // seen and cleaned up — the JSON would otherwise claim zero players
+            // beside a list of them.
             item.required = 0;
             item.covered = 0;
             item.players = 0;
@@ -225,8 +249,23 @@ impl Grouper {
         }
         item.required = item.voices.len();
         item.covered = item.voices.iter().filter(|v| v.is_covered()).count();
-        item.players = item.voices.iter().map(|v| v.players.len()).sum();
-        item.players_acknowledged = item.voices.iter().map(|v| v.acknowledged()).sum();
+
+        // Distinct people. Somebody on two parts of this piece is one musician,
+        // and counting them twice would make a short-handed section look fuller
+        // than it is — the opposite of what this screen is for.
+        let mut people: Vec<(Uuid, bool)> = Vec::new();
+        for voice in &item.voices {
+            for player in &voice.players {
+                let acknowledged = player.acknowledged_at.is_some();
+                match people.iter_mut().find(|(id, _)| *id == player.user_id) {
+                    // Acknowledged everything they hold, or they are not done.
+                    Some((_, all_acked)) => *all_acked = *all_acked && acknowledged,
+                    None => people.push((player.user_id, acknowledged)),
+                }
+            }
+        }
+        item.players = people.len();
+        item.players_acknowledged = people.iter().filter(|(_, acked)| *acked).count();
 
         // Somebody on more than one voice of this piece cannot play them at
         // once. Scoped to the piece: the same person on 1st trumpet in one
@@ -259,11 +298,32 @@ impl Grouper {
     }
 
     /// Roll finished pieces up into a report's totals.
+    ///
+    /// Parts add up across pieces — forty parts in a programme is forty jobs to
+    /// fill. **People do not**: a musician who plays every piece is one
+    /// musician, and summing the per-piece counts would report them once per
+    /// piece. So the player figures are distinct people across the whole
+    /// collection, and "acknowledged" means they have acknowledged *everything*
+    /// they hold in it — which is the question an archivist is actually asking
+    /// before a concert.
     fn finish_report(report: &mut CoverageReport) {
         report.required = report.items.iter().map(|i| i.required).sum();
         report.covered = report.items.iter().map(|i| i.covered).sum();
-        report.players = report.items.iter().map(|i| i.players).sum();
-        report.players_acknowledged = report.items.iter().map(|i| i.players_acknowledged).sum();
+
+        let mut people: Vec<(Uuid, bool)> = Vec::new();
+        for item in report.items.iter().filter(|i| !i.arrangement_removed) {
+            for voice in &item.voices {
+                for player in &voice.players {
+                    let acknowledged = player.acknowledged_at.is_some();
+                    match people.iter_mut().find(|(id, _)| *id == player.user_id) {
+                        Some((_, all_acked)) => *all_acked = *all_acked && acknowledged,
+                        None => people.push((player.user_id, acknowledged)),
+                    }
+                }
+            }
+        }
+        report.players = people.len();
+        report.players_acknowledged = people.iter().filter(|(_, acked)| *acked).count();
     }
 }
 
@@ -378,15 +438,17 @@ async fn query_collection(
         let item = items.last_mut().expect("just pushed");
         Grouper::push_voice(
             item,
-            row.voice_id,
-            row.voice_name,
-            row.instrument_id,
-            row.assignment_id,
-            row.assignee_user_id,
-            row.assignee_username,
-            row.assignee_display_name,
-            row.notified_at,
-            row.acknowledged_at,
+            VoiceRow {
+                voice_id: row.voice_id,
+                voice_name: row.voice_name,
+                instrument_id: row.instrument_id,
+                assignment_id: row.assignment_id,
+                user_id: row.assignee_user_id,
+                username: row.assignee_username,
+                display_name: row.assignee_display_name,
+                notified_at: row.notified_at,
+                acknowledged_at: row.acknowledged_at,
+            },
         );
     }
     for item in &mut items {
@@ -494,15 +556,17 @@ pub async fn for_org(
         let item = report.items.last_mut().expect("just pushed");
         Grouper::push_voice(
             item,
-            row.voice_id,
-            row.voice_name,
-            row.instrument_id,
-            row.assignment_id,
-            row.assignee_user_id,
-            row.assignee_username,
-            row.assignee_display_name,
-            row.notified_at,
-            row.acknowledged_at,
+            VoiceRow {
+                voice_id: row.voice_id,
+                voice_name: row.voice_name,
+                instrument_id: row.instrument_id,
+                assignment_id: row.assignment_id,
+                user_id: row.assignee_user_id,
+                username: row.assignee_username,
+                display_name: row.assignee_display_name,
+                notified_at: row.notified_at,
+                acknowledged_at: row.acknowledged_at,
+            },
         );
     }
 
