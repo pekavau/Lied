@@ -303,10 +303,10 @@ async fn seed_programme(pool: &PgPool, org_id: Uuid) -> Programme {
 }
 
 async fn assign(pool: &PgPool, item: Uuid, voice: Uuid, user: Uuid) -> Uuid {
-    let (row, _) = part_assignment::assign(pool, Uuid::now_v7(), item, voice, user, None)
+    part_assignment::assign(pool, Uuid::now_v7(), item, voice, user, None)
         .await
-        .expect("assign");
-    row.id
+        .expect("assign")
+        .id
 }
 
 async fn acknowledge(pool: &PgPool, assignment: Uuid) {
@@ -398,31 +398,36 @@ async fn coverage_reports_gaps_assignments_and_rehearsal_per_piece() {
     acknowledge(&db.pool, a1).await;
 
     let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
-    assert_eq!(report["required"], 4);
-    assert_eq!(
-        report["assigned"], 3,
-        "rehearsed voices count as assigned too"
-    );
-    assert_eq!(report["rehearsed"], 1);
+    assert_eq!(report["required"], 4, "four parts");
+    assert_eq!(report["covered"], 3, "three of them have somebody on");
+    assert_eq!(report["players"], 3);
+    assert_eq!(report["playersAcknowledged"], 1);
 
     let items = report["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["required"], 2);
-    assert_eq!(items[0]["assigned"], 2);
-    assert_eq!(items[0]["rehearsed"], 1);
-    assert_eq!(items[1]["assigned"], 1, "the second piece has a gap");
+    assert_eq!(items[0]["covered"], 2);
+    assert_eq!(items[0]["playersAcknowledged"], 1);
+    assert_eq!(items[1]["covered"], 1, "the second piece has a gap");
 
-    // The three states are distinguishable per voice, which is what the
-    // dashboard renders.
-    let states: Vec<&str> = items
+    // Each voice carries its players, and acknowledgement is a ratio rather
+    // than a flag — a section that is half-acknowledged is neither rehearsed
+    // nor unrehearsed.
+    let per_voice: Vec<(usize, usize)> = items
         .iter()
         .flat_map(|item| item["voices"].as_array().unwrap())
-        .map(|v| v["state"].as_str().unwrap())
+        .map(|v| {
+            let players = v["players"].as_array().unwrap();
+            (
+                players.len(),
+                players
+                    .iter()
+                    .filter(|p| !p["acknowledgedAt"].is_null())
+                    .count(),
+            )
+        })
         .collect();
-    assert_eq!(
-        states,
-        vec!["rehearsed", "assigned", "assigned", "unassigned"]
-    );
+    assert_eq!(per_voice, vec![(1, 1), (1, 0), (1, 0), (0, 0)]);
 }
 
 #[tokio::test]
@@ -468,10 +473,11 @@ async fn soft_deleted_voices_items_and_arrangements_are_never_required() {
     assert_eq!(report["required"], 1, "only the first piece still counts");
     let removed = &report["items"][1];
     assert_eq!(removed["arrangementRemoved"], true);
-    assert_eq!(removed["required"], 0);
+    assert_eq!(removed["required"], 0, "a removed piece requires nothing");
+    assert_eq!(removed["players"], 0, "…and its players count for nothing");
     assert!(
-        removed["voices"].as_array().unwrap().is_empty(),
-        "a removed piece contributes no voices"
+        !removed["voices"].as_array().unwrap().is_empty(),
+        "…but its voices stay visible, so whoever holds them can be cleaned up"
     );
 
     // A piece removed from the programme disappears entirely.
@@ -578,7 +584,7 @@ async fn a_plain_musician_is_refused_and_an_unconfigured_principal_gets_an_empty
     let unconfigured = seed_musician(&db.pool, &state, org_id, "new-lead", true, &[]).await;
     let report = coverage_json(&app, &unconfigured, org_id, programme.collection_id).await;
     assert_eq!(report["required"], 0);
-    assert_eq!(report["assigned"], 0);
+    assert_eq!(report["covered"], 0);
     assert!(
         report["items"]
             .as_array()
@@ -675,8 +681,18 @@ async fn the_org_wide_query_agrees_with_the_per_collection_one() {
                 .await
                 .expect("per-collection coverage");
             assert_eq!(
-                (report.required, report.assigned, report.rehearsed),
-                (single.required, single.assigned, single.rehearsed),
+                (
+                    report.required,
+                    report.covered,
+                    report.players,
+                    report.players_acknowledged
+                ),
+                (
+                    single.required,
+                    single.covered,
+                    single.players,
+                    single.players_acknowledged
+                ),
                 "the two queries disagree about collection {}",
                 report.collection_id
             );
@@ -687,4 +703,123 @@ async fn the_org_wide_query_agrees_with_the_per_collection_one() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_part_counts_once_however_many_players_it_has() {
+    // Eight second violins read one part. Before #53 the tallies were
+    // incremented per returned row, so a section would have reported 8/8 for a
+    // single part — parts and players are different denominators.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+
+    // Three players on the first voice, one of whom has acknowledged.
+    let mut first = None;
+    for username in ["desk-one", "desk-two", "desk-three"] {
+        let player = create_plain_user(&db.pool, username).await;
+        let id = assign(
+            &db.pool,
+            programme.items[0],
+            programme.voices[0].0,
+            player.id,
+        )
+        .await;
+        first.get_or_insert(id);
+    }
+    acknowledge(&db.pool, first.unwrap()).await;
+
+    let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
+    assert_eq!(report["required"], 4, "still four parts");
+    assert_eq!(report["covered"], 1, "one of them has anybody on it");
+    assert_eq!(report["players"], 3, "…played by three people");
+    assert_eq!(report["playersAcknowledged"], 1);
+
+    let voice = &report["items"][0]["voices"][0];
+    assert_eq!(voice["players"].as_array().unwrap().len(), 3);
+    let names: Vec<&str> = voice["players"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["desk-one", "desk-two", "desk-three"],
+        "players are listed in the order they were added"
+    );
+}
+
+#[tokio::test]
+async fn one_person_on_two_voices_of_a_piece_is_reported_as_a_conflict() {
+    // Legal and sometimes necessary — who plays what gets juggled by who turns
+    // up — but nobody plays two parts at once, so the tallies would otherwise
+    // overstate how ready the piece is.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+    let doubling = create_plain_user(&db.pool, "doubling-player").await;
+
+    // Both voices of the FIRST piece.
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[0].0,
+        doubling.id,
+    )
+    .await;
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[1].0,
+        doubling.id,
+    )
+    .await;
+    // …and one voice of the second piece, which is not a conflict: different
+    // pieces are played at different times.
+    assign(
+        &db.pool,
+        programme.items[1],
+        programme.voices[2].0,
+        doubling.id,
+    )
+    .await;
+
+    let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
+    let first = &report["items"][0];
+    let second = &report["items"][1];
+
+    let conflicts = first["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "the doubling is flagged");
+    assert_eq!(conflicts[0]["username"], "doubling-player");
+    assert_eq!(
+        conflicts[0]["voiceNames"].as_array().unwrap().len(),
+        2,
+        "naming both voices they hold"
+    );
+    assert!(
+        second["conflicts"].as_array().unwrap().is_empty(),
+        "holding a part in another piece is ordinary, not a conflict"
+    );
+
+    // The piece still reports as covered: the conflict informs, it does not
+    // reduce the tallies or block anything.
+    assert_eq!(first["covered"], 2);
+    assert_eq!(first["required"], 2);
 }

@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::auth::authz::{coverage_scope_for, CoverageScope};
 use crate::auth::extractors::AuthSession;
 use crate::domain::collection;
-use crate::domain::coverage::{self, CoverageReport, VoiceState};
+use crate::domain::coverage::{self, CoverageReport};
 use crate::error::AppError;
 use crate::listing::SortDirection;
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
@@ -78,20 +78,28 @@ fn is_section_view(required: &coverage::Required) -> bool {
     matches!(required, coverage::Required::Instruments(_))
 }
 
-/// "12 of 14" with the shortfall called out, or a plain tally when complete.
+/// Parts and players are different questions with different denominators, so
+/// both are named rather than blended into one ratio: a programme can be fully
+/// cast and barely acknowledged, or half-cast and fully acknowledged.
 fn tally(report: &CoverageReport) -> Markup {
+    let conflicts = report.conflicts().count();
     html! {
         @if report.required == 0 {
             span class="muted" { "nothing required" }
-        } @else if report.is_fully_assigned() {
-            span { (report.assigned) "/" (report.required) " assigned" }
-            " · " span { (report.rehearsed) " rehearsed" }
         } @else {
-            span class="error" {
-                (report.assigned) "/" (report.required) " assigned — "
-                (report.required - report.assigned) " gap(s)"
+            @if report.is_fully_covered() {
+                span { (report.covered) "/" (report.required) " parts covered" }
+            } @else {
+                span class="error" {
+                    (report.covered) "/" (report.required) " parts covered — "
+                    (report.required - report.covered) " gap(s)"
+                }
             }
-            " · " span { (report.rehearsed) " rehearsed" }
+            " · "
+            span { (report.players_acknowledged) " of " (report.players) " players acknowledged" }
+            @if conflicts > 0 {
+                " · " span class="error" { (conflicts) " conflict(s)" }
+            }
         }
     }
 }
@@ -162,8 +170,9 @@ async fn dashboard(
                     collection_id: c.id,
                     items: Vec::new(),
                     required: 0,
-                    assigned: 0,
-                    rehearsed: 0,
+                    covered: 0,
+                    players: 0,
+                    players_acknowledged: 0,
                 });
             (c, report)
         })
@@ -176,7 +185,7 @@ async fn dashboard(
             if r.required == 0 {
                 f64::MAX
             } else {
-                r.assigned as f64 / r.required as f64
+                r.covered as f64 / r.required as f64
             }
         };
         shortfall(a)
@@ -290,15 +299,17 @@ async fn collection_coverage(
                 " "
                 @if item.required == 0 {
                     span class="muted" { "— nothing required" }
-                } @else if item.assigned == item.required {
+                } @else if item.covered == item.required {
                     span class="muted" {
-                        "— " (item.assigned) "/" (item.required) " assigned, "
-                        (item.rehearsed) " rehearsed"
+                        "— " (item.covered) "/" (item.required) " parts covered, "
+                        (item.players_acknowledged) " of " (item.players)
+                        " players acknowledged"
                     }
                 } @else {
                     span class="error" {
-                        "— " (item.assigned) "/" (item.required) " assigned, "
-                        (item.rehearsed) " rehearsed"
+                        "— " (item.covered) "/" (item.required) " parts covered, "
+                        (item.players_acknowledged) " of " (item.players)
+                        " players acknowledged"
                     }
                 }
                 @if can_assign && !item.arrangement_removed {
@@ -316,29 +327,42 @@ async fn collection_coverage(
                     "programme."
                 }
             }
+            // Somebody on two parts of one piece cannot play both at once. Not
+            // prevented — sections get juggled by who turns up — but the
+            // tallies above would otherwise overstate how ready this is.
+            @for conflict in &item.conflicts {
+                p class="error" {
+                    "⚠ " (conflict.display_name)
+                    " (" (conflict.username) ") is on "
+                    (conflict.voice_names.join(" and "))
+                    " — one player cannot cover both at the same time."
+                }
+            }
             table {
-                thead { tr { th { "Voice" } th { "Assigned to" } th { "State" } } }
+                thead { tr { th { "Voice" } th { "Players" } th { "Acknowledged" } } }
                 tbody {
                     @for voice in &item.voices {
                         tr {
                             td { (voice.voice_name) }
                             td {
-                                @match &voice.assignee_display_name {
-                                    Some(name) => (name),
-                                    None => span class="muted" { "—" },
+                                @if voice.players.is_empty() {
+                                    span class="error" { "unassigned" }
+                                } @else {
+                                    @for (position, player) in voice.players.iter().enumerate() {
+                                        @if position > 0 { ", " }
+                                        (player.display_name)
+                                        @if player.acknowledged_at.is_none()
+                                            && player.notified_at.is_none() {
+                                            span class="muted" { " (not yet notified)" }
+                                        }
+                                    }
                                 }
                             }
                             td {
-                                @match voice.state {
-                                    VoiceState::Unassigned => span class="error" { "unassigned" },
-                                    VoiceState::Assigned => {
-                                        @if voice.notified_at.is_some() {
-                                            "notified, not acknowledged"
-                                        } @else {
-                                            "assigned, not yet notified"
-                                        }
-                                    }
-                                    VoiceState::Rehearsed => "rehearsed",
+                                @if voice.players.is_empty() {
+                                    span class="muted" { "—" }
+                                } @else {
+                                    (voice.acknowledged()) " of " (voice.players.len())
                                 }
                             }
                         }

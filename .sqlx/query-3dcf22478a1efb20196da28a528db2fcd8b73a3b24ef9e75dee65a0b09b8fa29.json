@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        FROM part_assignment\n        WHERE collection_item_id = $1 AND voice_id = $2\n        ",
+  "query": "\n        INSERT INTO part_assignment (id, collection_item_id, user_id, voice_id, created_by)\n        SELECT $1, ci.id, $4, v.id, $5\n        FROM collection_item ci\n        JOIN voice v\n          ON v.id = $3\n         AND v.arrangement_id = ci.arrangement_id\n         AND v.deleted_at IS NULL\n        WHERE ci.id = $2 AND ci.deleted_at IS NULL\n        RETURNING\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        ",
   "describe": {
     "columns": [
       {
@@ -52,6 +52,9 @@
     "parameters": {
       "Left": [
         "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
         "Uuid"
       ]
     },
@@ -67,5 +70,5 @@
       true
     ]
   },
-  "hash": "90ba6af6cd370d8864047552aafe8dfab63be23a8612ede4f6c69adc73ecade1"
+  "hash": "3dcf22478a1efb20196da28a528db2fcd8b73a3b24ef9e75dee65a0b09b8fa29"
 }

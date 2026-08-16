@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
-use crate::domain::{arrangement, collection, collection_item, membership, part_assignment, user};
+use crate::domain::{
+    arrangement, collection, collection_item, coverage, membership, part_assignment, user,
+};
 use crate::listing::{check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, require_found, scoped_arrangement,
@@ -1209,8 +1211,16 @@ async fn assignments_page(
         Err(response) => return response,
     };
 
-    let matrix = match part_assignment::voice_matrix_for_item(&state.db, item_id).await {
-        Ok(rows) => rows,
+    let matrix = match coverage::for_item(
+        &state.db,
+        collection_id,
+        item_id,
+        &coverage::Required::EveryVoice,
+    )
+    .await
+    {
+        Ok(Some(item)) => item.voices,
+        Ok(None) => Vec::new(),
         Err(error) => {
             tracing::error!(%error, "failed to load the assignment matrix");
             return error_page(
@@ -1266,81 +1276,71 @@ async fn assignments_page(
         table {
             thead {
                 tr {
-                    th { "Voice" } th { "Assigned to" } th { "Notified" }
-                    th { "Acknowledged" } th { "Assign / reassign" }
+                    th { "Voice" } th { "Players" } th { "Add a player" }
                 }
             }
             tbody {
                 @for row in &matrix {
                     tr {
-                        td { (row.voice_name) }
                         td {
-                            @match &row.assignee_username {
-                                Some(username) => {
-                                    (row.assignee_display_name.clone().unwrap_or_else(|| username.clone()))
-                                    " "
-                                    span class="muted" { "(" (username) ")" }
-                                }
-                                None => span class="muted" { "unassigned" },
+                            (row.voice_name)
+                            @if row.players.len() > 1 {
+                                " " span class="muted" { "(" (row.players.len()) " players)" }
                             }
                         }
                         td {
-                            @match row.notified_at {
-                                Some(at) => (at.format("%Y-%m-%d %H:%M").to_string()),
-                                None => {
-                                    @if let Some(id) = row.assignment_id {
-                                        form class="inline" method="post"
-                                             action=(format!("{base}/{id}/notified")) {
-                                            (layout::csrf_field(&token))
-                                            button type="submit" { "Mark notified" }
+                            @if row.players.is_empty() {
+                                span class="muted" { "nobody yet" }
+                            }
+                            @for player in &row.players {
+                                div {
+                                    (player.display_name)
+                                    " " span class="muted" { "(" (player.username) ")" }
+                                    " — "
+                                    @match player.acknowledged_at {
+                                        Some(at) => {
+                                            "acknowledged " (at.format("%Y-%m-%d").to_string())
                                         }
-                                    } @else {
-                                        span class="muted" { "—" }
+                                        None => {
+                                            @match player.notified_at {
+                                                Some(at) => {
+                                                    "notified " (at.format("%Y-%m-%d").to_string())
+                                                    " "
+                                                    form class="inline" method="post"
+                                                         action=(format!("{base}/{}/acknowledged", player.assignment_id)) {
+                                                        (layout::csrf_field(&token))
+                                                        button type="submit" { "Mark acknowledged" }
+                                                    }
+                                                }
+                                                None => {
+                                                    span class="muted" { "not yet notified" }
+                                                    " "
+                                                    form class="inline" method="post"
+                                                         action=(format!("{base}/{}/notified", player.assignment_id)) {
+                                                        (layout::csrf_field(&token))
+                                                        button type="submit" { "Mark notified" }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                        }
-                        td {
-                            @match row.acknowledged_at {
-                                Some(at) => (at.format("%Y-%m-%d %H:%M").to_string()),
-                                None => {
-                                    @if let Some(id) = row.assignment_id {
-                                        form class="inline" method="post"
-                                             action=(format!("{base}/{id}/acknowledged")) {
-                                            (layout::csrf_field(&token))
-                                            button type="submit" { "Mark acknowledged" }
-                                        }
-                                    } @else {
-                                        span class="muted" { "—" }
+                                    " "
+                                    form class="inline" method="post"
+                                         action=(format!("{base}/{}/unassign", player.assignment_id)) {
+                                        (layout::csrf_field(&token))
+                                        button type="submit" { "Remove" }
                                     }
                                 }
                             }
                         }
                         td {
                             @if !arrangement_removed {
-                            form class="inline" method="post" action=(&base) {
-                                (layout::csrf_field(&token))
-                                input type="hidden" name="voice_id" value=(row.voice_id);
-                                // Present only when replacing an existing
-                                // assignee: the same If-Match contract `/v1`
-                                // enforces on a reassignment.
-                                @if let Some(updated_at) = row.assignment_updated_at {
-                                    input type="hidden" name="expected_version"
-                                          value=(updated_at.timestamp_millis());
-                                }
-                                input type="text" name="username" list="member-usernames"
-                                      placeholder="username" required;
-                                button type="submit" {
-                                    @if row.assignment_id.is_some() { "Reassign" } @else { "Assign" }
-                                }
-                            }
-                            }
-                            @if let Some(id) = row.assignment_id {
-                                " "
-                                form class="inline" method="post"
-                                     action=(format!("{base}/{id}/unassign")) {
+                                form class="inline" method="post" action=(&base) {
                                     (layout::csrf_field(&token))
-                                    button type="submit" { "Unassign" }
+                                    input type="hidden" name="voice_id" value=(row.voice_id);
+                                    input type="text" name="username" list="member-usernames"
+                                          placeholder="username" required;
+                                    button type="submit" { "Add" }
                                 }
                             }
                         }
@@ -1348,6 +1348,7 @@ async fn assignments_page(
                 }
             }
         }
+
         @if matrix.is_empty() {
             p class="muted" {
                 "This arrangement has no voices yet — add them in the catalog "
@@ -1427,26 +1428,6 @@ async fn assign_part(
         }
     };
 
-    // Replacing an existing assignee is the concurrency-sensitive case (the
-    // previous assignee may have been notified since this page rendered), so it
-    // carries the same If-Match contract `/v1` enforces.
-    let existing = match part_assignment::find_by_item_voice(&state.db, item_id, voice_id).await {
-        Ok(existing) => existing,
-        Err(error) => {
-            tracing::error!(%error, "failed to check the current assignee");
-            return error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not check the current assignee.",
-            );
-        }
-    };
-    if let Some(ref current) = existing {
-        if check_if_match(field(&pairs, "expected_version"), current.updated_at).is_err() {
-            return console::precondition_page(&ctx, Section::Collections, "assignment", &back);
-        }
-    }
-
     match part_assignment::assign(
         &state.db,
         Uuid::now_v7(),
@@ -1457,15 +1438,11 @@ async fn assign_part(
     )
     .await
     {
-        Ok((created, was_insert)) => {
+        Ok(created) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
-                if was_insert {
-                    "part_assignment.create"
-                } else {
-                    "part_assignment.reassign"
-                },
+                "part_assignment.create",
                 "part_assignment",
                 Some(created.id),
                 serde_json::json!({
@@ -1477,6 +1454,11 @@ async fn assign_part(
             .await;
             Redirect::to(&back).into_response()
         }
+        Err(part_assignment::PartAssignmentError::Duplicate) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "That musician is already playing this voice on this piece.",
+        ),
         Err(part_assignment::PartAssignmentError::VoiceNotInArrangement) => error_page(
             &ctx,
             StatusCode::NOT_FOUND,

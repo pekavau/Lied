@@ -88,6 +88,9 @@ fn empty_field(field: &str, msg: &str) -> AppError {
 
 fn part_assignment_error_to_app_error(err: part_assignment::PartAssignmentError) -> AppError {
     match err {
+        part_assignment::PartAssignmentError::Duplicate => {
+            AppError::Conflict("this musician already plays this voice on this piece".to_string())
+        }
         part_assignment::PartAssignmentError::VoiceNotInArrangement => empty_field(
             "voiceId",
             "voice does not exist or does not belong to this item's arrangement",
@@ -217,39 +220,36 @@ struct AssignRequest {
 /// (owner/archivist/conductor). `PUT` rather than `POST`: the resource
 /// identity is the `(collectionItemId, voiceId)` pair, not a client-chosen id,
 /// so re-issuing the same request with a different `userId` is a replace, not
-/// a new resource — the idiomatic `PUT` semantic. `201` on a fresh
-/// assignment, `200` when it replaced an existing one.
+/// Add a musician to a voice on a collection item.
 ///
-/// A replace is a mutation of an existing resource, so it carries the same
-/// optimistic-concurrency contract as PATCH/DELETE: when an assignment already
-/// exists for `(item, voice)`, the caller MUST send a matching `If-Match`
-/// (from a prior GET/list); a missing or stale value → `412`. A first-time
-/// assignment has no prior ETag, so the header is not required for creates.
+/// **Adds a player; it does not replace one.** A part is played by as many
+/// musicians as the section has (issue #53), so this is a `POST` that appends
+/// to the assignments collection: always `201`, and `409` when the same person
+/// is added to the same voice twice.
+///
+/// There is no `If-Match` here because nothing is being overwritten. Removing a
+/// player is `DELETE` by assignment id and changing distribution state is
+/// `PATCH` by assignment id; both keep their optimistic-concurrency contract.
 #[utoipa::path(
-    put,
+    post,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments",
     tag = "part-assignments",
-    summary = "Assign or reassign a voice on a collection item",
+    summary = "Add a musician to a voice on a collection item",
     params(
         ("orgId"        = Uuid, Path, description = "Organization ID"),
         ("collectionId" = Uuid, Path, description = "Collection ID"),
         ("itemId"       = Uuid, Path, description = "Collection item ID"),
-        ("If-Match" = Option<String>, Header,
-            description = "Required when replacing an existing assignment; ETag from a prior GET/list, stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = AssignRequest,
     responses(
-        (status = 200, description = "Existing assignment replaced", body = part_assignment::PartAssignment,
-            headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
-        (status = 201, description = "Assignment created", body = part_assignment::PartAssignment,
+        (status = 201, description = "Musician added to the voice", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
         Forbidden403,
         NotFound404,
         Validation400,
         Conflict409,
-        Precondition412,
     )
 )]
 async fn assign_voice(
@@ -257,26 +257,16 @@ async fn assign_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
-    headers: HeaderMap,
     Json(body): Json<AssignRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
 
-    // A replace overwrites an existing assignee (and resets notified/
-    // acknowledged), so guard it with `If-Match` against the current row. A
-    // fresh assignment has no prior ETag and so needs no header. An unknown
-    // `userId` is surfaced by the domain layer's FK-violation mapping (→ 400
-    // on `userId`), so no separate existence pre-check is needed here.
-    if let Some(existing) =
-        part_assignment::find_by_item_voice(&state.db, item_id, body.voice_id).await?
-    {
-        crate::listing::check_if_match(if_match_header(&headers), existing.updated_at)
-            .map_err(|_| AppError::PreconditionFailed)?;
-    }
-
+    // Nothing is overwritten, so there is no precondition to check. An unknown
+    // `userId` is surfaced by the domain's FK-violation mapping (→ 400 on
+    // `userId`), so no separate existence pre-check is needed here.
     let id = Uuid::now_v7();
-    let (created, inserted) = part_assignment::assign(
+    let created = part_assignment::assign(
         &state.db,
         id,
         item_id,
@@ -294,11 +284,7 @@ async fn assign_voice(
             org_id: Some(org_id),
             request_id: Some(request_id),
         },
-        if inserted {
-            "part_assignment.create"
-        } else {
-            "part_assignment.reassign"
-        },
+        "part_assignment.create",
         "part_assignment",
         Some(created.id),
         serde_json::json!({
@@ -309,13 +295,12 @@ async fn assign_voice(
     )
     .await;
 
-    let status = if inserted {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
     let updated_at = created.updated_at;
-    Ok(etag_response_status(status, created, updated_at))
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 // ── get / update / delete a single assignment ───────────────────────────────

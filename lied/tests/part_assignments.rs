@@ -334,7 +334,7 @@ async fn assign_a_user_and_voice_to_an_item() {
     let (status, body, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": voice })),
@@ -349,17 +349,19 @@ async fn assign_a_user_and_voice_to_an_item() {
 }
 
 #[tokio::test]
-async fn reassignment_replaces_the_row() {
+async fn a_voice_takes_several_players_and_refuses_a_duplicate() {
+    // A part is played by as many musicians as the section has (#53), so the
+    // endpoint adds rather than replaces: no upsert, no 200, no If-Match.
     let (ctx, tok, _actor) = setup(membership::Role::Archivist).await;
     let (coll, item, voice) = seed_item_and_voice(&ctx).await;
     let alice = create_user(&ctx.pool, "alice").await;
     let bob = create_user(&ctx.pool, "bob").await;
-
     let url = assignments_url(ctx.org, coll, item);
-    let (s1, first, h1) = send(
+
+    let (s1, first, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": alice, "voiceId": voice })),
@@ -367,44 +369,21 @@ async fn reassignment_replaces_the_row() {
     )
     .await;
     assert_eq!(s1, axum::http::StatusCode::CREATED);
-    let first_id = first["id"].as_str().unwrap().to_string();
-    let etag = h1.get("etag").unwrap().to_str().unwrap().to_string();
 
-    // A replace without If-Match is rejected — same optimistic-concurrency
-    // contract as PATCH/DELETE.
-    let (s_missing, _b, _h) = send(
-        &ctx.app,
-        req(
-            "PUT",
-            &url,
-            &tok,
-            Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
-        ),
-    )
-    .await;
-    assert_eq!(
-        s_missing,
-        axum::http::StatusCode::PRECONDITION_FAILED,
-        "reassignment requires If-Match"
-    );
-
-    // Reassign the same (item, voice) to bob, presenting the current ETag.
+    // A second player on the same part is a second row, not a replacement.
     let (s2, second, _h) = send(
         &ctx.app,
-        req_with_if_match(
-            "PUT",
+        req(
+            "POST",
             &url,
             &tok,
-            Some(&etag),
             Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
         ),
     )
     .await;
-    assert_eq!(s2, axum::http::StatusCode::OK, "reassignment replaces, 200");
-    assert_eq!(second["id"], first_id, "the row keeps its original id");
-    assert_eq!(second["userId"], bob.to_string());
+    assert_eq!(s2, axum::http::StatusCode::CREATED, "adding, not replacing");
+    assert_ne!(second["id"], first["id"]);
 
-    // Still exactly one row for (item, voice).
     let count: i64 = sqlx::query_scalar!(
         r#"SELECT count(*) as "c!" FROM part_assignment WHERE collection_item_id = $1 AND voice_id = $2"#,
         item,
@@ -413,71 +392,84 @@ async fn reassignment_replaces_the_row() {
     .fetch_one(&ctx.pool)
     .await
     .expect("count");
-    assert_eq!(count, 1);
-}
+    assert_eq!(count, 2, "both musicians hold the part");
 
-#[tokio::test]
-async fn reassigning_to_a_different_user_clears_notified_and_acknowledged() {
-    let (ctx, tok, _actor) = setup(membership::Role::Archivist).await;
-    let (coll, item, voice) = seed_item_and_voice(&ctx).await;
-    let alice = create_user(&ctx.pool, "alice").await;
-    let bob = create_user(&ctx.pool, "bob").await;
-
-    let url = assignments_url(ctx.org, coll, item);
-    let (_s, first, _h) = send(
+    // The same person twice is still a mistake.
+    let (s3, _b, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": alice, "voiceId": voice })),
         ),
     )
     .await;
-    let id = first["id"].as_str().unwrap().to_string();
-    let get_url = format!("{url}/{id}");
+    assert_eq!(s3, axum::http::StatusCode::CONFLICT);
+}
 
-    // Get its ETag, then mark notified + acknowledged.
-    let (_s, _b, headers) = send(&ctx.app, req("GET", &get_url, &tok, None)).await;
-    let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
-    let now = chrono::Utc::now();
-    let (s, patched, patched_h) = send(
+#[tokio::test]
+async fn adding_a_player_keeps_the_other_players_state_untouched() {
+    // The old upsert reset notified/acknowledged when the assignee changed,
+    // because the row's identity changed underneath. Adding a player must not
+    // touch anybody else's state.
+    let (ctx, tok, _actor) = setup(membership::Role::Archivist).await;
+    let (coll, item, voice) = seed_item_and_voice(&ctx).await;
+    let alice = create_user(&ctx.pool, "alice").await;
+    let bob = create_user(&ctx.pool, "bob").await;
+    let url = assignments_url(ctx.org, coll, item);
+
+    let (_s, first, h) = send(
         &ctx.app,
-        req_with_if_match(
-            "PATCH",
-            &get_url,
+        req(
+            "POST",
+            &url,
             &tok,
-            Some(&etag),
-            Some(serde_json::json!({ "notifiedAt": now, "acknowledgedAt": now })),
+            Some(serde_json::json!({ "userId": alice, "voiceId": voice })),
         ),
     )
     .await;
-    assert_eq!(s, axum::http::StatusCode::OK);
-    assert!(!patched["notifiedAt"].is_null());
-    assert!(!patched["acknowledgedAt"].is_null());
-    // The PATCH bumped updated_at; the reassign must present the fresh ETag.
-    let etag = patched_h.get("etag").unwrap().to_str().unwrap().to_string();
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let etag = h.get("etag").unwrap().to_str().unwrap().to_string();
 
-    // Reassign to bob — notified/acknowledged reset to null.
-    let (_s, reassigned, _h) = send(
+    // Alice acknowledges.
+    let (s_patch, patched, _h) = send(
         &ctx.app,
         req_with_if_match(
-            "PUT",
-            &url,
+            "PATCH",
+            &format!("{url}/{first_id}"),
             &tok,
             Some(&etag),
+            Some(serde_json::json!({ "acknowledgedAt": "2026-01-01T10:00:00Z" })),
+        ),
+    )
+    .await;
+    assert_eq!(s_patch, axum::http::StatusCode::OK);
+    assert!(!patched["acknowledgedAt"].is_null());
+
+    // Bob joins the part; Alice's acknowledgement survives.
+    let (s_add, _b, _h) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &url,
+            &tok,
             Some(serde_json::json!({ "userId": bob, "voiceId": voice })),
         ),
     )
     .await;
-    assert_eq!(reassigned["id"], id);
+    assert_eq!(s_add, axum::http::StatusCode::CREATED);
+
+    let (_s, listed, _h) = send(&ctx.app, req("GET", &url, &tok, None)).await;
+    let items = listed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let alice_row = items
+        .iter()
+        .find(|i| i["id"] == first_id)
+        .expect("alice's row survives");
     assert!(
-        reassigned["notifiedAt"].is_null(),
-        "reassignment must clear notifiedAt"
-    );
-    assert!(
-        reassigned["acknowledgedAt"].is_null(),
-        "reassignment must clear acknowledgedAt"
+        !alice_row["acknowledgedAt"].is_null(),
+        "adding a colleague must not reset an existing player's state"
     );
 }
 
@@ -495,7 +487,7 @@ async fn voice_must_belong_to_the_items_arrangement() {
     let (status, _body, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": other_voice })),
@@ -514,7 +506,7 @@ async fn assigning_a_nonexistent_user_is_rejected() {
     let (status, _body, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": Uuid::now_v7(), "voiceId": voice })),
@@ -534,7 +526,7 @@ async fn permission_matrix_musician_forbidden_conductor_allowed() {
     let (status, _b, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": voice })),
@@ -550,7 +542,7 @@ async fn permission_matrix_musician_forbidden_conductor_allowed() {
     let (status2, _b, _h) = send(
         &ctx2.app,
         req(
-            "PUT",
+            "POST",
             &url2,
             &tok2,
             Some(serde_json::json!({ "userId": musician2, "voiceId": voice2 })),
@@ -581,7 +573,7 @@ async fn cross_org_assignment_is_rejected_with_404() {
     let (status, _b, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &b_tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": voice_a })),
@@ -601,7 +593,7 @@ async fn list_and_get_and_delete_assignment() {
     let (_s, created, _h) = send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": voice })),
@@ -651,7 +643,7 @@ async fn assignment_writes_are_audited() {
     send(
         &ctx.app,
         req(
-            "PUT",
+            "POST",
             &url,
             &tok,
             Some(serde_json::json!({ "userId": musician, "voiceId": voice })),
