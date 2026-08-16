@@ -137,10 +137,23 @@ pub async fn require_coverage_viewer_v1(
     auth: &BearerOrSession,
     organization_id: Uuid,
 ) -> Result<CoverageScope, AppError> {
-    if auth.user.is_system_admin {
+    coverage_scope_for(state, &auth.user, organization_id).await
+}
+
+/// The coverage scope rule itself, over a plain [`User`] so **both** surfaces
+/// use it: `/v1` through [`require_coverage_viewer_v1`], the console through its
+/// session user. Two implementations of one permission rule is what the shared
+/// `file_service` (#32) and the shared index cap (#34) were extracted to
+/// prevent; a rule that gains a staff-equivalent role must gain it once.
+pub async fn coverage_scope_for(
+    state: &AppState,
+    user: &User,
+    organization_id: Uuid,
+) -> Result<CoverageScope, AppError> {
+    if user.is_system_admin {
         return Ok(CoverageScope::FullProgram);
     }
-    let found = membership::find_by_user_and_org(&state.db, auth.user.id, organization_id)
+    let found = membership::find_by_user_and_org(&state.db, user.id, organization_id)
         .await
         .map_err(AppError::from)?;
     match found {

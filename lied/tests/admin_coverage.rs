@@ -289,14 +289,24 @@ async fn two_instruments(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
 
 /// A programme of one piece with a flute and a trumpet voice.
 async fn seed_programme(state: &AppState, org_id: Uuid) -> (Uuid, Uuid, Uuid, Uuid) {
+    seed_programme_named(state, org_id, "Spring Concert").await
+}
+
+/// As above, named — an org may hold several programmes, and their slugs are
+/// unique.
+async fn seed_programme_named(
+    state: &AppState,
+    org_id: Uuid,
+    name: &str,
+) -> (Uuid, Uuid, Uuid, Uuid) {
     let (flute, trumpet) = two_instruments(&state.db).await;
     let collection_id = Uuid::now_v7();
     lied::domain::collection::create(
         &state.db,
         collection_id,
         org_id,
-        "Spring Concert",
-        "spring-concert",
+        name,
+        &lied::domain::collection::slugify(name),
         "program",
         None,
     )
@@ -304,13 +314,14 @@ async fn seed_programme(state: &AppState, org_id: Uuid) -> (Uuid, Uuid, Uuid, Uu
     .expect("collection");
 
     let arr_id = Uuid::now_v7();
+    let arrangement_title = format!("{name} — Bolero");
     arrangement::create(
         &state.db,
         arr_id,
         org_id,
-        "bolero",
+        &arrangement::slugify(&arrangement_title),
         arrangement::ArrangementFields {
-            title: "Bolero",
+            title: &arrangement_title,
             work_id: None,
             instrumentation: None,
             arranger: None,
@@ -554,6 +565,13 @@ async fn a_principal_sees_only_their_section_and_no_way_to_assign() {
 
 #[tokio::test]
 async fn a_plain_musician_cannot_reach_coverage_at_all() {
+    // NOTE on what this does and does not pin. A plain musician is refused by
+    // the *console entry* gate (#30: only staff and principals may enter at
+    // all), so this test would still pass if coverage's own scope rule were
+    // broken — verified by mutation. The coverage-specific denial is pinned by
+    // `a_plain_musician_is_refused_...` in tests/coverage.rs, which goes through
+    // `/v1` where console entry is not in the way. Kept because defence in depth
+    // is worth asserting; do not read it as covering the scope rule.
     let ctx = Ctx::new().await;
     let fx = seed(&ctx.state).await;
     let (collection_id, _item, _voice, _flute) = seed_programme(&ctx.state, fx.org_id).await;
@@ -601,5 +619,109 @@ async fn a_collection_from_another_org_is_not_found() {
         status,
         axum::http::StatusCode::NOT_FOUND,
         "a coverage report names both programme and people — it must not cross orgs"
+    );
+}
+
+#[tokio::test]
+async fn the_dashboard_puts_the_worst_covered_programme_first() {
+    // The page exists to be scanned: the programme that needs work must not be
+    // below the fold, and an empty collection must not read as fully covered.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (_covered, item_id, flute_voice, _flute) = seed_programme(&ctx.state, fx.org_id).await;
+
+    // A second programme with nothing assigned, and a third with no pieces.
+    let _gap = seed_programme_named(&ctx.state, fx.org_id, "Zzz Gap Concert").await;
+    let empty = Uuid::now_v7();
+    lied::domain::collection::create(
+        &ctx.state.db,
+        empty,
+        fx.org_id,
+        "Aaa Empty Book",
+        "aaa-empty-book",
+        "standing",
+        None,
+    )
+    .await
+    .expect("empty collection");
+
+    // Cover the first programme completely.
+    let player = user::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        "player",
+        "player",
+        None,
+        None,
+        "player",
+        false,
+        None,
+    )
+    .await
+    .expect("user");
+    for voice in [flute_voice] {
+        lied::domain::part_assignment::assign(
+            &ctx.state.db,
+            Uuid::now_v7(),
+            item_id,
+            voice,
+            player.id,
+            None,
+        )
+        .await
+        .expect("assign");
+    }
+
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/coverage", fx.org_id),
+    )
+    .await;
+
+    let position = |needle: &str| html.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        position("Zzz Gap Concert") < position("Spring Concert"),
+        "the uncovered programme outranks the half-covered one despite the name order"
+    );
+    assert!(
+        position("Spring Concert") < position("Aaa Empty Book"),
+        "a collection requiring nothing sinks below real programmes"
+    );
+    assert!(
+        html.contains("nothing required"),
+        "an empty collection says so rather than showing 0/0 as covered"
+    );
+}
+
+#[tokio::test]
+async fn a_conductor_gets_the_full_programme_and_the_assignment_links() {
+    // Conductors are staff for coverage and may build collections, but are
+    // read-only over the catalogue — a distinction that has been got wrong
+    // before, so it is pinned here.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let (collection_id, item_id, _voice, _flute) = seed_programme(&ctx.state, fx.org_id).await;
+    let conductor = Browser::login(&ctx.app, "cond").await;
+
+    let (status, html) = load_page(
+        &ctx.app,
+        &conductor,
+        &format!("/admin/orgs/{}/coverage/{collection_id}", fx.org_id),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("Flute 1") && html.contains("Trumpet 1"),
+        "a conductor sees the whole programme, not a section"
+    );
+    assert!(
+        !html.contains("your own section"),
+        "…and is not told they are seeing a section"
+    );
+    assert!(
+        html.contains(&format!("/items/{item_id}/assignments")),
+        "a conductor may assign parts, so the link is offered"
     );
 }

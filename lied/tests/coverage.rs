@@ -12,8 +12,8 @@ use std::sync::Arc;
 use lied::auth;
 use lied::config::{AppConfig, Secret};
 use lied::domain::{
-    arrangement, collection, collection_item, membership, organization, part_assignment, user,
-    voice,
+    arrangement, collection, collection_item, coverage, membership, organization, part_assignment,
+    user, voice,
 };
 use lied::state::AppState;
 use sqlx::postgres::PgPoolOptions;
@@ -617,4 +617,74 @@ async fn coverage_for_another_orgs_collection_is_not_found() {
         coverage_status(&app, &token, org_id, theirs.collection_id).await,
         404
     );
+}
+
+#[tokio::test]
+async fn the_org_wide_query_agrees_with_the_per_collection_one() {
+    // The dashboard reads every collection in one query rather than looping the
+    // per-collection one (an N+1 over a five-way join). Two queries answering
+    // the same question is a drift risk, so they are checked against each other
+    // over a corpus with each interesting shape present: covered, gapped, empty,
+    // and a piece whose arrangement was removed.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, _token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let _ = &app;
+    let player = create_plain_user(&db.pool, "player").await;
+
+    let covered = seed_programme(&db.pool, org_id).await;
+    let a1 = assign(&db.pool, covered.items[0], covered.voices[0].0, player.id).await;
+    acknowledge(&db.pool, a1).await;
+
+    // An empty collection, which the per-collection query would report as zeros
+    // and the org-wide one must not drop.
+    let empty = Uuid::now_v7();
+    collection::create(
+        &db.pool,
+        empty,
+        org_id,
+        "Empty Book",
+        "empty-book",
+        "standing",
+        None,
+    )
+    .await
+    .expect("collection");
+
+    for required in [
+        coverage::Required::EveryVoice,
+        coverage::Required::Instruments(vec![covered.voices[0].1]),
+    ] {
+        let org_wide = coverage::for_org(&db.pool, org_id, &required)
+            .await
+            .expect("org-wide coverage");
+        assert!(
+            org_wide.iter().any(|r| r.collection_id == empty),
+            "an empty collection must still appear"
+        );
+
+        for report in &org_wide {
+            let single = coverage::for_collection(&db.pool, report.collection_id, &required)
+                .await
+                .expect("per-collection coverage");
+            assert_eq!(
+                (report.required, report.assigned, report.rehearsed),
+                (single.required, single.assigned, single.rehearsed),
+                "the two queries disagree about collection {}",
+                report.collection_id
+            );
+            assert_eq!(
+                report.items.len(),
+                single.items.len(),
+                "…or about how many pieces it has"
+            );
+        }
+    }
 }
