@@ -133,6 +133,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/orgs/{orgId}/collections/{id}/reorder",
     // Collection items
     "/v1/orgs/{orgId}/collections/{id}/items",
+    "/v1/orgs/{orgId}/collections/{collectionId}/coverage",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete",
     // Part assignments

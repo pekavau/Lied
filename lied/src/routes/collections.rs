@@ -15,11 +15,13 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::{require_collection_editor_v1, require_org_role_v1};
+use crate::auth::authz::{
+    require_collection_editor_v1, require_coverage_viewer_v1, require_org_role_v1, CoverageScope,
+};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
-use crate::domain::{collection, collection_item};
+use crate::domain::{collection, collection_item, coverage};
 use crate::error::AppError;
 use crate::listing::{self, SortDirection};
 use crate::pagination::Page;
@@ -42,6 +44,7 @@ pub fn router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_items, add_item))
         .routes(routes!(get_item, update_item, delete_item))
         .routes(routes!(undelete_item))
+        .routes(routes!(collection_coverage))
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
@@ -924,4 +927,49 @@ async fn undelete_item(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Coverage for a collection: which required voices are assigned, and which are
+/// rehearsed (UC-13).
+///
+/// Staff see every voice of every piece. A `musician` with `is_principal = true`
+/// sees only their own section — the voices whose instrument is in their
+/// `principal_instrument_ids` — which is the one non-staff-facing view in this
+/// tree. Everyone else gets `403`.
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/collections/{collectionId}/coverage",
+    tag = "collections",
+    summary = "Coverage for a collection",
+    params(
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "Coverage report; scoped to the caller's \
+                                      section when they are a principal",
+            body = coverage::CoverageReport),
+        CommonErrors,
+        Forbidden403,
+        NotFound404,
+    )
+)]
+async fn collection_coverage(
+    auth: BearerOrSession,
+    State(state): State<AppState>,
+    Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<coverage::CoverageReport>, AppError> {
+    let scope = require_coverage_viewer_v1(&state, &auth, org_id).await?;
+    // Scope the collection to the org before reporting on it: a coverage report
+    // names pieces and the people playing them, so a cross-org id must 404
+    // rather than leak another orchestra's programme.
+    find_collection_scoped(&state, org_id, collection_id).await?;
+
+    let required = match scope {
+        CoverageScope::FullProgram => coverage::Required::EveryVoice,
+        CoverageScope::Section(instrument_ids) => coverage::Required::Instruments(instrument_ids),
+    };
+    let report = coverage::for_collection(&state.db, collection_id, &required).await?;
+    Ok(Json(report))
 }
