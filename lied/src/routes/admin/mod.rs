@@ -7,6 +7,7 @@
 pub mod arrangements;
 pub mod collections;
 pub mod console;
+pub mod coverage;
 pub mod files;
 pub mod layout;
 pub mod members;
@@ -62,6 +63,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(collections::router())
         // Archive search (issue #34).
         .merge(search::router())
+        // Coverage dashboard incl. the principal carve-out (issue #35).
+        .merge(coverage::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,

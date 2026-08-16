@@ -415,6 +415,10 @@ async fn collection_detail_page(
                                 a href=(format!("{items_base}/{}/assignments", view.item.id)) {
                                     "Parts"
                                 }
+                                " · "
+                                a href=(format!("/admin/orgs/{org_id}/coverage/{collection_id}")) {
+                                    "Coverage"
+                                }
                             }
                         }
                     }

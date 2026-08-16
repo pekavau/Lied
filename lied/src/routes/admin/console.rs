@@ -323,11 +323,10 @@ pub fn can_enter(role: Role, is_principal: bool) -> bool {
 }
 
 pub fn router() -> Router<AppState> {
-    // Arrangements, Collections and Search are real screens merged separately
-    // in `admin::router`; the rest are still gated stubs.
+    // Arrangements, Collections, Search and Coverage are real screens merged
+    // separately in `admin::router`; annotations (#36) is still a gated stub.
     Router::new()
         .route("/orgs/:org_id/console", get(home_page))
-        .route("/orgs/:org_id/coverage", get(coverage_stub))
         .route("/orgs/:org_id/annotations", get(annotations_stub))
 }
 
@@ -542,7 +541,6 @@ macro_rules! section_handler {
     };
 }
 
-section_handler!(coverage_stub, Section::Coverage);
 section_handler!(annotations_stub, Section::Annotations);
 
 #[cfg(test)]
