@@ -66,10 +66,17 @@ pub enum PartAssignmentError {
     /// FK violation rather than the more specific check above.
     #[error("a referenced entity does not exist")]
     UnknownReference,
+    /// This person already plays this voice on this piece. Several musicians
+    /// per part is the point of the model; the same one twice is not.
+    #[error("this musician is already assigned to this voice")]
+    Duplicate,
 }
 
 fn map_write_error(err: sqlx::Error) -> PartAssignmentError {
     if let sqlx::Error::Database(ref db_err) = err {
+        if db_err.constraint() == Some("part_assignment_collection_item_id_voice_id_user_id_key") {
+            return PartAssignmentError::Duplicate;
+        }
         if db_err.is_foreign_key_violation() {
             return PartAssignmentError::UnknownReference;
         }
@@ -77,16 +84,17 @@ fn map_write_error(err: sqlx::Error) -> PartAssignmentError {
     PartAssignmentError::Database(err)
 }
 
-/// Assign `user_id` to `voice_id` on `collection_item_id`, or replace the
-/// existing assignee if one already exists for that `(item, voice)` pair.
-/// Returns the resulting row and whether it was a fresh insert (`true`) or a
-/// replace of an existing row (`false`) — callers use this to pick `201` vs
-/// `200`.
+/// Add `user_id` as a player of `voice_id` on `collection_item_id`.
+///
+/// **Adds; never replaces.** A part is played by as many musicians as the
+/// section has, so a second assignment is a second player, not a correction of
+/// the first (issue #53). The same person twice on one part is still a mistake
+/// and maps to [`PartAssignmentError::Duplicate`].
 ///
 /// Enforces, atomically within the statement: `collection_item_id` must
-/// reference a live item, and `voice_id` must reference a live voice under
-/// that item's arrangement — else [`PartAssignmentError::VoiceNotInArrangement`]
-/// (zero rows written, nothing to roll back).
+/// reference a live item, and `voice_id` a live voice under that item's
+/// arrangement — else [`PartAssignmentError::VoiceNotInArrangement`] with zero
+/// rows written.
 pub async fn assign(
     pool: &PgPool,
     id: Uuid,
@@ -94,8 +102,9 @@ pub async fn assign(
     voice_id: Uuid,
     user_id: Uuid,
     created_by: Option<Uuid>,
-) -> Result<(PartAssignment, bool), PartAssignmentError> {
-    let row = sqlx::query!(
+) -> Result<PartAssignment, PartAssignmentError> {
+    let row = sqlx::query_as!(
+        PartAssignment,
         r#"
         INSERT INTO part_assignment (id, collection_item_id, user_id, voice_id, created_by)
         SELECT $1, ci.id, $4, v.id, $5
@@ -105,25 +114,13 @@ pub async fn assign(
          AND v.arrangement_id = ci.arrangement_id
          AND v.deleted_at IS NULL
         WHERE ci.id = $2 AND ci.deleted_at IS NULL
-        ON CONFLICT (collection_item_id, voice_id) DO UPDATE SET
-            user_id = excluded.user_id,
-            notified_at = CASE
-                WHEN part_assignment.user_id <> excluded.user_id THEN NULL
-                ELSE part_assignment.notified_at
-            END,
-            acknowledged_at = CASE
-                WHEN part_assignment.user_id <> excluded.user_id THEN NULL
-                ELSE part_assignment.acknowledged_at
-            END,
-            updated_at = now()
         RETURNING
             id, collection_item_id, user_id, voice_id,
             notified_at as "notified_at: DateTime<Utc>",
             acknowledged_at as "acknowledged_at: DateTime<Utc>",
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            (xmax = 0) as "inserted!"
+            created_by
         "#,
         id,
         collection_item_id,
@@ -135,24 +132,9 @@ pub async fn assign(
     .await
     .map_err(map_write_error)?;
 
-    let Some(row) = row else {
-        return Err(PartAssignmentError::VoiceNotInArrangement);
-    };
-
-    Ok((
-        PartAssignment {
-            id: row.id,
-            collection_item_id: row.collection_item_id,
-            user_id: row.user_id,
-            voice_id: row.voice_id,
-            notified_at: row.notified_at,
-            acknowledged_at: row.acknowledged_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            created_by: row.created_by,
-        },
-        row.inserted,
-    ))
+    // No row means the INSERT..SELECT matched nothing: the item or the voice is
+    // gone, or the voice belongs to a different arrangement.
+    row.ok_or(PartAssignmentError::VoiceNotInArrangement)
 }
 
 /// Look up an assignment by id.
@@ -176,16 +158,14 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<PartAssignment
     .await
 }
 
-/// Look up the current assignment for a `(collection_item, voice)` pair, if
-/// any. The assign endpoint uses this to enforce `If-Match` on a *replace*: a
-/// PUT that overwrites an existing assignee carries the same optimistic-
-/// concurrency contract as a PATCH/DELETE, so the caller must present the
-/// current row's ETag.
-pub async fn find_by_item_voice(
+/// Every musician playing a `(collection_item, voice)` pair, oldest assignment
+/// first. A section holds as many as it has players; an empty result is an
+/// uncovered part.
+pub async fn list_for_item_voice(
     pool: &PgPool,
     collection_item_id: Uuid,
     voice_id: Uuid,
-) -> Result<Option<PartAssignment>, sqlx::Error> {
+) -> Result<Vec<PartAssignment>, sqlx::Error> {
     sqlx::query_as!(
         PartAssignment,
         r#"
@@ -198,11 +178,12 @@ pub async fn find_by_item_voice(
             created_by
         FROM part_assignment
         WHERE collection_item_id = $1 AND voice_id = $2
+        ORDER BY created_at ASC, id ASC
         "#,
         collection_item_id,
         voice_id,
     )
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
 }
 
@@ -300,85 +281,4 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
-}
-
-/// One row of the console's per-item assignment matrix: a live voice of the
-/// item's arrangement, plus whoever is assigned to it (if anyone) and that
-/// assignment's distribution state.
-///
-/// The screen is voice-first — an unassigned voice is exactly the thing the
-/// archivist is looking for — so this is a LEFT JOIN from the voices, not a
-/// list of assignments. Resolving the assignee's name in the same query keeps
-/// the page to one round trip instead of an N+1 over `user::find_by_id`.
-#[derive(Debug, Clone)]
-pub struct VoiceAssignment {
-    pub voice_id: Uuid,
-    pub voice_name: String,
-    pub voice_slug: String,
-    pub assignment_id: Option<Uuid>,
-    pub assignee_user_id: Option<Uuid>,
-    pub assignee_username: Option<String>,
-    pub assignee_display_name: Option<String>,
-    pub notified_at: Option<DateTime<Utc>>,
-    pub acknowledged_at: Option<DateTime<Utc>>,
-    /// The assignment's `updated_at`, for the console's optimistic-concurrency
-    /// field. `None` when the voice is unassigned (nothing to be stale about).
-    pub assignment_updated_at: Option<DateTime<Utc>>,
-}
-
-/// Every live voice of `collection_item_id`'s arrangement with its assignment,
-/// ordered by voice name. Empty if the item is soft-deleted or absent.
-///
-/// **Deliberately unpaginated**, for the same reason the screen exists: "which
-/// voices are still unassigned" is only answerable over the whole set, and the
-/// bound is an arrangement's voice count — a large orchestral work is dozens of
-/// voices, and `LIED_MAX_FILES_PER_VOICE`-scale growth does not apply here.
-pub async fn voice_matrix_for_item(
-    pool: &PgPool,
-    collection_item_id: Uuid,
-) -> Result<Vec<VoiceAssignment>, sqlx::Error> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT
-            v.id as voice_id,
-            v.name as voice_name,
-            v.slug as voice_slug,
-            pa.id as "assignment_id?",
-            pa.user_id as "assignee_user_id?",
-            u.username as "assignee_username?",
-            u.display_name as "assignee_display_name?",
-            pa.notified_at as "notified_at: DateTime<Utc>",
-            pa.acknowledged_at as "acknowledged_at: DateTime<Utc>",
-            pa.updated_at as "assignment_updated_at?: DateTime<Utc>"
-        FROM collection_item ci
-        JOIN voice v
-          ON v.arrangement_id = ci.arrangement_id
-         AND v.deleted_at IS NULL
-        LEFT JOIN part_assignment pa
-          ON pa.collection_item_id = ci.id
-         AND pa.voice_id = v.id
-        LEFT JOIN "user" u ON u.id = pa.user_id
-        WHERE ci.id = $1 AND ci.deleted_at IS NULL
-        ORDER BY v.name ASC, v.id ASC
-        "#,
-        collection_item_id,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| VoiceAssignment {
-            voice_id: r.voice_id,
-            voice_name: r.voice_name,
-            voice_slug: r.voice_slug,
-            assignment_id: r.assignment_id,
-            assignee_user_id: r.assignee_user_id,
-            assignee_username: r.assignee_username,
-            assignee_display_name: r.assignee_display_name,
-            notified_at: r.notified_at,
-            acknowledged_at: r.acknowledged_at,
-            assignment_updated_at: r.assignment_updated_at,
-        })
-        .collect())
 }

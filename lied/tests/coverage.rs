@@ -229,14 +229,19 @@ async fn two_instruments(pool: &PgPool) -> (Uuid, Uuid) {
 }
 
 async fn seed_programme(pool: &PgPool, org_id: Uuid) -> Programme {
+    seed_programme_named(pool, org_id, "Spring Concert").await
+}
+
+/// As above, named — an org may hold several programmes, whose slugs are unique.
+async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Programme {
     let (flute, trumpet) = two_instruments(pool).await;
     let collection_id = Uuid::now_v7();
     collection::create(
         pool,
         collection_id,
         org_id,
-        "Spring Concert",
-        "spring-concert",
+        name,
+        &collection::slugify(name),
         "program",
         None,
     )
@@ -245,7 +250,8 @@ async fn seed_programme(pool: &PgPool, org_id: Uuid) -> Programme {
 
     let mut items = Vec::new();
     let mut voices = Vec::new();
-    for (index, title) in [(1, "Bolero"), (2, "Egmont")] {
+    for (index, base) in [(1, "Bolero"), (2, "Egmont")] {
+        let title = &format!("{name} — {base}");
         let arr_id = Uuid::now_v7();
         arrangement::create(
             pool,
@@ -303,10 +309,10 @@ async fn seed_programme(pool: &PgPool, org_id: Uuid) -> Programme {
 }
 
 async fn assign(pool: &PgPool, item: Uuid, voice: Uuid, user: Uuid) -> Uuid {
-    let (row, _) = part_assignment::assign(pool, Uuid::now_v7(), item, voice, user, None)
+    part_assignment::assign(pool, Uuid::now_v7(), item, voice, user, None)
         .await
-        .expect("assign");
-    row.id
+        .expect("assign")
+        .id
 }
 
 async fn acknowledge(pool: &PgPool, assignment: Uuid) {
@@ -373,7 +379,10 @@ async fn coverage_reports_gaps_assignments_and_rehearsal_per_piece() {
     let player = create_plain_user(&db.pool, "player").await;
     let programme = seed_programme(&db.pool, org_id).await;
 
-    // Four required voices: leave one unassigned, assign two (one acknowledged).
+    // Four required voices: leave one unassigned, put a different musician on
+    // each of the other three, one of whom has acknowledged.
+    let ben = create_plain_user(&db.pool, "ben").await;
+    let chris = create_plain_user(&db.pool, "chris").await;
     let a1 = assign(
         &db.pool,
         programme.items[0],
@@ -381,48 +390,47 @@ async fn coverage_reports_gaps_assignments_and_rehearsal_per_piece() {
         player.id,
     )
     .await;
-    assign(
-        &db.pool,
-        programme.items[0],
-        programme.voices[1].0,
-        player.id,
-    )
-    .await;
+    assign(&db.pool, programme.items[0], programme.voices[1].0, ben.id).await;
     assign(
         &db.pool,
         programme.items[1],
         programme.voices[2].0,
-        player.id,
+        chris.id,
     )
     .await;
     acknowledge(&db.pool, a1).await;
 
     let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
-    assert_eq!(report["required"], 4);
-    assert_eq!(
-        report["assigned"], 3,
-        "rehearsed voices count as assigned too"
-    );
-    assert_eq!(report["rehearsed"], 1);
+    assert_eq!(report["required"], 4, "four parts");
+    assert_eq!(report["covered"], 3, "three of them have somebody on");
+    assert_eq!(report["players"], 3);
+    assert_eq!(report["playersAcknowledged"], 1);
 
     let items = report["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["required"], 2);
-    assert_eq!(items[0]["assigned"], 2);
-    assert_eq!(items[0]["rehearsed"], 1);
-    assert_eq!(items[1]["assigned"], 1, "the second piece has a gap");
+    assert_eq!(items[0]["covered"], 2);
+    assert_eq!(items[0]["playersAcknowledged"], 1);
+    assert_eq!(items[1]["covered"], 1, "the second piece has a gap");
 
-    // The three states are distinguishable per voice, which is what the
-    // dashboard renders.
-    let states: Vec<&str> = items
+    // Each voice carries its players, and acknowledgement is a ratio rather
+    // than a flag — a section that is half-acknowledged is neither rehearsed
+    // nor unrehearsed.
+    let per_voice: Vec<(usize, usize)> = items
         .iter()
         .flat_map(|item| item["voices"].as_array().unwrap())
-        .map(|v| v["state"].as_str().unwrap())
+        .map(|v| {
+            let players = v["players"].as_array().unwrap();
+            (
+                players.len(),
+                players
+                    .iter()
+                    .filter(|p| !p["acknowledgedAt"].is_null())
+                    .count(),
+            )
+        })
         .collect();
-    assert_eq!(
-        states,
-        vec!["rehearsed", "assigned", "assigned", "unassigned"]
-    );
+    assert_eq!(per_voice, vec![(1, 1), (1, 0), (1, 0), (0, 0)]);
 }
 
 #[tokio::test]
@@ -468,10 +476,11 @@ async fn soft_deleted_voices_items_and_arrangements_are_never_required() {
     assert_eq!(report["required"], 1, "only the first piece still counts");
     let removed = &report["items"][1];
     assert_eq!(removed["arrangementRemoved"], true);
-    assert_eq!(removed["required"], 0);
+    assert_eq!(removed["required"], 0, "a removed piece requires nothing");
+    assert_eq!(removed["players"], 0, "…and its players count for nothing");
     assert!(
-        removed["voices"].as_array().unwrap().is_empty(),
-        "a removed piece contributes no voices"
+        !removed["voices"].as_array().unwrap().is_empty(),
+        "…but its voices stay visible, so whoever holds them can be cleaned up"
     );
 
     // A piece removed from the programme disappears entirely.
@@ -578,7 +587,7 @@ async fn a_plain_musician_is_refused_and_an_unconfigured_principal_gets_an_empty
     let unconfigured = seed_musician(&db.pool, &state, org_id, "new-lead", true, &[]).await;
     let report = coverage_json(&app, &unconfigured, org_id, programme.collection_id).await;
     assert_eq!(report["required"], 0);
-    assert_eq!(report["assigned"], 0);
+    assert_eq!(report["covered"], 0);
     assert!(
         report["items"]
             .as_array()
@@ -675,8 +684,18 @@ async fn the_org_wide_query_agrees_with_the_per_collection_one() {
                 .await
                 .expect("per-collection coverage");
             assert_eq!(
-                (report.required, report.assigned, report.rehearsed),
-                (single.required, single.assigned, single.rehearsed),
+                (
+                    report.required,
+                    report.covered,
+                    report.players,
+                    report.players_acknowledged
+                ),
+                (
+                    single.required,
+                    single.covered,
+                    single.players,
+                    single.players_acknowledged
+                ),
                 "the two queries disagree about collection {}",
                 report.collection_id
             );
@@ -687,4 +706,274 @@ async fn the_org_wide_query_agrees_with_the_per_collection_one() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_part_counts_once_however_many_players_it_has() {
+    // Eight second violins read one part. Before #53 the tallies were
+    // incremented per returned row, so a section would have reported 8/8 for a
+    // single part — parts and players are different denominators.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+
+    // Three players on the first voice, one of whom has acknowledged.
+    let mut first = None;
+    for username in ["desk-one", "desk-two", "desk-three"] {
+        let player = create_plain_user(&db.pool, username).await;
+        let id = assign(
+            &db.pool,
+            programme.items[0],
+            programme.voices[0].0,
+            player.id,
+        )
+        .await;
+        first.get_or_insert(id);
+    }
+    acknowledge(&db.pool, first.unwrap()).await;
+
+    let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
+    assert_eq!(report["required"], 4, "still four parts");
+    assert_eq!(report["covered"], 1, "one of them has anybody on it");
+    assert_eq!(report["players"], 3, "…played by three people");
+    assert_eq!(report["playersAcknowledged"], 1);
+
+    let voice = &report["items"][0]["voices"][0];
+    assert_eq!(voice["players"].as_array().unwrap().len(), 3);
+    let names: Vec<&str> = voice["players"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["desk-one", "desk-two", "desk-three"],
+        "players are listed in the order they were added"
+    );
+}
+
+#[tokio::test]
+async fn one_person_on_two_voices_of_a_piece_is_reported_as_a_conflict() {
+    // Legal and sometimes necessary — who plays what gets juggled by who turns
+    // up — but nobody plays two parts at once, so the tallies would otherwise
+    // overstate how ready the piece is.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+    let doubling = create_plain_user(&db.pool, "doubling-player").await;
+
+    // Both voices of the FIRST piece.
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[0].0,
+        doubling.id,
+    )
+    .await;
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[1].0,
+        doubling.id,
+    )
+    .await;
+    // …and one voice of the second piece, which is not a conflict: different
+    // pieces are played at different times.
+    assign(
+        &db.pool,
+        programme.items[1],
+        programme.voices[2].0,
+        doubling.id,
+    )
+    .await;
+
+    let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
+    let first = &report["items"][0];
+    let second = &report["items"][1];
+
+    let conflicts = first["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "the doubling is flagged");
+    assert_eq!(conflicts[0]["username"], "doubling-player");
+    assert_eq!(
+        conflicts[0]["voiceNames"].as_array().unwrap().len(),
+        2,
+        "naming both voices they hold"
+    );
+    assert!(
+        second["conflicts"].as_array().unwrap().is_empty(),
+        "holding a part in another piece is ordinary, not a conflict"
+    );
+
+    // The piece still reports as covered: the conflict informs, it does not
+    // reduce the tallies or block anything.
+    assert_eq!(first["covered"], 2);
+    assert_eq!(first["required"], 2);
+}
+
+#[tokio::test]
+async fn a_doubling_player_counts_as_one_musician_not_two() {
+    // The player tallies count people, not assignment rows. Somebody holding
+    // two parts of a piece is one musician who cannot be in two places — which
+    // is exactly what `conflicts` says — so counting them twice would make a
+    // short-handed section look fuller than it is.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+    let doubling = create_plain_user(&db.pool, "doubling-player").await;
+
+    let first = assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[0].0,
+        doubling.id,
+    )
+    .await;
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[1].0,
+        doubling.id,
+    )
+    .await;
+
+    let item = &coverage_json(&app, &token, org_id, programme.collection_id).await["items"][0];
+    assert_eq!(item["covered"], 2, "both parts have somebody on them");
+    assert_eq!(item["players"], 1, "but there is only one musician");
+    assert_eq!(item["playersAcknowledged"], 0);
+
+    // Acknowledging ONE of the two parts does not make the person done: they
+    // still owe the other.
+    acknowledge(&db.pool, first).await;
+    let item = &coverage_json(&app, &token, org_id, programme.collection_id).await["items"][0];
+    assert_eq!(
+        item["playersAcknowledged"], 0,
+        "a musician who has acknowledged one of their two parts is not finished"
+    );
+}
+
+#[tokio::test]
+async fn a_removed_piece_reports_no_players_even_though_it_lists_them() {
+    // Its voices stay visible so whoever holds them can be cleaned up, but they
+    // count for nothing — and the counts must agree with themselves, rather
+    // than claiming zero players beside a list of them.
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+    let player = create_plain_user(&db.pool, "player").await;
+    assign(
+        &db.pool,
+        programme.items[0],
+        programme.voices[0].0,
+        player.id,
+    )
+    .await;
+
+    let arrangement_id = Uuid::parse_str(
+        coverage_json(&app, &token, org_id, programme.collection_id).await["items"][0]
+            ["arrangementId"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    arrangement::soft_delete(&db.pool, arrangement_id)
+        .await
+        .unwrap();
+
+    let item = &coverage_json(&app, &token, org_id, programme.collection_id).await["items"][0];
+    assert_eq!(item["arrangementRemoved"], true);
+    assert_eq!(item["required"], 0);
+    assert_eq!(item["players"], 0);
+    assert!(
+        item["conflicts"].as_array().unwrap().is_empty(),
+        "a piece with no music cannot double-book anybody"
+    );
+    // …and the assignment is still visible, which is the point of keeping the
+    // voices: somebody has to be able to take it off.
+    let holders: usize = item["voices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["players"].as_array().unwrap().len())
+        .sum();
+    assert_eq!(holders, 1, "the stranded assignment is still shown");
+}
+
+#[tokio::test]
+async fn the_per_item_query_returns_only_that_item() {
+    // The console's assignment screen reads `for_item`; without the filter it
+    // would show another piece's parts on the wrong screen.
+    let db = TestDb::create_and_migrate().await;
+    let (_app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, _token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+
+    for (position, item_id) in programme.items.iter().enumerate() {
+        let item = coverage::for_item(
+            &db.pool,
+            programme.collection_id,
+            *item_id,
+            &coverage::Required::EveryVoice,
+        )
+        .await
+        .expect("query")
+        .expect("the item exists");
+        assert_eq!(item.item_id, *item_id);
+        assert_eq!(item.index as usize, position + 1);
+        assert_eq!(item.voices.len(), 2, "only this piece's voices");
+    }
+
+    // An item id from another collection does not resolve through this one.
+    let other = seed_programme_named(&db.pool, org_id, "Autumn Concert").await;
+    assert!(
+        coverage::for_item(
+            &db.pool,
+            programme.collection_id,
+            other.items[0],
+            &coverage::Required::EveryVoice,
+        )
+        .await
+        .expect("query")
+        .is_none(),
+        "an item from another collection must not resolve"
+    );
 }

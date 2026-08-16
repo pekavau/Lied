@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.id as item_id,\n            ci.index as item_index,\n            a.id as arrangement_id,\n            a.title as arrangement_title,\n            a.slug as arrangement_slug,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\",\n            v.id as \"voice_id?\",\n            v.name as \"voice_name?\",\n            v.instrument_id as \"instrument_id?\",\n            pa.id as \"assignment_id?\",\n            pa.user_id as \"assignee_user_id?\",\n            u.username as \"assignee_username?\",\n            u.display_name as \"assignee_display_name?\",\n            pa.notified_at as \"notified_at?: DateTime<Utc>\",\n            pa.acknowledged_at as \"acknowledged_at?: DateTime<Utc>\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        -- LEFT JOIN, not JOIN: a piece with no live voices (or whose\n        -- arrangement was removed) must still appear as a row, or the\n        -- programme would silently lose the slot that most needs attention.\n        LEFT JOIN voice v\n          ON v.arrangement_id = a.id\n         AND v.deleted_at IS NULL\n         AND ($2::uuid[] IS NULL OR v.instrument_id = ANY($2))\n        LEFT JOIN part_assignment pa\n          ON pa.collection_item_id = ci.id\n         AND pa.voice_id = v.id\n        LEFT JOIN \"user\" u ON u.id = pa.user_id\n        WHERE ci.collection_id = $1\n          AND ci.deleted_at IS NULL\n          AND c.deleted_at IS NULL\n          AND ($3::uuid IS NULL OR ci.id = $3)\n        ORDER BY ci.index ASC, ci.id ASC, v.name ASC, v.id ASC, pa.created_at ASC, pa.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "arrangement_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "arrangement_removed!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "voice_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "voice_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "instrument_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "assignment_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "assignee_user_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "assignee_username?",
+        "type_info": {
+          "Custom": {
+            "name": "citext",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "assignee_display_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "notified_at?: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "acknowledged_at?: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "6a930aaad81f604ffea8aea363d86249a148e762cc61b6d06961055db87901b4"
+}

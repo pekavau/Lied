@@ -418,7 +418,7 @@ async fn the_dashboard_summarises_every_collection_and_links_through() {
     let (status, html) = load_page(&ctx.app, &browser, &url).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert!(html.contains("Spring Concert"));
-    assert!(html.contains("0/2 assigned"), "got: {html}");
+    assert!(html.contains("0/2 parts covered"), "got: {html}");
     assert!(html.contains("2 gap(s)"));
     assert!(
         html.contains(&format!("/coverage/{collection_id}")),
@@ -439,7 +439,7 @@ async fn the_dashboard_summarises_every_collection_and_links_through() {
     )
     .await
     .expect("user");
-    let (assignment, _) = lied::domain::part_assignment::assign(
+    let assignment = lied::domain::part_assignment::assign(
         &ctx.state.db,
         Uuid::now_v7(),
         item_id,
@@ -460,8 +460,8 @@ async fn the_dashboard_summarises_every_collection_and_links_through() {
 
     let (_, html) = load_page(&ctx.app, &browser, &url).await;
     assert!(
-        html.contains("1/2 assigned") && html.contains("1 rehearsed"),
-        "got: {html}"
+        html.contains("1/2 parts covered") && html.contains("1 of 1 players acknowledged"),
+        "parts and players are tallied separately: {html}"
     );
 }
 
@@ -498,7 +498,7 @@ async fn the_detail_screen_names_each_voices_state() {
     )
     .await
     .expect("user");
-    let (assignment, _) = lied::domain::part_assignment::assign(
+    let assignment = lied::domain::part_assignment::assign(
         &ctx.state.db,
         Uuid::now_v7(),
         item_id,
@@ -509,7 +509,7 @@ async fn the_detail_screen_names_each_voices_state() {
     .await
     .expect("assign");
     let (_, html) = load_page(&ctx.app, &browser, &url).await;
-    assert!(html.contains("assigned, not yet notified"), "got: {html}");
+    assert!(html.contains("not yet notified"), "got: {html}");
 
     lied::domain::part_assignment::update_state(
         &ctx.state.db,
@@ -520,7 +520,10 @@ async fn the_detail_screen_names_each_voices_state() {
     .await
     .expect("notify");
     let (_, html) = load_page(&ctx.app, &browser, &url).await;
-    assert!(html.contains("notified, not acknowledged"), "got: {html}");
+    assert!(
+        html.contains("0 of 1"),
+        "the ratio replaces the flag: {html}"
+    );
 }
 
 #[tokio::test]
@@ -540,7 +543,7 @@ async fn a_principal_sees_only_their_section_and_no_way_to_assign() {
     assert_eq!(status, axum::http::StatusCode::OK);
     assert!(html.contains("your own section"), "the scope is stated");
     assert!(
-        html.contains("0/1 assigned"),
+        html.contains("0/1 parts covered"),
         "one flute voice required, not the trumpet: {html}"
     );
 
@@ -724,4 +727,73 @@ async fn a_conductor_gets_the_full_programme_and_the_assignment_links() {
         html.contains(&format!("/items/{item_id}/assignments")),
         "a conductor may assign parts, so the link is offered"
     );
+}
+
+#[tokio::test]
+async fn the_detail_screen_warns_when_one_person_holds_two_parts() {
+    // Allowed — sections get juggled by who turns up — but nobody plays two
+    // parts at once, so the tallies alone would overstate readiness.
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (collection_id, item_id, flute_voice, _flute) = seed_programme(&ctx.state, fx.org_id).await;
+    let url = format!("/admin/orgs/{}/coverage/{collection_id}", fx.org_id);
+
+    // The same person on both voices of the piece.
+    let doubler = user::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        "doubler",
+        "doubler",
+        None,
+        None,
+        "Dora Doubler",
+        false,
+        None,
+    )
+    .await
+    .expect("user");
+    let trumpet_voice: Uuid = sqlx::query_scalar!(
+        r#"SELECT v.id FROM voice v
+           JOIN collection_item ci ON ci.arrangement_id = v.arrangement_id
+           WHERE ci.id = $1 AND v.id <> $2 AND v.deleted_at IS NULL"#,
+        item_id,
+        flute_voice,
+    )
+    .fetch_one(&ctx.state.db)
+    .await
+    .expect("the other voice");
+    for voice in [flute_voice, trumpet_voice] {
+        lied::domain::part_assignment::assign(
+            &ctx.state.db,
+            Uuid::now_v7(),
+            item_id,
+            voice,
+            doubler.id,
+            None,
+        )
+        .await
+        .expect("assign");
+    }
+
+    let (status, html) = load_page(&ctx.app, &browser, &url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("Dora Doubler") && html.contains("cannot cover both"),
+        "the conflict is named and explained: {html}"
+    );
+    // It informs rather than reduces: the parts still count as covered.
+    assert!(
+        html.contains("2/2 parts covered"),
+        "a conflict does not un-cover a part: {html}"
+    );
+
+    // And the dashboard surfaces it too, so it is visible before drilling in.
+    let (_, dashboard) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/coverage", fx.org_id),
+    )
+    .await;
+    assert!(dashboard.contains("1 conflict(s)"), "got: {dashboard}");
 }

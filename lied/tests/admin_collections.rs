@@ -1064,14 +1064,23 @@ async fn seed_program_with_voices(
     (coll, item, vec![flute, trumpet])
 }
 
+/// Everyone playing a voice on a piece — a part may have a whole section on it.
+async fn players_for(
+    ctx: &Ctx,
+    item: Uuid,
+    voice: Uuid,
+) -> Vec<lied::domain::part_assignment::PartAssignment> {
+    lied::domain::part_assignment::list_for_item_voice(&ctx.pool, item, voice)
+        .await
+        .unwrap()
+}
+
 async fn assignment_for(
     ctx: &Ctx,
     item: Uuid,
     voice: Uuid,
 ) -> Option<lied::domain::part_assignment::PartAssignment> {
-    lied::domain::part_assignment::find_by_item_voice(&ctx.pool, item, voice)
-        .await
-        .unwrap()
+    players_for(ctx, item, voice).await.into_iter().next()
 }
 
 #[tokio::test]
@@ -1090,7 +1099,7 @@ async fn every_voice_is_listed_and_a_guest_can_hold_a_part() {
     let (status, html) = load_page(&ctx.app, &browser, &url).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert!(html.contains("Flute 1") && html.contains("Trumpet 1"));
-    assert_eq!(html.matches("unassigned").count(), 2);
+    assert_eq!(html.matches("nobody yet").count(), 2);
 
     // A substitute with NO membership in this org can take a part — that is how
     // guests get access at all (the assignment itself grants the read).
@@ -1117,7 +1126,7 @@ async fn every_voice_is_listed_and_a_guest_can_hold_a_part() {
     let (_, html) = load_page(&ctx.app, &browser, &url).await;
     assert!(html.contains("guest-sub"), "the assignee is shown");
     assert_eq!(
-        html.matches("unassigned").count(),
+        html.matches("nobody yet").count(),
         1,
         "the other voice is still open"
     );
@@ -1138,7 +1147,10 @@ async fn every_voice_is_listed_and_a_guest_can_hold_a_part() {
 }
 
 #[tokio::test]
-async fn a_reassignment_from_a_stale_form_is_refused() {
+async fn a_part_takes_several_players_and_refuses_the_same_one_twice() {
+    // A second violin part is played by every desk of the section. Adding the
+    // second player used to remove the first (the assignment was an upsert);
+    // now it adds. The same person twice is still a mistake.
     let ctx = Ctx::new().await;
     let fx = seed(&ctx.state).await;
     let browser = Browser::login(&ctx.app, "arch").await;
@@ -1147,69 +1159,74 @@ async fn a_reassignment_from_a_stale_form_is_refused() {
         "/admin/orgs/{}/collections/{coll}/items/{item}/assignments",
         fx.org_id
     );
-    seed_user(&ctx.state, "first-player").await;
-    seed_user(&ctx.state, "second-player").await;
+    for username in ["first-desk", "second-desk"] {
+        seed_user(&ctx.state, username).await;
+    }
 
     let (_, html) = load_page(&ctx.app, &browser, &url).await;
     let token = form_csrf(&html);
-    post_form(
-        &ctx.app,
-        &browser,
-        &url,
-        &[
-            ("voice_id", &voices[0].to_string()),
-            ("username", "first-player"),
-        ],
-        &token,
-    )
-    .await;
-    let current = assignment_for(&ctx, item, voices[0]).await.unwrap();
+    for username in ["first-desk", "second-desk"] {
+        let response = post_form(
+            &ctx.app,
+            &browser,
+            &url,
+            &[("voice_id", &voices[0].to_string()), ("username", username)],
+            &token,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SEE_OTHER,
+            "adding {username} should succeed"
+        );
+    }
 
-    // A reassignment carrying a stale version must not silently overwrite an
-    // assignment that changed since the page rendered.
-    let stale = (current.updated_at.timestamp_millis() - 1).to_string();
+    let players = players_for(&ctx, item, voices[0]).await;
+    assert_eq!(players.len(), 2, "both desks hold the part");
+    assert_eq!(audit_count(&ctx.pool, "part_assignment.create").await, 2);
+
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    assert!(
+        html.contains("first-desk") && html.contains("second-desk"),
+        "both players are listed: {html}"
+    );
+    assert!(html.contains("2 players"), "the count is shown: {html}");
+
+    // The same person again is a conflict, not a silent no-op or a duplicate.
+    let token = form_csrf(&html);
     let response = post_form(
         &ctx.app,
         &browser,
         &url,
         &[
             ("voice_id", &voices[0].to_string()),
-            ("username", "second-player"),
-            ("expected_version", &stale),
+            ("username", "first-desk"),
         ],
         &token,
     )
     .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     assert_eq!(
-        response.status(),
-        axum::http::StatusCode::PRECONDITION_FAILED,
-        "a stale reassignment must be refused"
-    );
-    assert_eq!(
-        assignment_for(&ctx, item, voices[0]).await.unwrap().user_id,
-        current.user_id,
-        "the refused reassignment changed nothing"
+        players_for(&ctx, item, voices[0]).await.len(),
+        2,
+        "the refused add changed nothing"
     );
 
-    // With the current version it goes through, and replaces rather than
-    // duplicating (one assignee per voice per piece).
-    let fresh = current.updated_at.timestamp_millis().to_string();
+    // Removing one player leaves the other on the part.
+    let (_, html) = load_page(&ctx.app, &browser, &url).await;
+    let token = form_csrf(&html);
     let response = post_form(
         &ctx.app,
         &browser,
-        &url,
-        &[
-            ("voice_id", &voices[0].to_string()),
-            ("username", "second-player"),
-            ("expected_version", &fresh),
-        ],
+        &format!("{url}/{}/unassign", players[0].id),
+        &[],
         &token,
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
-    let replaced = assignment_for(&ctx, item, voices[0]).await.unwrap();
-    assert_ne!(replaced.user_id, current.user_id, "the assignee changed");
-    assert_eq!(audit_count(&ctx.pool, "part_assignment.reassign").await, 1);
+    let remaining = players_for(&ctx, item, voices[0]).await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, players[1].id);
 }
 
 #[tokio::test]
