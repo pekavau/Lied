@@ -21,7 +21,14 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # Chainguard's build of MinIO: the upstream minio/minio images were pulled
+    # from Docker Hub and quay.io now requires a login. Free tier is
+    # `:latest` only. Choosing a long-term object store is issue #59.
+    image: cgr.dev/chainguard/minio:latest
+    # The image defaults to a non-root user, which cannot write the
+    # host-mounted ./.data/minio that Docker creates root-owned. Root matches
+    # what the upstream image did.
+    user: "0:0"
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:

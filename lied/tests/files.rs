@@ -16,9 +16,10 @@ use lied::domain::{arrangement, membership, organization, user, voice};
 use lied::state::AppState;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::GenericImage;
 use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::minio::MinIO;
 use testcontainers_modules::postgres::Postgres;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -29,7 +30,7 @@ const BOUNDARY: &str = "X-LIED-TEST-BOUNDARY";
 /// Holds both containers (kept alive for the test) plus the wired app/state.
 struct Ctx {
     _pg: ContainerAsync<Postgres>,
-    _minio: ContainerAsync<MinIO>,
+    _minio: ContainerAsync<GenericImage>,
     pool: PgPool,
     app: axum::Router,
     state: AppState,
@@ -58,7 +59,18 @@ impl Ctx {
             .expect("migrate");
 
         // --- MinIO ---
-        let minio = MinIO::default().start().await.expect("start minio");
+        let minio = // Chainguard's MinIO build: the upstream image the testcontainers module
+        // pulls was removed from Docker Hub (#59 tracks a long-term choice).
+        // A GenericImage rather than the module because current MinIO prints
+        // its "API:" ready line to stderr, and the module waits on stdout.
+        // Credentials are MinIO's built-in minioadmin/minioadmin defaults.
+        GenericImage::new("cgr.dev/chainguard/minio", "latest")
+            .with_exposed_port(9000.tcp())
+            .with_wait_for(WaitFor::message_on_stderr("API:"))
+            .with_cmd(["server", "/data"])
+            .start()
+            .await
+            .expect("start minio");
         let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
         let endpoint = format!("http://127.0.0.1:{minio_port}");
 
