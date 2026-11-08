@@ -1,19 +1,20 @@
 //! `/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments` —
 //! issue #10 (Part assignments + the archivist→musician loop).
 //!
-//! Assigns a user + voice to a `CollectionItem`; reassignment replaces the
-//! row (CLAUDE.md Unique-constraints: `(collection_item_id, voice_id)`). The
-//! assignment is what grants a guest/substitute (no `Membership`) read access
-//! to that voice's files via the WebDAV collections subtree — see
-//! `webdav::access` / `webdav::fs`.
+//! Adds a user as a player of a voice on a `CollectionItem`; a part takes as
+//! many players as the section has (CLAUDE.md Unique-constraints:
+//! `(collection_item_id, voice_id, user_id)`, issue #53). The assignment is
+//! what grants a guest/substitute (no `Membership`) read access to that voice's
+//! files via the WebDAV collections subtree — see `webdav::access` /
+//! `webdav::fs`.
 //!
-//! Reads require any org membership (`musician`+); writes (assign/reassign,
+//! Reads require any org membership (`musician`+); writes (add/remove a player,
 //! set `notifiedAt`/`acknowledgedAt`, unassign) require
 //! `owner`/`archivist`/`conductor` (CLAUDE.md Permission matrix: "Part
 //! assignments"), enforced via [`require_collection_editor_v1`]. Optimistic
 //! concurrency (ETag/`If-Match`), RFC 7807 errors, and an `audit()` on every
-//! write, per the API guidelines. `part_assignment` has no soft-delete
-//! (CLAUDE.md: "reassignment replaces the row") — unassign is a hard delete.
+//! write, per the API guidelines. `part_assignment` has no soft-delete —
+//! unassign is a hard delete.
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -207,7 +208,7 @@ async fn list_assignments(
 
 // ── assign / reassign ───────────────────────────────────────────────────────
 
-/// Request body for `PUT .../assignments`.
+/// Request body for `POST .../assignments`.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AssignRequest {
@@ -215,12 +216,7 @@ struct AssignRequest {
     voice_id: Uuid,
 }
 
-/// Assign a user + voice to a collection item, or replace the current
-/// assignee if that `(item, voice)` pair is already assigned
-/// (owner/archivist/conductor). `PUT` rather than `POST`: the resource
-/// identity is the `(collectionItemId, voiceId)` pair, not a client-chosen id,
-/// so re-issuing the same request with a different `userId` is a replace, not
-/// Add a musician to a voice on a collection item.
+/// Add a musician to a voice on a collection item (owner/archivist/conductor).
 ///
 /// **Adds a player; it does not replace one.** A part is played by as many
 /// musicians as the section has (issue #53), so this is a `POST` that appends

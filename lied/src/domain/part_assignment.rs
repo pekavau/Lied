@@ -6,18 +6,13 @@
 //! `deleted_at` (see `migrations/0014_part_assignment.sql`) — "unassign" is a
 //! hard `DELETE`.
 //!
-//! **Reassignment replaces the row.** The unique index on
-//! `(collection_item_id, voice_id)` means at most one assignee exists per
-//! voice per item at any time. [`assign`] implements "replace" as an
-//! `INSERT ... ON CONFLICT (collection_item_id, voice_id) DO UPDATE` — the row
-//! keeps its original `id`, but `user_id` (and `notified_at`/`acknowledged_at`,
-//! since a new assignee has been notified/acknowledged of nothing yet) are
-//! overwritten. Reassigning to the *same* user is a no-op on the
-//! notified/acknowledged state. `created_at`/`created_by` are **not** touched
-//! on a replace: they record who first created the row and when, and are left
-//! consistent with each other rather than pointing `created_by` at the last
-//! re-assigner while `created_at` stays original (the actor of a reassignment
-//! is captured in the audit log instead).
+//! **Several players per part.** The unique index is on
+//! `(collection_item_id, voice_id, user_id)` (issue #53): a part is played by as
+//! many musicians as the section has, so [`assign`] adds a player and never
+//! replaces one; only the same person twice on one part is refused. Moving a
+//! part to someone else is remove-then-add, each audited. Assigning one player
+//! to the same part across a whole collection is
+//! [`crate::domain::bulk_assign`], which writes ordinary rows of this table.
 //!
 //! **Implicit read grant.** A `PartAssignment` does not require the assigned
 //! user to hold a `Membership` in the org — this is how guest/substitute
