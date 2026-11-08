@@ -7,15 +7,12 @@ all-features = true
 
 [advisories]
 ignore = [
-    # Transitive-only, dev-dependency path: testcontainers (0.23) pulls an
-    # old rustls 0.21 chain via aws-sdk-* test images, and an unmaintained
-    # tokio-tar for extracting container image layers. None of these crates
-    # are reachable from the lied/lied-server production binary — they only
-    # run inside `cargo test`. Tracked for removal once testcontainers ships
-    # a release on a newer rustls/tar stack.
-    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints (testcontainers -> aws-config dev chain)
-    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints (same chain)
-    "RUSTSEC-2026-0104", # rustls-webpki: reachable panic in CRL parsing (same chain)
+    # Transitive-only, dev-dependency path: testcontainers pulls an
+    # unmaintained tokio-tar for extracting container image layers. Not
+    # reachable from the lied/lied-server production binary — it only runs
+    # inside `cargo test`. Tracked for removal once testcontainers ships a
+    # release on a newer tar stack. (The old rustls-0.21 chain that used to be
+    # ignored here came from aws-sdk-s3's legacy `rustls` feature, now off.)
     "RUSTSEC-2025-0111", # tokio-tar: PAX header file smuggling (testcontainers image extraction, dev-only)
     "RUSTSEC-2024-0436", # paste: unmaintained (transitive, no upstream replacement forced yet)
     "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained (transitive via testcontainers -> bollard, dev-only)
