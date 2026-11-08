@@ -729,7 +729,7 @@ async fn instrumentation_filters_by_a_live_voice() {
     let instrument = first_instrument_id(&db.pool).await;
     let voice_id = Uuid::now_v7();
     voice::create(
-        &db.pool, voice_id, with_harp, "Harp 1", "harp-1", instrument, None,
+        &db.pool, voice_id, with_harp, "Harp 1", "harp-1", instrument, None, None,
     )
     .await
     .expect("voice");

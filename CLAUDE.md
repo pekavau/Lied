@@ -564,6 +564,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 
 #### Annotations & distribution state
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: a part is **covered** once at least one musician holds it (the model has no desk counts, so "enough players" is not a question it can answer); acknowledgement is reported as a **ratio of players**, not a per-part flag, because a section where two of three have replied is neither rehearsed nor unrehearsed. Coverage only ever reports — no operation refuses because a part is unassigned.
+- **Part identity and bulk assignment (issue #55).** "The same part across pieces" is `(Voice.instrument_id, Voice.part_number)`, with a null part number matching null (Timpani, Harp). Before #55 the ordinal lived only in the voice name; migration 0024 backfilled it with a deliberately conservative guess (`lied_guess_part_number`: trailing arabic/roman or a leading ordinal, NULL for anything combined like "Horn 1 & 3" or "Flute 2/Piccolo"), because a wrong number hands a player the wrong part while a missing one shows up in the preview. Bulk assignment ("the 1st trumpet on the whole March Book") **fans out into ordinary `PartAssignment` rows** — no standing roster, so nothing can drift from the assignments and a one-piece exception is the same edit as ever. It is **preview → confirm**: the preview reports per piece `assign` / `alreadyHeld` / `noMatch` (with the instrument's other voices as candidates) / `ambiguous` (two matching voices — assign by hand) / `removed`, and notes other parts the player already holds in that piece (a conflict, reported not refused). The confirm writes exactly the previewed `(item, voice)` pairs, all-or-nothing, and refuses with 409 if any no longer resolves; already-held pairs are reported, so re-running after adding pieces extends it. A voice carrying several instruments (percussion grab-bag parts, doublings) is a separate, deferred change (#57).
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
   **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
   **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
@@ -613,7 +614,7 @@ Fields: organization FK, title, `slug` (text, immutable, unique per organization
 
 **Voice**
 An individual instrument part within an arrangement (e.g. Flute 1, Violin II, Trumpet in Bb).
-Fields: arrangement FK, name, `slug` (text, immutable, unique per arrangement), `instrument_id` FK to Instrument, audit fields, `deleted_at`.
+Fields: arrangement FK, name, `slug` (text, immutable, unique per arrangement), `instrument_id` FK to Instrument, `part_number` (smallint ≥ 1, nullable — the `1` of "Trumpet in Bb 1"; null for parts that carry no number), audit fields, `deleted_at`.
 
 **File**
 An actual file representing a voice or full score, in a specific format.
@@ -686,7 +687,7 @@ Work (optional, composer)
   └── Arrangement (status, duration, difficulty 1-8 ABRSM, difficulty_ratings, provenance)
         ├── File(s) [full score]
         ├── ArrangementTag → Tag
-        └── Voice (instrument_id → Instrument)
+        └── Voice (instrument_id → Instrument, part_number?)
               └── File (format, mime_type, derived_from?, conversion_quality?)
                     └── [personal annotation files in MinIO, by naming convention]
 

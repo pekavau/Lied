@@ -288,6 +288,7 @@ async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Progra
                 &voice::slugify(&format!("{title}-{name}")),
                 instrument,
                 None,
+                None,
             )
             .await
             .expect("voice");

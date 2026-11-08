@@ -281,6 +281,13 @@ async fn collection_coverage(
     let body = html! {
         h2 { (c.name) " " span class="muted" { "(" (c.collection_type) ")" } }
         p { (tally(&report)) }
+        @if can_assign && !report.items.is_empty() {
+            p {
+                a href=(format!("/admin/orgs/{org_id}/collections/{collection_id}/bulk-assign")) {
+                    "Assign a player to one part across the whole collection →"
+                }
+            }
+        }
         @if section_view {
             p class="muted" {
                 "Your section only. A piece with no line below has nothing for "

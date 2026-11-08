@@ -354,6 +354,7 @@ async fn seed_programme_named(
             &lied::domain::voice::slugify(name),
             instrument,
             None,
+            None,
         )
         .await
         .expect("voice");

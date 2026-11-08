@@ -1143,7 +1143,38 @@ const FAMILY_ORDER: &[&str] = &[
 struct VoiceForm {
     name: Option<String>,
     instrument_id: Option<String>,
+    part_number: Option<String>,
     expected_version: Option<String>,
+}
+
+/// Parse the optional part-number field: blank is "no number" (Timpani, Harp),
+/// anything else must be a whole number of at least 1.
+fn parse_part_number(raw: Option<String>) -> Result<Option<i16>, ()> {
+    match blank_to_none(raw) {
+        None => Ok(None),
+        Some(text) => match text.trim().parse::<i16>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(()),
+        },
+    }
+}
+
+const PART_NUMBER_HELP: &str =
+    "Part number must be a whole number of at least 1, or blank for a part with no number.";
+
+/// The part-number input, shared by the add and edit forms.
+fn part_number_input(current: Option<i16>) -> Markup {
+    html! {
+        label {
+            "Part number "
+            input type="number" name="part_number" min="1" step="1"
+                  value=[current] placeholder="none";
+        }
+        small class="muted" {
+            " The 1 of \"Trumpet in B♭ 1\". Leave blank for parts without a number. "
+            "Assigning a player across a whole collection matches on instrument + part number."
+        }
+    }
 }
 
 /// Load the whole instrument vocabulary (~177 rows) for the picker.
@@ -1260,12 +1291,18 @@ async fn voices_page(
         h2 { "Voices — " (a.title) }
         @if !can_edit { p class="muted" { "You have read-only access to voices." } }
         table {
-            thead { tr { th { "Voice" } th { "Instrument" } @if can_edit { th {} } } }
+            thead { tr { th { "Voice" } th { "Instrument" } th { "Part" } @if can_edit { th {} } } }
             tbody {
                 @for v in &voices {
                     tr {
                         td { (v.name) }
                         td { (instrument_name(&instruments, v.instrument_id)) }
+                        td {
+                            @match v.part_number {
+                                Some(n) => (n),
+                                None => span class="muted" { "—" },
+                            }
+                        }
                         @if can_edit {
                             td {
                                 a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{}", v.id)) { "Edit" }
@@ -1283,6 +1320,7 @@ async fn voices_page(
                 (layout::csrf_field(&token))
                 label { "Name " input type="text" name="name" required; }
                 label { "Instrument " (instrument_picker(&instruments, None)) }
+                (part_number_input(None))
                 button type="submit" { "Add voice" }
             }
         }
@@ -1354,6 +1392,9 @@ async fn create_voice(
             )
         }
     };
+    let Ok(part_number) = parse_part_number(form.part_number) else {
+        return error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP);
+    };
     let slug = voice::slugify(&name);
     match voice::create(
         &state.db,
@@ -1362,6 +1403,7 @@ async fn create_voice(
         &name,
         &slug,
         instrument_id,
+        part_number,
         Some(ctx.user().id),
     )
     .await
@@ -1373,7 +1415,12 @@ async fn create_voice(
                 "voice.create",
                 "voice",
                 Some(created.id),
-                serde_json::json!({ "name": created.name, "slug": created.slug }),
+                serde_json::json!({
+                    "name": created.name,
+                    "slug": created.slug,
+                    "instrumentId": created.instrument_id,
+                    "partNumber": created.part_number,
+                }),
             )
             .await;
             Redirect::to(&format!(
@@ -1391,6 +1438,9 @@ async fn create_voice(
             StatusCode::BAD_REQUEST,
             "That instrument no longer exists.",
         ),
+        Err(voice::VoiceError::InvalidPartNumber) => {
+            error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP)
+        }
         Err(voice::VoiceError::Database(error)) => {
             tracing::error!(%error, "failed to create voice");
             error_page(
@@ -1450,6 +1500,7 @@ async fn voice_detail_page(
                 input type="hidden" name="expected_version" value=(version);
                 label { "Name " input type="text" name="name" value=(v.name) required; }
                 label { "Instrument " (instrument_picker(&instruments, Some(v.instrument_id))) }
+                (part_number_input(v.part_number))
                 button type="submit" { "Save changes" }
             }
             form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/delete")) {
@@ -1458,6 +1509,13 @@ async fn voice_detail_page(
             }
         } @else {
             p { "Instrument: " (instrument_name(&instruments, v.instrument_id)) }
+            p {
+                "Part number: "
+                @match v.part_number {
+                    Some(n) => (n),
+                    None => span class="muted" { "none" },
+                }
+            }
         }
         p {
             a href=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/files")) { "Voice files →" }
@@ -1519,7 +1577,10 @@ async fn update_voice(
             )
         }
     };
-    match voice::update(&state.db, voice_id, &name, instrument_id).await {
+    let Ok(part_number) = parse_part_number(form.part_number) else {
+        return error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP);
+    };
+    match voice::update(&state.db, voice_id, &name, instrument_id, part_number).await {
         Ok(Some(updated)) => {
             audit(
                 &state.db,
@@ -1527,7 +1588,18 @@ async fn update_voice(
                 "voice.update",
                 "voice",
                 Some(updated.id),
-                serde_json::json!({ "name": updated.name }),
+                serde_json::json!({
+                    "before": {
+                        "name": current.name,
+                        "instrumentId": current.instrument_id,
+                        "partNumber": current.part_number,
+                    },
+                    "after": {
+                        "name": updated.name,
+                        "instrumentId": updated.instrument_id,
+                        "partNumber": updated.part_number,
+                    },
+                }),
             )
             .await;
             Redirect::to(&format!(
@@ -1541,6 +1613,9 @@ async fn update_voice(
             StatusCode::BAD_REQUEST,
             "That instrument no longer exists.",
         ),
+        Err(voice::VoiceError::InvalidPartNumber) => {
+            error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP)
+        }
         Err(error) => {
             tracing::error!(%error, "failed to update voice");
             error_page(
@@ -1661,6 +1736,18 @@ async fn undelete_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn part_number_field_is_optional_and_positive() {
+        assert_eq!(parse_part_number(None), Ok(None));
+        assert_eq!(parse_part_number(Some("  ".into())), Ok(None));
+        assert_eq!(parse_part_number(Some("2".into())), Ok(Some(2)));
+        assert_eq!(parse_part_number(Some(" 3 ".into())), Ok(Some(3)));
+        assert_eq!(parse_part_number(Some("0".into())), Err(()));
+        assert_eq!(parse_part_number(Some("-1".into())), Err(()));
+        assert_eq!(parse_part_number(Some("II".into())), Err(()));
+        assert_eq!(parse_part_number(Some("1.5".into())), Err(()));
+    }
 
     fn with_title() -> ArrangementForm {
         ArrangementForm {

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT pa.collection_item_id, v.id as voice_id, v.name, v.part_number\n        FROM part_assignment pa\n        JOIN collection_item ci ON ci.id = pa.collection_item_id\n        JOIN voice v ON v.id = pa.voice_id\n        WHERE ci.collection_id = $1\n          AND ci.deleted_at IS NULL\n          AND v.deleted_at IS NULL\n          AND pa.user_id = $2\n        ORDER BY v.name ASC, v.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection_item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "voice_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "part_number",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "7fde2cfb05dbfb0fda06810cf9c64017a574a7540a2b387e6c60a1831dcaebad"
+}

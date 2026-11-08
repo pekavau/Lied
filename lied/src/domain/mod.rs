@@ -11,6 +11,7 @@
 pub mod app_password;
 pub mod arrangement;
 pub mod audit_log;
+pub mod bulk_assign;
 pub mod collection;
 pub mod collection_item;
 pub mod coverage;

@@ -28,6 +28,11 @@ pub struct Voice {
     pub name: String,
     pub slug: String,
     pub instrument_id: Uuid,
+    /// Which part of its instrument this voice is — the `1` of "Trumpet in Bb
+    /// 1". `None` is an ordinary value (Timpani, Harp, Solo Cornet), not a
+    /// missing one. `(instrument_id, part_number)` is how "the same part" is
+    /// recognised across pieces (issue #55).
+    pub part_number: Option<i16>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by: Option<Uuid>,
@@ -42,6 +47,17 @@ pub enum VoiceError {
     DuplicateSlug,
     #[error("instrument_id does not reference a live instrument")]
     UnknownInstrument,
+    #[error("part_number must be at least 1")]
+    InvalidPartNumber,
+}
+
+/// The rule the `voice.part_number` CHECK enforces, applied up front so a bad
+/// value is a clean domain error rather than a constraint violation.
+fn validate_part_number(part_number: Option<i16>) -> Result<(), VoiceError> {
+    match part_number {
+        Some(n) if n < 1 => Err(VoiceError::InvalidPartNumber),
+        _ => Ok(()),
+    }
 }
 
 fn map_write_error(err: sqlx::Error) -> VoiceError {
@@ -86,6 +102,7 @@ struct Row {
     name: String,
     slug: String,
     instrument_id: Uuid,
+    part_number: Option<i16>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     created_by: Option<Uuid>,
@@ -100,6 +117,7 @@ impl Row {
             name: self.name,
             slug: self.slug,
             instrument_id: self.instrument_id,
+            part_number: self.part_number,
             created_at: self.created_at,
             updated_at: self.updated_at,
             created_by: self.created_by,
@@ -111,6 +129,7 @@ impl Row {
 /// Insert a new voice row. Validates `instrument_id` up front so the error
 /// is a clean [`VoiceError::UnknownInstrument`] rather than a raw FK
 /// violation.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     pool: &PgPool,
     id: Uuid,
@@ -118,8 +137,10 @@ pub async fn create(
     name: &str,
     slug: &str,
     instrument_id: Uuid,
+    part_number: Option<i16>,
     created_by: Option<Uuid>,
 ) -> Result<Voice, VoiceError> {
+    validate_part_number(part_number)?;
     if !validate_instrument_id(pool, instrument_id).await? {
         return Err(VoiceError::UnknownInstrument);
     }
@@ -127,10 +148,10 @@ pub async fn create(
     let row = sqlx::query_as!(
         Row,
         r#"
-        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING
-            id, arrangement_id, name, slug, instrument_id,
+            id, arrangement_id, name, slug, instrument_id, part_number,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -141,6 +162,7 @@ pub async fn create(
         name,
         slug,
         instrument_id,
+        part_number,
         created_by,
     )
     .fetch_one(pool)
@@ -159,7 +181,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Voice>, sqlx::
         Row,
         r#"
         SELECT
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id,
+            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
             v.created_at as "created_at: DateTime<Utc>",
             v.updated_at as "updated_at: DateTime<Utc>",
             v.created_by,
@@ -186,7 +208,7 @@ pub async fn find_by_id_including_deleted(
         Row,
         r#"
         SELECT
-            id, arrangement_id, name, slug, instrument_id,
+            id, arrangement_id, name, slug, instrument_id, part_number,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -230,7 +252,7 @@ pub async fn list_for_arrangement(
     let query = format!(
         r#"
         SELECT
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id,
+            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
             v.created_at, v.updated_at, v.created_by, v.deleted_at,
             count(*) OVER() as total
         FROM voice v
@@ -281,6 +303,7 @@ pub async fn list_for_arrangement(
                 name: row.try_get("name")?,
                 slug: row.try_get("slug")?,
                 instrument_id: row.try_get("instrument_id")?,
+                part_number: row.try_get("part_number")?,
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
                 created_by: row.try_get("created_by")?,
@@ -292,14 +315,16 @@ pub async fn list_for_arrangement(
     Ok((items, total))
 }
 
-/// Update a voice's mutable fields (`name`, `instrument_id`). `slug` is
-/// immutable. Returns `None` if no live row (own + parent) matched `id`.
+/// Update a voice's mutable fields (`name`, `instrument_id`, `part_number`).
+/// `slug` is immutable. Returns `None` if no live row (own + parent) matched `id`.
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
     name: &str,
     instrument_id: Uuid,
+    part_number: Option<i16>,
 ) -> Result<Option<Voice>, VoiceError> {
+    validate_part_number(part_number)?;
     if !validate_instrument_id(pool, instrument_id).await? {
         return Err(VoiceError::UnknownInstrument);
     }
@@ -308,10 +333,10 @@ pub async fn update(
         Row,
         r#"
         UPDATE voice v
-        SET name = $2, instrument_id = $3, updated_at = now()
+        SET name = $2, instrument_id = $3, part_number = $4, updated_at = now()
         WHERE v.id = $1 AND v.deleted_at IS NULL
         RETURNING
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id,
+            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
             v.created_at as "created_at: DateTime<Utc>",
             v.updated_at as "updated_at: DateTime<Utc>",
             v.created_by,
@@ -320,6 +345,7 @@ pub async fn update(
         id,
         name,
         instrument_id,
+        part_number,
     )
     .fetch_optional(pool)
     .await
@@ -359,5 +385,19 @@ mod tests {
     #[test]
     fn slugify_matches_shared_algorithm() {
         assert_eq!(slugify("Flute 1"), "flute-1");
+    }
+
+    #[test]
+    fn part_number_must_be_positive_or_absent() {
+        assert!(validate_part_number(None).is_ok());
+        assert!(validate_part_number(Some(1)).is_ok());
+        assert!(matches!(
+            validate_part_number(Some(0)),
+            Err(VoiceError::InvalidPartNumber)
+        ));
+        assert!(matches!(
+            validate_part_number(Some(-2)),
+            Err(VoiceError::InvalidPartNumber)
+        ));
     }
 }

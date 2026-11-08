@@ -12,6 +12,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod arrangements;
+pub mod bulk_assign;
 pub mod collections;
 pub mod console;
 pub mod coverage;
@@ -72,6 +73,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(search::router())
         // Coverage dashboard incl. the principal carve-out (issue #35).
         .merge(coverage::router())
+        // One player on one part across a collection (issue #55).
+        .merge(bulk_assign::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,

@@ -99,3 +99,13 @@ pub async fn list(
 
     Ok((items, total))
 }
+
+/// Whether `id` names an instrument in the vocabulary.
+pub async fn exists(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT EXISTS(SELECT 1 FROM instrument WHERE id = $1) as "exists!""#,
+        id,
+    )
+    .fetch_one(pool)
+    .await
+}

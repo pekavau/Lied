@@ -139,6 +139,8 @@ const EXPECTED_PATHS: &[&str] = &[
     // Part assignments
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments/{assignmentId}",
+    "/v1/orgs/{orgId}/collections/{collectionId}/bulk-assignments",
+    "/v1/orgs/{orgId}/collections/{collectionId}/bulk-assignments/preview",
 ];
 
 /// §2 completeness: the documented path set equals `EXPECTED_PATHS` exactly.
