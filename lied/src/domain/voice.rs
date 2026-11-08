@@ -51,6 +51,28 @@ pub enum VoiceError {
     InvalidPartNumber,
 }
 
+/// The part number a new voice gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewPartNumber {
+    /// Nobody said: guess it from the name with the same
+    /// `lied_guess_part_number` the backfill used (migration 0024), so voices
+    /// created later number the same way as the ones that existed before.
+    /// "Trumpet in Bb 1" gets 1; "Timpani" or "Horn 1 & 3" get none.
+    FromName,
+    /// Exactly this — `None` is an explicit "this part has no number".
+    Set(Option<i16>),
+}
+
+/// What an update does to a voice's part number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartNumberChange {
+    /// Leave it as it is. A client that does not know about part numbers must
+    /// not erase one by omitting it.
+    Keep,
+    /// Replace it — `None` clears it.
+    Set(Option<i16>),
+}
+
 /// The rule the `voice.part_number` CHECK enforces, applied up front so a bad
 /// value is a clean domain error rather than a constraint violation.
 fn validate_part_number(part_number: Option<i16>) -> Result<(), VoiceError> {
@@ -87,13 +109,7 @@ pub fn slugify(input: &str) -> String {
 /// reason to also check here is to turn the bare FK-violation `23503` into a
 /// clean domain error rather than a generic database error).
 async fn validate_instrument_id(pool: &PgPool, instrument_id: Uuid) -> Result<bool, sqlx::Error> {
-    let exists: bool = sqlx::query_scalar!(
-        r#"SELECT EXISTS(SELECT 1 FROM instrument WHERE id = $1) as "exists!""#,
-        instrument_id,
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(exists)
+    crate::domain::instrument::exists(pool, instrument_id).await
 }
 
 struct Row {
@@ -137,10 +153,14 @@ pub async fn create(
     name: &str,
     slug: &str,
     instrument_id: Uuid,
-    part_number: Option<i16>,
+    part_number: NewPartNumber,
     created_by: Option<Uuid>,
 ) -> Result<Voice, VoiceError> {
-    validate_part_number(part_number)?;
+    let (from_name, explicit) = match part_number {
+        NewPartNumber::FromName => (true, None),
+        NewPartNumber::Set(n) => (false, n),
+    };
+    validate_part_number(explicit)?;
     if !validate_instrument_id(pool, instrument_id).await? {
         return Err(VoiceError::UnknownInstrument);
     }
@@ -149,7 +169,11 @@ pub async fn create(
         Row,
         r#"
         INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES (
+            $1, $2, $3, $4, $5,
+            CASE WHEN $8 THEN lied_guess_part_number($3) ELSE $6 END,
+            $7
+        )
         RETURNING
             id, arrangement_id, name, slug, instrument_id, part_number,
             created_at as "created_at: DateTime<Utc>",
@@ -162,8 +186,9 @@ pub async fn create(
         name,
         slug,
         instrument_id,
-        part_number,
+        explicit,
         created_by,
+        from_name,
     )
     .fetch_one(pool)
     .await
@@ -322,9 +347,13 @@ pub async fn update(
     id: Uuid,
     name: &str,
     instrument_id: Uuid,
-    part_number: Option<i16>,
+    part_number: PartNumberChange,
 ) -> Result<Option<Voice>, VoiceError> {
-    validate_part_number(part_number)?;
+    let (keep, explicit) = match part_number {
+        PartNumberChange::Keep => (true, None),
+        PartNumberChange::Set(n) => (false, n),
+    };
+    validate_part_number(explicit)?;
     if !validate_instrument_id(pool, instrument_id).await? {
         return Err(VoiceError::UnknownInstrument);
     }
@@ -333,7 +362,10 @@ pub async fn update(
         Row,
         r#"
         UPDATE voice v
-        SET name = $2, instrument_id = $3, part_number = $4, updated_at = now()
+        SET name = $2,
+            instrument_id = $3,
+            part_number = CASE WHEN $5 THEN v.part_number ELSE $4 END,
+            updated_at = now()
         WHERE v.id = $1 AND v.deleted_at IS NULL
         RETURNING
             v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
@@ -345,7 +377,8 @@ pub async fn update(
         id,
         name,
         instrument_id,
-        part_number,
+        explicit,
+        keep,
     )
     .fetch_optional(pool)
     .await

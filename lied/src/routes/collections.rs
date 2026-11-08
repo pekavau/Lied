@@ -92,17 +92,11 @@ fn validate_index(index: i32) -> Result<(), AppError> {
     if collection_item::is_valid_index(index) {
         Ok(())
     } else {
-        Err(empty_field(
+        Err(AppError::field(
             "index",
             &format!("index must be between 1 and {}", collection_item::MAX_INDEX),
         ))
     }
-}
-
-fn empty_field(field: &str, msg: &str) -> AppError {
-    let mut report = garde::Report::new();
-    report.append(garde::Path::new(field), garde::Error::new(msg.to_string()));
-    AppError::Validation(report)
 }
 
 fn collection_error_to_app_error(err: collection::CollectionError) -> AppError {
@@ -132,7 +126,7 @@ fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppErro
     }
 }
 
-async fn find_collection_scoped(
+pub(crate) async fn find_collection_scoped(
     state: &AppState,
     org_id: Uuid,
     id: Uuid,
@@ -295,10 +289,13 @@ async fn create_collection(
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
     if body.name.trim().is_empty() {
-        return Err(empty_field("name", "name must not be empty"));
+        return Err(AppError::field("name", "name must not be empty"));
     }
     if !collection::is_valid_type(&body.collection_type) {
-        return Err(empty_field("type", "type must be `program` or `standing`"));
+        return Err(AppError::field(
+            "type",
+            "type must be `program` or `standing`",
+        ));
     }
 
     let id = Uuid::now_v7();
@@ -406,10 +403,13 @@ async fn update_collection(
         .map_err(|_| AppError::PreconditionFailed)?;
 
     if body.name.trim().is_empty() {
-        return Err(empty_field("name", "name must not be empty"));
+        return Err(AppError::field("name", "name must not be empty"));
     }
     if !collection::is_valid_type(&body.collection_type) {
-        return Err(empty_field("type", "type must be `program` or `standing`"));
+        return Err(AppError::field(
+            "type",
+            "type must be `program` or `standing`",
+        ));
     }
 
     let updated = collection::update(&state.db, id, &body.name, &body.collection_type)

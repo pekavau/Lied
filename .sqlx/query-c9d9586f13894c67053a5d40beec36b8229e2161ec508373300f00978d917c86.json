@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO audit_log (id, actor_user_id, org_id, action, target_kind, target_id, payload, request_id)\n        SELECT r.id, $1, $2, $3, $4, r.target_id, r.payload, $5\n        FROM unnest($6::uuid[], $7::uuid[], $8::jsonb[]) AS r(id, target_id, payload)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "UuidArray",
+        "UuidArray",
+        "JsonbArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c9d9586f13894c67053a5d40beec36b8229e2161ec508373300f00978d917c86"
+}

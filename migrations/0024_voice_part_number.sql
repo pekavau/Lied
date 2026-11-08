@@ -11,45 +11,74 @@
 ALTER TABLE voice
     ADD COLUMN part_number smallint CHECK (part_number >= 1);
 
--- Best-effort guess of a part number from a voice name, used to backfill the
--- voices that existed before the column did. Deliberately conservative: it only
--- answers when the name carries exactly one ordinal in an unmistakable place,
--- and returns NULL for anything else -- a wrong number silently hands a player
--- the wrong part, whereas a missing one shows up in the bulk-assign preview as
--- "no matching voice", where the archivist can see it and fix it.
+-- Best-effort guess of a part number from a voice name. Used twice: to
+-- backfill the voices that existed before the column did, and by the
+-- application as the default for a new voice created without an explicit
+-- part number -- one implementation, so the two cannot disagree.
 --
--- Recognised:
+-- Deliberately conservative. It answers only when the name carries exactly
+-- ONE ordinal, in an unmistakable place, and returns NULL for anything else:
+-- a wrong number silently hands a player the wrong part, whereas a missing one
+-- shows up in the bulk-assign preview, where the archivist can see and fix it.
+--
+-- The name is split on whitespace; a token is an ordinal if it is arabic
+-- digits (optionally "1st"/"2nd"/"2."), or an upper-case roman numeral I..VIII.
+--
+-- Recognised (exactly one ordinal):
 --   trailing arabic   "Trumpet in Bb 1", "Horn in F 12"
---   trailing roman    "Violin I" .. "Violin VIII" (upper case only)
+--   trailing roman    "Violin I" .. "Viola VIII"
 --   leading ordinal   "1st Trumpet", "2nd Violin", "2. Trompete"
--- Rejected (NULL):
---   any separator that signals a combined or doubling part (/ & + ,):
---     "Horn 1 & 3", "Flute 2/Piccolo", "Trombone 1+2"
---   any second number: "Trumpet 1 in 3/4" etc.
---   0 or three-digit numbers.
+-- NULL:
+--   two or more ordinals, however they are joined -- combined parts:
+--     "Horn 1 und 3", "Violin I und II", "Violin I - II", "1st Violin II"
+--   the separators / & + , anywhere: "Flute 2/Piccolo", "Trombone 1+2"
+--   0, three-digit numbers, or an ordinal in the middle of the name
+--   lower-case roman ("Violin ii"): too easily an ordinary word
 --
--- IMMUTABLE: it depends on its argument alone, and declaring it so lets a test
--- call it directly to pin the heuristic.
+-- IMMUTABLE: it depends on its argument alone, which lets tests call it
+-- directly to pin the heuristic.
 CREATE FUNCTION lied_guess_part_number(name text) RETURNS smallint
-    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
 AS $$
-    SELECT CASE
-        WHEN btrim(name) ~ '^[^0-9/&+,]*\s[1-9][0-9]?$'
-            THEN substring(btrim(name) FROM '([1-9][0-9]?)$')::smallint
-        WHEN btrim(name) ~ '^[^0-9/&+,]*\s(I|II|III|IV|V|VI|VII|VIII)$'
-            THEN CASE substring(btrim(name) FROM '\s(I|II|III|IV|V|VI|VII|VIII)$')
-                WHEN 'I' THEN 1
-                WHEN 'II' THEN 2
-                WHEN 'III' THEN 3
-                WHEN 'IV' THEN 4
-                WHEN 'V' THEN 5
-                WHEN 'VI' THEN 6
-                WHEN 'VII' THEN 7
-                WHEN 'VIII' THEN 8
-            END::smallint
-        WHEN btrim(name) ~ '^[1-9][0-9]?(st|nd|rd|th|\.)\s+[^0-9/&+,]+$'
-            THEN substring(btrim(name) FROM '^([1-9][0-9]?)')::smallint
-    END
+DECLARE
+    romans constant text[] := ARRAY['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII'];
+    tokens text[];
+    token text;
+    ordinals int := 0;
+    last text;
+    first text;
+BEGIN
+    IF name ~ '[/&+,]' THEN
+        RETURN NULL;
+    END IF;
+    tokens := array_remove(regexp_split_to_array(btrim(name), '\s+'), '');
+    IF coalesce(array_length(tokens, 1), 0) < 2 THEN
+        RETURN NULL;
+    END IF;
+
+    FOREACH token IN ARRAY tokens LOOP
+        IF token ~ '^[0-9]+(st|nd|rd|th|\.)?$' OR token = ANY (romans) THEN
+            ordinals := ordinals + 1;
+        END IF;
+    END LOOP;
+    IF ordinals <> 1 THEN
+        RETURN NULL;
+    END IF;
+
+    last := tokens[array_length(tokens, 1)];
+    IF last ~ '^[1-9][0-9]?$' THEN
+        RETURN last::smallint;
+    END IF;
+    IF last = ANY (romans) THEN
+        RETURN array_position(romans, last)::smallint;
+    END IF;
+
+    first := tokens[1];
+    IF first ~ '^[1-9][0-9]?(st|nd|rd|th|\.)$' THEN
+        RETURN substring(first FROM '^[0-9]+')::smallint;
+    END IF;
+    RETURN NULL;
+END
 $$;
 
 -- Soft-deleted voices are backfilled too: undeleting one should bring back a

@@ -101,6 +101,52 @@ pub async fn audit(
     }
 }
 
+/// Write several audit_log rows sharing one action and context, as part of
+/// the caller's transaction, in a single INSERT.
+///
+/// Unlike [`audit`] this **propagates** its error: it exists for writes that
+/// must not commit without their audit trail (bulk part assignment), where the
+/// caller wants "both or neither" rather than "the write, and the log if
+/// possible". Payloads get the same redaction pass as [`audit`].
+pub async fn audit_many_in(
+    conn: &mut sqlx::PgConnection,
+    ctx: &AuditContext,
+    action: &str,
+    target_kind: &str,
+    rows: Vec<(Uuid, Value)>,
+) -> Result<(), sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = rows.iter().map(|_| Uuid::now_v7()).collect();
+    let mut target_ids = Vec::with_capacity(rows.len());
+    let mut payloads = Vec::with_capacity(rows.len());
+    for (target_id, mut payload) in rows {
+        redact(&mut payload);
+        target_ids.push(target_id);
+        payloads.push(payload);
+    }
+
+    sqlx::query!(
+        r#"
+        INSERT INTO audit_log (id, actor_user_id, org_id, action, target_kind, target_id, payload, request_id)
+        SELECT r.id, $1, $2, $3, $4, r.target_id, r.payload, $5
+        FROM unnest($6::uuid[], $7::uuid[], $8::jsonb[]) AS r(id, target_id, payload)
+        "#,
+        ctx.actor_user_id,
+        ctx.org_id,
+        action,
+        target_kind,
+        ctx.request_id,
+        &ids,
+        &target_ids,
+        &payloads,
+    )
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,7 +25,6 @@ use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::auth::extractors::AuthSession;
-use crate::domain::audit_log::audit;
 use crate::domain::bulk_assign::{self, Outcome, PartInCollection, PartKey, PlanItem, VoiceRef};
 use crate::domain::{membership, user};
 use crate::routes::admin::arrangements::{audit_ctx, csrf_token};
@@ -187,10 +186,22 @@ async fn bulk_assign_page(
             );
         }
     };
-    let member_usernames =
-        membership::member_usernames(&state.db, org_id, i64::from(state.config.max_page_size))
-            .await
-            .unwrap_or_default();
+    // The datalist is a convenience — the field accepts any username — so a
+    // failed lookup degrades to an empty list rather than an error page, but
+    // it is logged, not swallowed.
+    let member_usernames = match membership::member_usernames(
+        &state.db,
+        org_id,
+        i64::from(state.config.max_page_size),
+    )
+    .await
+    {
+        Ok(names) => names,
+        Err(error) => {
+            tracing::error!(%error, "failed to list member usernames for the datalist");
+            Vec::new()
+        }
+    };
 
     let raw_part = field(&pairs, "part").filter(|v| !v.is_empty());
     let username = field(&pairs, "username")
@@ -329,7 +340,9 @@ async fn bulk_assign_page(
             } @else {
                 form method="post" action=(&action) {
                     (layout::csrf_field(&token))
-                    input type="hidden" name="username" value=(player.username);
+                    // The player is carried by id, not username: usernames can
+                    // be renamed, and the write must go to the person previewed.
+                    input type="hidden" name="user_id" value=(player.id);
                     @if let Some(part) = raw_part {
                         input type="hidden" name="part" value=(part);
                     }
@@ -378,15 +391,22 @@ async fn apply_bulk_assign(
         Err(response) => return response,
     };
 
-    let Some(username) = field(&pairs, "username")
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    else {
+    let Some(player_id) = field(&pairs, "user_id").and_then(|v| Uuid::parse_str(v).ok()) else {
         return error_page(
             &ctx,
             StatusCode::BAD_REQUEST,
-            "Enter the player's username.",
+            "Choose a player and preview first.",
         );
+    };
+    let Some(raw_part) = field(&pairs, "part") else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Choose a part and preview first.",
+        );
+    };
+    let Some(key) = parse_part(raw_part) else {
+        return error_page(&ctx, StatusCode::BAD_REQUEST, "Choose a part.");
     };
     let raw_pairs = multi(&pairs, "pair");
     let Some(assignments) = raw_pairs
@@ -397,36 +417,17 @@ async fn apply_bulk_assign(
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Malformed assignment list.");
     };
 
-    let player = match user::find_by_username(&state.db, username).await {
-        Ok(Some(player)) => player,
-        Ok(None) => {
-            return error_page(
-                &ctx,
-                StatusCode::NOT_FOUND,
-                "No user with that username. They need an account before they can be \
-                 assigned a part.",
-            )
-        }
-        Err(error) => {
-            tracing::error!(%error, "failed to look up the player");
-            return error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not look up that user.",
-            );
-        }
-    };
-
-    let applied = match bulk_assign::apply(
+    match bulk_assign::apply(
         &state.db,
         collection_id,
-        player.id,
+        key,
+        player_id,
         &assignments,
-        Some(ctx.user().id),
+        &audit_ctx(&ctx, request_id),
     )
     .await
     {
-        Ok(applied) => applied,
+        Ok(_) => {}
         Err(bulk_assign::BulkAssignError::Empty) => {
             return error_page(
                 &ctx,
@@ -441,8 +442,9 @@ async fn apply_bulk_assign(
             return error_page(
                 &ctx,
                 StatusCode::CONFLICT,
-                "The collection changed since the preview — a piece or voice was removed. \
-                 Nothing was assigned; go back and preview again.",
+                "The collection changed since the preview — a piece or voice was removed, \
+                 or a voice is no longer this part. Nothing was assigned; go back and \
+                 preview again.",
             )
         }
         Err(bulk_assign::BulkAssignError::Database(error)) => {
@@ -453,37 +455,27 @@ async fn apply_bulk_assign(
                 "Could not assign the parts. Nothing was assigned.",
             );
         }
-    };
-
-    let actx = audit_ctx(&ctx, request_id);
-    for created in &applied.created {
-        audit(
-            &state.db,
-            &actx,
-            "part_assignment.create",
-            "part_assignment",
-            Some(created.id),
-            serde_json::json!({
-                "collectionItemId": created.collection_item_id,
-                "voiceId": created.voice_id,
-                "userId": created.user_id,
-                "via": "bulk",
-            }),
-        )
-        .await;
     }
+
+    // The redirect shows the preview again under the player's CURRENT
+    // username; the id is what was written to.
+    let username = match user::find_by_id(&state.db, player_id).await {
+        Ok(Some(player)) => player.username,
+        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "That user no longer exists."),
+        Err(error) => {
+            tracing::error!(%error, "failed to look up the player after assigning");
+            return Redirect::to(&page_url(org_id, collection_id)).into_response();
+        }
+    };
 
     // Back to the same preview: what was just assigned now reads "already
     // plays it", which is the confirmation.
-    let mut back = format!(
-        "{}?username={}",
+    let back = format!(
+        "{}?username={}&part={}",
         page_url(org_id, collection_id),
-        encode_query_value(&player.username)
+        encode_query_value(&username),
+        encode_query_value(&encode_part(key)),
     );
-    if let Some(part) = field(&pairs, "part").filter(|v| parse_part(v).is_some()) {
-        back.push_str("&part=");
-        back.push_str(&encode_query_value(part));
-    }
     Redirect::to(&back).into_response()
 }
 

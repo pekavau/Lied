@@ -35,6 +35,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::domain::audit_log::{self, AuditContext};
 use crate::domain::part_assignment::PartAssignment;
 
 /// "The same part across pieces": an instrument and its part number, where a
@@ -60,7 +61,9 @@ pub struct VoiceRef {
 pub enum Outcome {
     /// Exactly one voice matches and the player does not hold it yet.
     Assign,
-    /// Exactly one voice matches and the player already plays it.
+    /// The player already plays this part of the piece: the one matching
+    /// voice, or — for a piece that was ambiguous or had no exact match — a
+    /// candidate voice someone assigned by hand. `voice` says which.
     AlreadyHeld,
     /// No voice of this piece matches. `candidates` lists the piece's voices
     /// for the same instrument, so a part named differently (or missing its
@@ -150,13 +153,7 @@ pub async fn plan(
             (a.deleted_at IS NOT NULL) as "arrangement_removed!",
             v.id as "voice_id?",
             v.name as "voice_name?",
-            v.part_number as "part_number?",
-            EXISTS (
-                SELECT 1 FROM part_assignment pa
-                WHERE pa.collection_item_id = ci.id
-                  AND pa.voice_id = v.id
-                  AND pa.user_id = $3
-            ) as "held!"
+            v.part_number as "part_number?"
         FROM collection_item ci
         JOIN collection c ON c.id = ci.collection_id
         JOIN arrangement a ON a.id = ci.arrangement_id
@@ -173,13 +170,13 @@ pub async fn plan(
         "#,
         collection_id,
         key.instrument_id,
-        user_id,
     )
     .fetch_all(pool)
     .await?;
 
     // Every live voice the player already holds in this collection, any
-    // instrument — the conflict note on an `Assign`.
+    // instrument. Answers both "does the player already play this voice" and
+    // the conflict note on an `Assign`, so one query serves both.
     let holdings = sqlx::query!(
         r#"
         SELECT pa.collection_item_id, v.id as voice_id, v.name, v.part_number
@@ -199,7 +196,9 @@ pub async fn plan(
     .await?;
 
     let mut held_by_item: HashMap<Uuid, Vec<VoiceRef>> = HashMap::new();
+    let mut held_pairs: HashSet<(Uuid, Uuid)> = HashSet::new();
     for h in holdings {
+        held_pairs.insert((h.collection_item_id, h.voice_id));
         held_by_item
             .entry(h.collection_item_id)
             .or_default()
@@ -225,7 +224,9 @@ pub async fn plan(
                 }),
                 _ => None,
             },
-            held: r.held,
+            held: r
+                .voice_id
+                .is_some_and(|voice_id| held_pairs.contains(&(r.item_id, voice_id))),
         })
         .collect::<Vec<_>>();
 
@@ -276,8 +277,24 @@ fn assemble(
                 .cloned()
                 .collect();
 
+            // A piece the matcher cannot settle may already have been settled by
+            // hand on its Parts screen. If the player plays one of the voices
+            // the plan would list, the piece is done: report it as held, or
+            // re-running the preview would flag it forever.
+            let held_candidate = |voices: &[(VoiceRef, bool)]| {
+                voices
+                    .iter()
+                    .find(|(_, held)| *held)
+                    .map(|(v, _)| v.clone())
+            };
+
             match matching.len() {
                 0 => {
+                    if let Some(held) = held_candidate(&instrument_voices) {
+                        item.outcome = Outcome::AlreadyHeld;
+                        item.voice = Some(held);
+                        return item;
+                    }
                     item.outcome = Outcome::NoMatch;
                     item.candidates = instrument_voices.into_iter().map(|(v, _)| v).collect();
                 }
@@ -300,6 +317,11 @@ fn assemble(
                     item.voice = Some(voice);
                 }
                 _ => {
+                    if let Some(held) = held_candidate(&matching) {
+                        item.outcome = Outcome::AlreadyHeld;
+                        item.voice = Some(held);
+                        return item;
+                    }
                     item.outcome = Outcome::Ambiguous;
                     item.candidates = matching.into_iter().map(|(v, _)| v).collect();
                 }
@@ -310,24 +332,40 @@ fn assemble(
 }
 
 /// Assign `user_id` to each submitted `(collection_item_id, voice_id)` pair of
-/// `collection_id`, all or nothing.
+/// `collection_id` as the part `key`, all or nothing, with one audit row per
+/// assignment written in the same transaction.
 ///
-/// Every pair must name a live piece of this collection whose arrangement is
-/// live, and a live voice of that arrangement; one that does not means the
-/// collection changed since the plan was made, and the call fails with
-/// [`BulkAssignError::Stale`] having written nothing. The rows it checked are
-/// share-locked for the rest of the transaction, so they cannot be removed
-/// between the check and the insert.
+/// Every pair must still be what the plan said it was: a live piece of this
+/// collection, and a live voice of that piece's arrangement **that is still
+/// the requested part** (same instrument, same part number). A voice that was
+/// removed, moved to another instrument, or renumbered since the preview —
+/// which is exactly what the preview tells the archivist to go and fix — makes
+/// the call fail with [`BulkAssignError::Stale`] having written nothing, so a
+/// confirm form left open in another tab cannot put a player on the wrong
+/// part.
+///
+/// The checked piece and voice rows are share-locked, in id order, until
+/// commit, so they cannot be removed, renumbered or reordered between the
+/// check and the insert. Arrangement and collection rows are deliberately not
+/// locked: a concurrent soft-delete of either only hides the new assignments
+/// through it (hide-with-references), which is harmless, whereas locking them
+/// would block unrelated edits such as renames for the whole apply.
 ///
 /// Pairs the player already holds are left alone and reported in
 /// [`Applied::already_held`] — re-running bulk assignment after adding a piece
 /// is the intended way to extend it. Duplicate pairs in the input are ignored.
+///
+/// The audit rows are written inside the transaction (unlike the best-effort
+/// [`crate::domain::audit_log::audit`]): an assignment and its audit row commit
+/// or fail together, so an aborted request can never leave assignments that
+/// the audit log does not know about.
 pub async fn apply(
     pool: &PgPool,
     collection_id: Uuid,
+    key: PartKey,
     user_id: Uuid,
     pairs: &[(Uuid, Uuid)],
-    created_by: Option<Uuid>,
+    audit_ctx: &AuditContext,
 ) -> Result<Applied, BulkAssignError> {
     let mut seen = HashSet::new();
     let pairs: Vec<(Uuid, Uuid)> = pairs.iter().copied().filter(|p| seen.insert(*p)).collect();
@@ -364,11 +402,16 @@ pub async fn apply(
           ON v.id = p.voice_id
          AND v.arrangement_id = a.id
          AND v.deleted_at IS NULL
-        FOR SHARE OF ci, c, a, v
+         AND v.instrument_id = $4
+         AND v.part_number IS NOT DISTINCT FROM $5
+        ORDER BY ci.id, v.id
+        FOR SHARE OF ci, v
         "#,
         collection_id,
         &item_ids,
         &voice_ids,
+        key.instrument_id,
+        key.part_number,
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -394,15 +437,13 @@ pub async fn apply(
             created_by
         "#,
         user_id,
-        created_by,
+        audit_ctx.actor_user_id,
         &ids,
         &item_ids,
         &voice_ids,
     )
     .fetch_all(&mut *tx)
     .await?;
-
-    tx.commit().await?;
 
     // RETURNING carries no ordering guarantee; restore submission order.
     let mut by_pair: HashMap<(Uuid, Uuid), PartAssignment> = inserted
@@ -417,6 +458,34 @@ pub async fn apply(
             None => already_held.push(pair),
         }
     }
+
+    // The same action and payload shape as a single assignment, so an
+    // assignment's history reads the same however it was made.
+    let audit_rows: Vec<(Uuid, serde_json::Value)> = created
+        .iter()
+        .map(|a| {
+            (
+                a.id,
+                serde_json::json!({
+                    "collectionItemId": a.collection_item_id,
+                    "voiceId": a.voice_id,
+                    "userId": a.user_id,
+                    "via": "bulk",
+                }),
+            )
+        })
+        .collect();
+    audit_log::audit_many_in(
+        &mut tx,
+        audit_ctx,
+        "part_assignment.create",
+        "part_assignment",
+        audit_rows,
+    )
+    .await?;
+
+    tx.commit().await?;
+
     Ok(Applied {
         created,
         already_held,
@@ -588,6 +657,27 @@ mod tests {
         assert_eq!(plan[0].outcome, Outcome::Ambiguous);
         assert_eq!(plan[0].candidates, vec![a, b]);
         assert_eq!(plan[0].voice, None);
+    }
+
+    #[test]
+    fn a_held_candidate_settles_an_ambiguous_or_unmatched_piece() {
+        let (ambiguous, unmatched) = (Uuid::now_v7(), Uuid::now_v7());
+        let alt = voice("Trumpet 1 (alt)", Some(1));
+        let plain = voice("Trumpet", None);
+        let plan = assemble(
+            vec![
+                row(ambiguous, 1, Some(voice("Trumpet 1", Some(1))), false),
+                row(ambiguous, 1, Some(alt.clone()), true),
+                row(unmatched, 2, Some(plain.clone()), true),
+            ],
+            Some(1),
+            &HashMap::new(),
+        );
+        assert_eq!(plan[0].outcome, Outcome::AlreadyHeld);
+        assert_eq!(plan[0].voice, Some(alt));
+        assert!(plan[0].candidates.is_empty());
+        assert_eq!(plan[1].outcome, Outcome::AlreadyHeld);
+        assert_eq!(plan[1].voice, Some(plain));
     }
 
     #[test]

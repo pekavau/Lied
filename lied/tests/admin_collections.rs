@@ -1041,7 +1041,7 @@ async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
         name,
         &lied::domain::voice::slugify(name),
         instrument_id,
-        None,
+        lied::domain::voice::NewPartNumber::Set(None),
         None,
     )
     .await
@@ -2090,12 +2090,29 @@ async fn seed_part(
         name,
         &lied::domain::voice::slugify(name),
         instrument_id,
-        part_number,
+        lied::domain::voice::NewPartNumber::Set(part_number),
         None,
     )
     .await
     .expect("voice");
     id
+}
+
+/// The value of the hidden input `name` on a page.
+fn hidden_value(html: &str, name: &str) -> String {
+    let marker = format!("name=\"{name}\" value=\"");
+    let start = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no hidden {name}"))
+        + marker.len();
+    html[start..].split('"').next().unwrap().to_string()
+}
+
+async fn trumpet_id(ctx: &Ctx) -> Uuid {
+    sqlx::query_scalar!("SELECT id FROM instrument WHERE key = 'trumpet_bb'")
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap()
 }
 
 /// The `pair` values a bulk-assign confirm form carries.
@@ -2140,7 +2157,7 @@ async fn a_player_is_put_on_one_part_across_the_collection_after_a_preview() {
     let browser = Browser::login(&ctx.app, "arch").await;
     let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
     // Spaces and an umlaut: the redirect back must encode the username.
-    seed_user(&ctx.state, "jörg first").await;
+    let jorg = seed_user(&ctx.state, "jörg first").await;
     let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
 
     // The collection's screens link here.
@@ -2194,8 +2211,16 @@ async fn a_player_is_put_on_one_part_across_the_collection_after_a_preview() {
 
     // Confirm.
     let token = form_csrf(&html);
-    let part_value = format!("{trumpet}:1");
-    let mut fields: Vec<(&str, &str)> = vec![("username", "jörg first"), ("part", &part_value)];
+    // Post exactly what the rendered confirm form carries.
+    let user_value = hidden_value(&html, "user_id");
+    let part_value = hidden_value(&html, "part");
+    assert_eq!(part_value, format!("{trumpet}:1"));
+    assert_eq!(
+        user_value,
+        jorg.to_string(),
+        "the confirm carries the previewed id"
+    );
+    let mut fields: Vec<(&str, &str)> = vec![("user_id", &user_value), ("part", &part_value)];
     for pair in &pairs {
         fields.push(("pair", pair));
     }
@@ -2229,7 +2254,8 @@ async fn a_stale_bulk_confirm_is_refused_and_nothing_is_assigned() {
     let fx = seed(&ctx.state).await;
     let browser = Browser::login(&ctx.app, "arch").await;
     let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
-    seed_user(&ctx.state, "player").await;
+    let player = seed_user(&ctx.state, "player").await.to_string();
+    let part = format!("{}:1", trumpet_id(&ctx).await);
     let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
     let token = session_csrf(&ctx.app, &browser, &page).await;
 
@@ -2244,7 +2270,12 @@ async fn a_stale_bulk_confirm_is_refused_and_nothing_is_assigned() {
         &ctx.app,
         &browser,
         &page,
-        &[("username", "player"), ("pair", &first), ("pair", &third)],
+        &[
+            ("user_id", &player),
+            ("part", &part),
+            ("pair", &first),
+            ("pair", &third),
+        ],
         &token,
     )
     .await;
@@ -2262,7 +2293,8 @@ async fn bulk_assignment_is_for_part_assigners_only() {
     let fx = seed(&ctx.state).await;
     let archivist = Browser::login(&ctx.app, "arch").await;
     let (coll, item_ids, a1, _) = seed_march_book(&ctx, &archivist, fx.org_id).await;
-    seed_user(&ctx.state, "player").await;
+    let player = seed_user(&ctx.state, "player").await.to_string();
+    let part = format!("{}:1", trumpet_id(&ctx).await);
     let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
     let pair = format!("{}:{a1}", item_ids[0]);
 
@@ -2274,7 +2306,7 @@ async fn bulk_assignment_is_for_part_assigners_only() {
         &ctx.app,
         &musician,
         &page,
-        &[("username", "player"), ("pair", &pair)],
+        &[("user_id", &player), ("part", &part), ("pair", &pair)],
         &token,
     )
     .await;
@@ -2316,7 +2348,7 @@ async fn bulk_assignment_is_for_part_assigners_only() {
         &ctx.app,
         &principal,
         &page,
-        &[("username", "player"), ("pair", &pair)],
+        &[("user_id", &player), ("part", &part), ("pair", &pair)],
         &token,
     )
     .await;
@@ -2329,12 +2361,127 @@ async fn bulk_assignment_is_for_part_assigners_only() {
         &ctx.app,
         &conductor,
         &page,
-        &[("username", "player"), ("pair", &pair)],
+        &[("user_id", &player), ("part", &part), ("pair", &pair)],
         &token,
     )
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
     assert!(assignment_for(&ctx, item_ids[0], a1).await.is_some());
+}
+
+/// Review of #55, finding 5: the confirm carries the previewed player's id,
+/// not the username. A rename between preview and confirm, with someone else
+/// taking the old name, must not hand the parts to that someone else.
+#[tokio::test]
+async fn the_confirm_assigns_the_previewed_player_even_after_a_rename() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
+    let anna = seed_user(&ctx.state, "anna").await;
+    let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
+    let trumpet = trumpet_id(&ctx).await;
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("{page}?part={trumpet}%3A1&username=anna"),
+    )
+    .await;
+    let token = form_csrf(&html);
+    let user_value = hidden_value(&html, "user_id");
+    let part_value = hidden_value(&html, "part");
+    let pairs = confirm_pairs(&html);
+
+    // Anna becomes "anna-k"; a different person signs up as "anna".
+    sqlx::query!(
+        r#"UPDATE "user" SET username = 'anna-k' WHERE id = $1"#,
+        anna
+    )
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    // Slugs never change on rename, so the newcomer gets a slug of their own.
+    let impostor = Uuid::now_v7();
+    user::create(
+        &ctx.state.db,
+        impostor,
+        "anna-2",
+        "anna",
+        None,
+        None,
+        "Another Anna",
+        false,
+        None,
+    )
+    .await
+    .expect("impostor");
+
+    let mut fields: Vec<(&str, &str)> = vec![("user_id", &user_value), ("part", &part_value)];
+    for pair in &pairs {
+        fields.push(("pair", pair));
+    }
+    let response = post_form(&ctx.app, &browser, &page, &fields, &token).await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    for (item, voice) in [(item_ids[0], a1), (item_ids[2], c1)] {
+        let players: Vec<Uuid> = players_for(&ctx, item, voice)
+            .await
+            .into_iter()
+            .map(|a| a.user_id)
+            .collect();
+        assert_eq!(
+            players,
+            vec![anna],
+            "the previewed person, not the new holder of the name"
+        );
+    }
+    assert!(!players_for(&ctx, item_ids[0], a1)
+        .await
+        .iter()
+        .any(|a| a.user_id == impostor));
+    // The redirect shows the preview under Anna's current name.
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(location.contains("username=anna-k"), "{location}");
+}
+
+/// Review of #55, finding 3 through the console: a voice renumbered after the
+/// preview makes the open confirm form stale.
+#[tokio::test]
+async fn a_console_confirm_for_a_renumbered_voice_is_refused() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
+    let player = seed_user(&ctx.state, "player").await.to_string();
+    let part = format!("{}:1", trumpet_id(&ctx).await);
+    let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
+    let token = session_csrf(&ctx.app, &browser, &page).await;
+
+    sqlx::query!("UPDATE voice SET part_number = 2 WHERE id = $1", c1)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let first = format!("{}:{a1}", item_ids[0]);
+    let third = format!("{}:{c1}", item_ids[2]);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &page,
+        &[
+            ("user_id", &player),
+            ("part", &part),
+            ("pair", &first),
+            ("pair", &third),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_none());
 }
 
 #[tokio::test]
@@ -2410,4 +2557,54 @@ async fn a_voice_part_number_is_set_from_the_catalog_screens() {
     .await
     .unwrap();
     assert_eq!(unnumbered, None);
+
+    // Review of #55, finding 7: a blank number on the ADD form takes it from
+    // the name, so new voices number like the backfilled ones.
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &voices_url,
+        &[
+            ("name", "Trumpet in Bb 3"),
+            ("instrument_id", &trumpet_str),
+            ("part_number", ""),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let (voice_id, guessed): (Uuid, Option<i16>) = sqlx::query_as(
+        "SELECT id, part_number FROM voice WHERE arrangement_id = $1 AND name = 'Trumpet in Bb 3'",
+    )
+    .bind(arr)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(guessed, Some(3));
+
+    // On the EDIT form, blank means "no number" — the field shows the current
+    // value, so clearing it is deliberate.
+    let edit_url = format!("{voices_url}/{voice_id}");
+    let (_, html) = load_page(&ctx.app, &browser, &edit_url).await;
+    let version = hidden_value(&html, "expected_version");
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &edit_url,
+        &[
+            ("expected_version", &version),
+            ("name", "Trumpet in Bb 3"),
+            ("instrument_id", &trumpet_str),
+            ("part_number", ""),
+        ],
+        &form_csrf(&html),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let cleared: Option<i16> = sqlx::query_scalar("SELECT part_number FROM voice WHERE id = $1")
+        .bind(voice_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(cleared, None);
 }

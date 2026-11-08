@@ -287,7 +287,7 @@ async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Progra
                 name,
                 &voice::slugify(&format!("{title}-{name}")),
                 instrument,
-                None,
+                lied::domain::voice::NewPartNumber::Set(None),
                 None,
             )
             .await
