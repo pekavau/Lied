@@ -14,7 +14,7 @@
 //! overwrite (CLAUDE.md HTTP conventions: "HTMX forms carry the ETag in a
 //! hidden field").
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -525,10 +525,17 @@ async fn create(
 // Arrangements: detail / update / delete / undelete
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
+struct DetailQuery {
+    /// Which page of the Annotations block to show.
+    annotations_offset: Option<i64>,
+}
+
 async fn detail_page(
     State(state): State<AppState>,
     auth: Option<AuthSession>,
     Path((org_id, arr_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<DetailQuery>,
     session: Session,
 ) -> Response {
     let ctx = match console::enter(&state, auth, org_id).await {
@@ -570,15 +577,17 @@ async fn detail_page(
     // A removed arrangement hides its annotations, so there is nothing to
     // load. A failed load is an error page, not an empty list: "no
     // annotations" must never be what a database hiccup looks like.
+    let annotation_limit = i64::from(state.config.max_page_size);
+    let annotation_offset = query.annotations_offset.unwrap_or(0).max(0);
     let (annotations, annotation_total) = if deleted {
         (Vec::new(), 0)
     } else {
         match global_annotation::list_for_arrangement(
             &state.db,
             arr_id,
-            i64::from(state.config.max_page_size),
-            0,
-            "g.created_at",
+            annotation_limit,
+            annotation_offset,
+            global_annotation::SortField::CreatedAt,
             SortDirection::Asc,
             None,
         )
@@ -626,7 +635,11 @@ async fn detail_page(
             arr_id,
             deleted,
             &annotations,
-            annotation_total,
+            crate::routes::admin::annotations::AnnotationPage {
+                offset: annotation_offset,
+                limit: annotation_limit,
+                total: annotation_total,
+            },
             &token,
         ))
 

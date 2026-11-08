@@ -137,16 +137,31 @@ async fn add_member(pool: &PgPool, org_id: Uuid, user_id: Uuid, role: membership
     .expect("membership");
 }
 
-async fn create_arrangement(pool: &PgPool, org_id: Uuid, slug: &str) -> Uuid {
+/// An arrangement, through the real repository function.
+async fn create_arrangement(pool: &PgPool, org_id: Uuid, title: &str) -> Uuid {
     let id = Uuid::now_v7();
-    sqlx::query!(
-        r#"INSERT INTO arrangement (id, organization_id, title, slug, status)
-           VALUES ($1, $2, $3, $3, 'active')"#,
+    lied::domain::arrangement::create(
+        pool,
         id,
         org_id,
-        slug,
+        &lied::domain::arrangement::slugify(title),
+        lied::domain::arrangement::ArrangementFields {
+            title,
+            work_id: None,
+            instrumentation: None,
+            arranger: None,
+            publisher: None,
+            purchase_date: None,
+            license_notes: None,
+            copy_count_allowed: None,
+            status: "active",
+            duration_seconds: None,
+            difficulty: None,
+            difficulty_ratings: None,
+            difficulty_notes: None,
+        },
+        None,
     )
-    .execute(pool)
     .await
     .expect("arrangement");
     id
@@ -685,13 +700,9 @@ async fn a_removed_arrangement_hides_its_annotations_until_restored() {
         note["id"].as_str().unwrap()
     );
 
-    sqlx::query!(
-        "UPDATE arrangement SET deleted_at = now() WHERE id = $1",
-        arr
-    )
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr)
+        .await
+        .unwrap());
     let (status, _, _) = send(&ctx.app, req("GET", &url, &tok, None)).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
     let (status, _, _) = send(&ctx.app, req("GET", &list_url(ctx.org, arr), &tok, None)).await;
@@ -715,14 +726,151 @@ async fn a_removed_arrangement_hides_its_annotations_until_restored() {
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 
     // Hide-with-references: restoring brings it back, unchanged.
-    sqlx::query!(
-        "UPDATE arrangement SET deleted_at = NULL WHERE id = $1",
-        arr
-    )
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    assert!(lied::domain::arrangement::undelete(&ctx.pool, arr)
+        .await
+        .unwrap());
     let (status, got, _) = send(&ctx.app, req("GET", &url, &tok, None)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(got["content"], "kept");
+}
+
+// ── review of #36 ───────────────────────────────────────────────────────────
+
+/// The current version (ETag milliseconds) of an annotation.
+async fn version_of(ctx: &Ctx, arr: Uuid, id: Uuid) -> i64 {
+    lied::domain::global_annotation::find(&ctx.pool, ctx.org, arr, id)
+        .await
+        .unwrap()
+        .expect("annotation")
+        .updated_at
+        .timestamp_millis()
+}
+
+/// Finding 1: the version check must be part of the write. Two writers holding
+/// the same version cannot both succeed — the domain write is called directly
+/// here, so the route's early check cannot be what stops the second.
+#[tokio::test]
+async fn two_writes_with_the_same_version_cannot_both_succeed() {
+    let (ctx, tok, _) = setup(membership::Role::Conductor).await;
+    let arr = create_arrangement(&ctx.pool, ctx.org, "bolero").await;
+    let (note, _) = create(&ctx, &tok, arr, "tempo", "first").await;
+    let id: Uuid = note["id"].as_str().unwrap().parse().unwrap();
+    let version = version_of(&ctx, arr, id).await;
+    // updated_at comes from now(): make sure the first write lands in a later
+    // millisecond, or the two versions would be equal by accident.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let first = lied::domain::global_annotation::update(&ctx.pool, id, version, None, Some("A"))
+        .await
+        .expect("the first writer wins");
+    assert_eq!(first.content, "A");
+    let second =
+        lied::domain::global_annotation::update(&ctx.pool, id, version, None, Some("B")).await;
+    assert!(matches!(
+        second,
+        Err(lied::domain::global_annotation::WriteError::Stale)
+    ));
+    let delete = lied::domain::global_annotation::delete(&ctx.pool, id, version).await;
+    assert!(matches!(
+        delete,
+        Err(lied::domain::global_annotation::WriteError::Stale)
+    ));
+    let current = lied::domain::global_annotation::find(&ctx.pool, ctx.org, arr, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.content, "A", "B did not overwrite A");
+}
+
+/// Finding 3: a hidden annotation (its arrangement removed) cannot be deleted
+/// or edited, even by a caller who read it a moment before, or restoring the
+/// arrangement would not bring it back as it was.
+#[tokio::test]
+async fn a_hidden_annotation_cannot_be_deleted_or_edited() {
+    let (ctx, tok, _) = setup(membership::Role::Conductor).await;
+    let arr = create_arrangement(&ctx.pool, ctx.org, "bolero").await;
+    let (note, _) = create(&ctx, &tok, arr, "tempo", "keep me").await;
+    let id: Uuid = note["id"].as_str().unwrap().parse().unwrap();
+    let version = version_of(&ctx, arr, id).await;
+    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr)
+        .await
+        .unwrap());
+
+    assert!(matches!(
+        lied::domain::global_annotation::delete(&ctx.pool, id, version).await,
+        Err(lied::domain::global_annotation::WriteError::NotFound)
+    ));
+    assert!(matches!(
+        lied::domain::global_annotation::update(&ctx.pool, id, version, None, Some("x")).await,
+        Err(lied::domain::global_annotation::WriteError::NotFound)
+    ));
+    assert!(lied::domain::arrangement::undelete(&ctx.pool, arr)
+        .await
+        .unwrap());
+    let back = lied::domain::global_annotation::find(&ctx.pool, ctx.org, arr, id)
+        .await
+        .unwrap()
+        .expect("restoring the arrangement brings it back");
+    assert_eq!(back.content, "keep me");
+}
+
+/// Finding 4: a PATCH that changes nothing writes nothing — same ETag, no
+/// audit row — and a misspelled field is refused, not a silent no-op.
+#[tokio::test]
+async fn a_patch_that_changes_nothing_writes_nothing() {
+    let (ctx, tok, _) = setup(membership::Role::Conductor).await;
+    let arr = create_arrangement(&ctx.pool, ctx.org, "bolero").await;
+    let (note, etag) = create(&ctx, &tok, arr, "tempo", "same").await;
+    let id: Uuid = note["id"].as_str().unwrap().parse().unwrap();
+    let url = format!("{}/{id}", list_url(ctx.org, arr));
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "type": "tempo", "content": "same" }),
+    ] {
+        let (status, got, headers) = send(
+            &ctx.app,
+            req_with_if_match("PATCH", &url, &tok, Some(&etag), Some(body.clone())),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(got["content"], "same");
+        assert_eq!(
+            headers.get("etag").unwrap().to_str().unwrap(),
+            etag,
+            "no new version for {body}"
+        );
+    }
+    assert!(audit_rows(&ctx.pool, "global_annotation.update", id)
+        .await
+        .is_empty());
+
+    let (status, _, _) = send(
+        &ctx.app,
+        req_with_if_match(
+            "PATCH",
+            &url,
+            &tok,
+            Some(&etag),
+            Some(serde_json::json!({ "contents": "typo" })),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_client_error() && status != axum::http::StatusCode::PRECONDITION_FAILED,
+        "an unknown field is refused, got {status}"
+    );
+    // A no-op PATCH still validates what it was sent.
+    let (status, _, _) = send(
+        &ctx.app,
+        req_with_if_match(
+            "PATCH",
+            &url,
+            &tok,
+            Some(&etag),
+            Some(serde_json::json!({ "type": "cut" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
 }

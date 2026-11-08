@@ -25,8 +25,7 @@ use uuid::Uuid;
 
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
-use crate::domain::global_annotation::{self, GlobalAnnotation, GlobalAnnotationError};
-use crate::listing::check_if_match;
+use crate::domain::global_annotation::{self, GlobalAnnotation, GlobalAnnotationError, WriteError};
 use crate::routes::admin::arrangements::{audit_ctx, csrf_token, scoped_arrangement};
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
@@ -121,20 +120,31 @@ fn refusal(ctx: &ConsoleCtx, err: GlobalAnnotationError) -> Response {
     }
 }
 
-/// The Annotations block on the arrangement screen. `annotations` is the
-/// arrangement's list (already loaded by the caller), `total` its full count
-/// so a capped list says so. A removed arrangement shows no add form: its
-/// notes are hidden through it and come back when it is restored.
+/// Which page of an arrangement's annotations the arrangement screen shows.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnnotationPage {
+    pub offset: i64,
+    pub limit: i64,
+    pub total: i64,
+}
+
+/// The Annotations block on the arrangement screen. `annotations` is one page
+/// of the arrangement's list (loaded by the caller); `page` says which, so a
+/// long list pages instead of leaving notes past the cap with no Edit link
+/// anywhere. A removed arrangement shows no add form: its notes are hidden
+/// through it and come back when it is restored.
 pub(crate) fn section(
     ctx: &ConsoleCtx,
     org_id: Uuid,
     arr_id: Uuid,
     arrangement_removed: bool,
     annotations: &[GlobalAnnotation],
-    total: i64,
+    page: AnnotationPage,
     token: &str,
 ) -> Markup {
     let can_author = ctx.can_author_global_annotations();
+    let base = arrangement_url(org_id, arr_id);
+    let shown_to = page.offset + annotations.len() as i64;
     html! {
         h2 { "Annotations" }
         p class="muted" {
@@ -157,7 +167,7 @@ pub(crate) fn section(
                                 td { (type_label(&a.annotation_type)) }
                                 td { (a.content) }
                                 td { (a.author_display_name) }
-                                td { (a.updated_at.format("%Y-%m-%d").to_string()) }
+                                td { (layout::utc_time(a.updated_at)) }
                                 @if can_author {
                                     td { a href=(annotation_url(org_id, arr_id, a.id)) { "Edit" } }
                                 }
@@ -165,8 +175,19 @@ pub(crate) fn section(
                         }
                     }
                 }
-                @if total > annotations.len() as i64 {
-                    p class="muted" { "Showing the first " (annotations.len()) " of " (total) "." }
+                @if page.total > annotations.len() as i64 {
+                    p class="muted" {
+                        "Annotations " (page.offset + 1) "–" (shown_to) " of " (page.total) ". "
+                        @if page.offset > 0 {
+                            a href=(format!("{base}?annotations_offset={}", (page.offset - page.limit).max(0))) {
+                                "← Earlier"
+                            }
+                            " "
+                        }
+                        @if shown_to < page.total {
+                            a href=(format!("{base}?annotations_offset={shown_to}")) { "Later →" }
+                        }
+                    }
                 }
             }
             @if can_author {
@@ -182,6 +203,22 @@ pub(crate) fn section(
             }
         }
     }
+}
+
+/// The version the form was rendered at, if it is still the current one.
+/// The write re-checks it atomically; this early answer avoids a pointless
+/// statement for a form that is plainly stale.
+fn expected_version(form: &AnnotationForm, current: &GlobalAnnotation) -> Option<i64> {
+    form.expected_version
+        .as_deref()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v == current.updated_at.timestamp_millis())
+}
+
+/// CRLF (and lone CR) to LF — what a browser's textarea sends versus what the
+/// note was stored with.
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 async fn enter_author(
@@ -252,7 +289,7 @@ async fn create_annotation(
         arr_id,
         ctx.user().id,
         form.annotation_type.as_deref().unwrap_or(""),
-        form.content.as_deref().unwrap_or(""),
+        &normalize_newlines(form.content.as_deref().unwrap_or("")),
     )
     .await
     {
@@ -299,13 +336,15 @@ async fn edit_page(
         h2 { "Edit annotation" }
         p class="muted" {
             "By " (a.author_display_name) ", last changed "
-            (a.updated_at.format("%Y-%m-%d %H:%M UTC").to_string()) "."
+            (layout::utc_time(a.updated_at)) "."
         }
         form method="post" action=(&url) {
             (layout::csrf_field(&token))
             input type="hidden" name="expected_version" value=(version);
             label { "Type " (type_select(Some(&a.annotation_type))) }
-            label { "Annotation " textarea name="content" rows="4" required { (a.content) } }
+            // The HTML parser drops one newline straight after <textarea>, so
+            // emit one: content that itself starts with a newline keeps it.
+            label { "Annotation " textarea name="content" rows="4" required { "\n" (a.content) } }
             button type="submit" { "Save changes" }
         }
         form method="post" action=(format!("{url}/delete")) {
@@ -335,23 +374,37 @@ async fn update_annotation(
         Err(response) => return response,
     };
     let url = annotation_url(org_id, arr_id, id);
-    if check_if_match(form.expected_version.as_deref(), current.updated_at).is_err() {
+    let Some(expected) = expected_version(&form, &current) else {
         return console::precondition_page(&ctx, Section::Arrangements, "annotation", &url);
-    }
+    };
     // The edit form always submits both fields, so a missing one is a broken
     // form, not "leave it": treat it like an empty value and let the domain
-    // refuse it.
+    // refuse it. Browsers submit textarea line breaks as CRLF; store LF, or
+    // saving a note that came in over /v1 would rewrite every line ending
+    // nobody touched.
+    let annotation_type = form.annotation_type.clone().unwrap_or_default();
+    let content = normalize_newlines(form.content.as_deref().unwrap_or(""));
+    if annotation_type == current.annotation_type && content == current.content {
+        // Nothing changed: no write, no new version, no audit row.
+        return Redirect::to(&arrangement_url(org_id, arr_id)).into_response();
+    }
     let updated = match global_annotation::update(
         &state.db,
         id,
-        Some(form.annotation_type.as_deref().unwrap_or("")),
-        Some(form.content.as_deref().unwrap_or("")),
+        expected,
+        Some(&annotation_type),
+        Some(&content),
     )
     .await
     {
-        Ok(Some(updated)) => updated,
-        Ok(None) => return error_page(&ctx, StatusCode::NOT_FOUND, "Annotation not found."),
-        Err(err) => return refusal(&ctx, err),
+        Ok(updated) => updated,
+        Err(WriteError::Stale) => {
+            return console::precondition_page(&ctx, Section::Arrangements, "annotation", &url)
+        }
+        Err(WriteError::NotFound) => {
+            return error_page(&ctx, StatusCode::NOT_FOUND, "Annotation not found.")
+        }
+        Err(WriteError::Invalid(err)) => return refusal(&ctx, err),
     };
     audit(
         &state.db,
@@ -384,26 +437,21 @@ async fn delete_annotation(
         Ok(a) => a,
         Err(response) => return response,
     };
-    if check_if_match(form.expected_version.as_deref(), current.updated_at).is_err() {
-        return console::precondition_page(
-            &ctx,
-            Section::Arrangements,
-            "annotation",
-            &annotation_url(org_id, arr_id, id),
-        );
-    }
-    match global_annotation::delete(&state.db, id).await {
-        Ok(true) => {}
-        Ok(false) => return error_page(&ctx, StatusCode::NOT_FOUND, "Annotation not found."),
-        Err(error) => {
-            tracing::error!(%error, "failed to delete the annotation");
-            return error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not delete the annotation.",
-            );
+    let url = annotation_url(org_id, arr_id, id);
+    let Some(expected) = expected_version(&form, &current) else {
+        return console::precondition_page(&ctx, Section::Arrangements, "annotation", &url);
+    };
+    // Audit what the write removed: afterwards it is the only copy.
+    let removed = match global_annotation::delete(&state.db, id, expected).await {
+        Ok(removed) => removed,
+        Err(WriteError::Stale) => {
+            return console::precondition_page(&ctx, Section::Arrangements, "annotation", &url)
         }
-    }
+        Err(WriteError::NotFound) => {
+            return error_page(&ctx, StatusCode::NOT_FOUND, "Annotation not found.")
+        }
+        Err(WriteError::Invalid(err)) => return refusal(&ctx, err),
+    };
     audit(
         &state.db,
         &audit_ctx(&ctx, request_id),
@@ -413,9 +461,9 @@ async fn delete_annotation(
         serde_json::json!({
             "hardDelete": true,
             "arrangementId": arr_id,
-            "authorId": current.author_id,
-            "type": current.annotation_type,
-            "content": current.content,
+            "authorId": removed.author_id,
+            "type": removed.annotation_type,
+            "content": removed.content,
         }),
     )
     .await;
@@ -433,9 +481,10 @@ async fn overview_page(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    if !ctx.can_author_global_annotations() {
+    if !ctx.may_view(Section::Annotations) {
         return console::section_forbidden(&ctx);
     }
+    let can_author = ctx.can_author_global_annotations();
     let limit = i64::from(state.config.max_page_size);
     let (rows, total) = match global_annotation::list_for_org(&state.db, org_id, limit).await {
         Ok(result) => result,
@@ -459,7 +508,7 @@ async fn overview_page(
             p class="muted" { "No annotations yet." }
         } @else {
             table {
-                thead { tr { th { "Arrangement" } th { "Type" } th { "Annotation" } th { "By" } th { "Changed" } } }
+                thead { tr { th { "Arrangement" } th { "Type" } th { "Annotation" } th { "By" } th { "Changed" } @if can_author { th {} } } }
                 tbody {
                     @for row in &rows {
                         @let a = &row.annotation;
@@ -468,7 +517,10 @@ async fn overview_page(
                             td { (type_label(&a.annotation_type)) }
                             td { (a.content) }
                             td { (a.author_display_name) }
-                            td { (a.updated_at.format("%Y-%m-%d").to_string()) }
+                            td { (layout::utc_time(a.updated_at)) }
+                            @if can_author {
+                                td { a href=(annotation_url(org_id, a.arrangement_id, a.id)) { "Edit" } }
+                            }
                         }
                     }
                 }
@@ -484,6 +536,12 @@ async fn overview_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn textarea_line_endings_are_stored_as_lf() {
+        assert_eq!(normalize_newlines("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        assert_eq!(normalize_newlines("plain"), "plain");
+    }
 
     #[test]
     fn every_type_has_a_label() {

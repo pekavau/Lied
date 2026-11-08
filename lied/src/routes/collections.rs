@@ -8,9 +8,8 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
@@ -24,6 +23,7 @@ use crate::domain::membership::Role;
 use crate::domain::{collection, collection_item, coverage};
 use crate::error::AppError;
 use crate::listing::{self, SortDirection};
+use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
@@ -54,37 +54,6 @@ struct ListQuery {
     limit: Option<u32>,
     offset: Option<u32>,
     sort: Option<String>,
-}
-
-fn if_match_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-}
-
-fn etag_response<T: Serialize>(
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    etag_response_status(StatusCode::OK, body, updated_at)
-}
-
-/// Like [`etag_response`] but with an explicit status (e.g. `201` on create),
-/// so the `ETag` response header the OpenAPI spec declares is actually emitted.
-fn etag_response_status<T: Serialize>(
-    status: StatusCode,
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    let etag = listing::etag_for(updated_at);
-    let mut response = Json(body).into_response();
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        axum::http::header::ETAG,
-        axum::http::HeaderValue::from_str(&etag)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"0\"")),
-    );
-    response
 }
 
 /// Piece numbers are 1-based and bounded well below the reorder parking offset

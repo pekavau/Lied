@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            g.id, g.arrangement_id, g.author_id,\n            u.display_name as author_display_name,\n            g.type as annotation_type, g.content,\n            g.created_at as \"created_at: DateTime<Utc>\",\n            g.updated_at as \"updated_at: DateTime<Utc>\",\n            a.title as arrangement_title\n        FROM global_annotation g\n        JOIN arrangement a ON a.id = g.arrangement_id AND a.deleted_at IS NULL\n        JOIN \"user\" u ON u.id = g.author_id\n        WHERE a.organization_id = $1\n        ORDER BY g.updated_at DESC, g.id ASC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT\n            g.id, g.arrangement_id, g.author_id,\n            u.display_name as author_display_name,\n            g.type as annotation_type, g.content,\n            g.created_at as \"created_at: DateTime<Utc>\",\n            g.updated_at as \"updated_at: DateTime<Utc>\",\n            a.title as arrangement_title,\n            count(*) OVER() as \"total!\"\n        FROM global_annotation g\n        JOIN arrangement a ON a.id = g.arrangement_id AND a.deleted_at IS NULL\n        JOIN \"user\" u ON u.id = g.author_id\n        WHERE a.organization_id = $1\n        ORDER BY g.updated_at DESC, g.id ASC\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -47,6 +47,11 @@
         "ordinal": 8,
         "name": "arrangement_title",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "total!",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
@@ -64,8 +69,9 @@
       false,
       false,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "0bdc0d3e88ebee4927a607424f2748e11e0a6178f078ce09800343d6580cdf5d"
+  "hash": "2dd3f7ff1cb01e22cc715ca237e06698ebc0027ebc70d0ff49588bef25c355ce"
 }

@@ -362,11 +362,13 @@ fn form_urlencoded(key: &str, value: &str) -> String {
 }
 
 async fn audit_count(pool: &PgPool, action: &str) -> i64 {
-    sqlx::query_scalar(r#"SELECT count(*) FROM audit_log WHERE action = $1"#)
-        .bind(action)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar!(
+        r#"SELECT count(*) as "n!" FROM audit_log WHERE action = $1"#,
+        action
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// Ids of the annotations on an arrangement, oldest first.
@@ -600,13 +602,7 @@ async fn the_annotations_section_lists_the_orgs_notes_for_their_authors_only() {
         .await;
     }
     // A removed arrangement's notes drop out of the overview with it.
-    sqlx::query!(
-        "UPDATE arrangement SET deleted_at = now() WHERE id = $1",
-        egmont
-    )
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    assert!(arrangement::soft_delete(&ctx.pool, egmont).await.unwrap());
 
     let overview = format!("/admin/orgs/{}/annotations", fx.org_id);
     let (status, html) = load_page(&ctx.app, &conductor, &overview).await;
@@ -644,4 +640,140 @@ async fn the_annotations_section_lists_the_orgs_notes_for_their_authors_only() {
         let (status, _) = load_page(&ctx.app, &browser, &overview).await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{who}");
     }
+}
+
+// ── review of #36 ───────────────────────────────────────────────────────────
+
+/// Finding 5: a browser submits textarea line breaks as CRLF. Saving a note
+/// whose content was not touched must not rewrite its line endings, and
+/// saving with no change at all writes nothing.
+#[tokio::test]
+async fn saving_an_untouched_multiline_note_does_not_rewrite_it() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let conductor_id = sqlx::query_scalar!(r#"SELECT id FROM "user" WHERE username = 'cond'"#)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    // A note with LF line endings, as a /v1 client would write it.
+    let note = lied::domain::global_annotation::create(
+        &ctx.pool,
+        Uuid::now_v7(),
+        arr,
+        conductor_id,
+        "tempo",
+        "bar 12: rit.\nbar 40: a tempo",
+    )
+    .await
+    .unwrap();
+    let browser = Browser::login(&ctx.app, "cond").await;
+    let edit = format!(
+        "/admin/orgs/{}/arrangements/{arr}/annotations/{}",
+        fx.org_id, note.id
+    );
+    let (_, html) = load_page(&ctx.app, &browser, &edit).await;
+    let version = hidden_value(&html, "expected_version");
+
+    // Same type, same content (as the browser sends it): nothing is written.
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &edit,
+        &[
+            ("expected_version", &version),
+            ("type", "tempo"),
+            ("content", "bar 12: rit.\r\nbar 40: a tempo"),
+        ],
+        &form_csrf(&html),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(audit_count(&ctx.pool, "global_annotation.update").await, 0);
+
+    // Only the type changes: the content keeps its LF line endings.
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &edit,
+        &[
+            ("expected_version", &version),
+            ("type", "dynamics"),
+            ("content", "bar 12: rit.\r\nbar 40: a tempo"),
+        ],
+        &form_csrf(&html),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let stored = sqlx::query_scalar!(
+        "SELECT content FROM global_annotation WHERE id = $1",
+        note.id
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, "bar 12: rit.\nbar 40: a tempo");
+
+    // The edit page emits one newline after <textarea> for the parser to
+    // drop, so content that itself starts with a newline survives a round trip.
+    assert!(html.contains("<textarea name=\"content\" rows=\"4\" required>\nbar 12"));
+}
+
+/// Finding 6 and 15: past the page cap, the arrangement screen pages instead
+/// of leaving notes with no Edit link anywhere in the console.
+#[tokio::test]
+async fn annotations_past_the_page_cap_are_paged_not_lost() {
+    let ctx = Ctx::with_page_size(1).await;
+    let fx = seed(&ctx.state).await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let browser = Browser::login(&ctx.app, "cond").await;
+    let page = format!("/admin/orgs/{}/arrangements/{arr}", fx.org_id);
+    for content in ["first note", "second note"] {
+        let (_, html) = load_page(&ctx.app, &browser, &page).await;
+        post_form(
+            &ctx.app,
+            &browser,
+            &format!("{page}/annotations"),
+            &[("type", "general"), ("content", content)],
+            &form_csrf(&html),
+        )
+        .await;
+    }
+    let ids = annotation_ids(&ctx, arr).await;
+
+    let (_, html) = load_page(&ctx.app, &browser, &page).await;
+    assert!(html.contains("first note") && !html.contains("second note"));
+    assert!(html.contains("Annotations 1–1 of 2."), "{html}");
+    assert!(html.contains("?annotations_offset=1"), "a link to the rest");
+
+    let (_, html) = load_page(&ctx.app, &browser, &format!("{page}?annotations_offset=1")).await;
+    assert!(html.contains("second note") && !html.contains("first note"));
+    assert!(
+        html.contains(&format!("/annotations/{}\"", ids[1])),
+        "the second note has its Edit link"
+    );
+    assert!(html.contains("?annotations_offset=0"), "and a way back");
+}
+
+/// Finding 14: the server does not present a UTC instant as a bare local-
+/// looking date; it says it is UTC and carries the machine-readable instant.
+#[tokio::test]
+async fn change_times_are_marked_as_utc() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let browser = Browser::login(&ctx.app, "cond").await;
+    let page = format!("/admin/orgs/{}/arrangements/{arr}", fx.org_id);
+    let (_, html) = load_page(&ctx.app, &browser, &page).await;
+    post_form(
+        &ctx.app,
+        &browser,
+        &format!("{page}/annotations"),
+        &[("type", "general"), ("content", "x")],
+        &form_csrf(&html),
+    )
+    .await;
+    let (_, html) = load_page(&ctx.app, &browser, &page).await;
+    assert!(html.contains("<time datetime=\""), "{html}");
+    assert!(html.contains(" UTC</time>"));
 }

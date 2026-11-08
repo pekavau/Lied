@@ -3,8 +3,10 @@
 //! off: it establishes how a member enters an org's workspace, the
 //! role-aware navigation shell, the permission-matrix gating primitive
 //! ([`ConsoleCtx`] + its capability helpers), and the principal carve-out.
-//! The section routes here are gated **stubs** — later items replace their
-//! bodies with real screens.
+//! Every section is a real screen in its own module (`arrangements`,
+//! `collections`, `coverage`, `search`, `members`, `annotations`); each gates on
+//! [`ConsoleCtx::may_view`], the same predicate the nav uses, so a nav link and
+//! its route cannot disagree.
 //!
 //! **Org scoping is stateless / in the URL** (`/admin/orgs/{org}/…`), reusing
 //! the same `:org_id` path param and `require_org_role`-style authorization
@@ -179,6 +181,12 @@ impl ConsoleCtx {
     }
     pub fn can_view_coverage(&self) -> bool {
         self.access.can_view_coverage()
+    }
+    /// Whether this caller may open `section` — the same rule that decides
+    /// whether the nav shows its link, so a screen gated on this can never be
+    /// linked to someone it then refuses.
+    pub fn may_view(&self, section: Section) -> bool {
+        section.is_visible_to(&self.access)
     }
 
     fn role_label(&self) -> String {

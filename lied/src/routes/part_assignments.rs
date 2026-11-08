@@ -18,10 +18,9 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
@@ -32,6 +31,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
 use crate::domain::{collection_item, part_assignment};
 use crate::error::AppError;
+use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
@@ -47,38 +47,6 @@ pub fn router() -> OpenApiRouter<AppState> {
             update_assignment,
             delete_assignment
         ))
-}
-
-// ── shared helpers (duplicated per-module per existing convention — see
-// routes::collections for the same shapes) ─────────────────────────────────
-
-fn if_match_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-}
-
-fn etag_response<T: Serialize>(
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    etag_response_status(StatusCode::OK, body, updated_at)
-}
-
-fn etag_response_status<T: Serialize>(
-    status: StatusCode,
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    let etag = crate::listing::etag_for(updated_at);
-    let mut response = Json(body).into_response();
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        axum::http::header::ETAG,
-        axum::http::HeaderValue::from_str(&etag)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"0\"")),
-    );
-    response
 }
 
 fn part_assignment_error_to_app_error(err: part_assignment::PartAssignmentError) -> AppError {
