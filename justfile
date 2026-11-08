@@ -50,8 +50,13 @@ backup:
     docker compose exec -T postgres pg_dump --format=custom -U "${POSTGRES_USER:-lied}" "${POSTGRES_DB:-lied}" > "backup/postgres-${timestamp}.dump"
     echo "Backing up MinIO..."
     mkdir -p "backup/minio-${timestamp}"
+    # The client image has no shell, so the alias comes from MC_HOST_<alias>
+    # instead of `mc alias set`; running as the host user keeps the backup
+    # files owned by whoever ran `just backup`.
     docker run --rm --network lied_default \
+      --user "$(id -u):$(id -g)" \
+      -e "MC_HOST_src=http://${MINIO_ROOT_USER:-minioadmin}:${MINIO_ROOT_PASSWORD:-minioadmin}@minio:9000" \
       -v "$(pwd)/backup/minio-${timestamp}:/backup" \
-      minio/mc:latest \
-      sh -c "mc alias set src http://minio:9000 \"\${MINIO_ROOT_USER:-minioadmin}\" \"\${MINIO_ROOT_PASSWORD:-minioadmin}\" && mc mirror src /backup"
+      cgr.dev/chainguard/minio-client:latest \
+      --config-dir /tmp/mc mirror src /backup
     echo "Backup complete: backup/postgres-${timestamp}.dump, backup/minio-${timestamp}/"
