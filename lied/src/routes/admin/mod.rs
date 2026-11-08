@@ -11,6 +11,7 @@
 // error is built at most once per request and returned straight to axum.
 #![allow(clippy::result_large_err)]
 
+pub mod annotations;
 pub mod arrangements;
 pub mod bulk_assign;
 pub mod collections;
@@ -75,6 +76,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(coverage::router())
         // One player on one part across a collection (issue #55).
         .merge(bulk_assign::router())
+        // Global annotations: arrangement block, editor, overview (issue #36).
+        .merge(annotations::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
