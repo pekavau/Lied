@@ -238,6 +238,40 @@ pub fn check_if_match(header_value: Option<&str>, updated_at: DateTime<Utc>) -> 
     }
 }
 
+/// The raw `If-Match` header value, if present and ASCII.
+pub fn if_match_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// A JSON `200` response carrying the entity's `ETag`.
+pub fn etag_response<T: serde::Serialize>(
+    body: T,
+    updated_at: DateTime<Utc>,
+) -> axum::response::Response {
+    etag_response_status(axum::http::StatusCode::OK, body, updated_at)
+}
+
+/// A JSON response with an explicit status (e.g. `201` on create) carrying
+/// the entity's `ETag`, so the header the OpenAPI spec declares is emitted.
+/// The one copy every `/v1` module uses.
+pub fn etag_response_status<T: serde::Serialize>(
+    status: axum::http::StatusCode,
+    body: T,
+    updated_at: DateTime<Utc>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut response = axum::Json(body).into_response();
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        axum::http::header::ETAG,
+        axum::http::HeaderValue::from_str(&etag_for(updated_at))
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"0\"")),
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

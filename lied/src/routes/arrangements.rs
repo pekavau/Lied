@@ -6,7 +6,6 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
@@ -20,6 +19,7 @@ use crate::domain::membership::{self, Role};
 use crate::domain::{arrangement, tag, voice, work};
 use crate::error::AppError;
 use crate::listing::{self, SortDirection};
+use crate::listing::{etag_response, if_match_header};
 use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
@@ -62,26 +62,6 @@ struct ListQuery {
 
 fn validation_error(report: garde::Report) -> AppError {
     AppError::Validation(report)
-}
-
-fn if_match_header(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-}
-
-fn etag_response<T: Serialize>(
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    let etag = listing::etag_for(updated_at);
-    let mut response = Json(body).into_response();
-    response.headers_mut().insert(
-        axum::http::header::ETAG,
-        axum::http::HeaderValue::from_str(&etag)
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"0\"")),
-    );
-    response
 }
 
 // ---------------------------------------------------------------------------

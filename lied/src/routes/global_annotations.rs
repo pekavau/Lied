@@ -15,9 +15,8 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
@@ -25,10 +24,10 @@ use uuid::Uuid;
 use crate::auth::authz::require_org_capability_v1;
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::global_annotation::{self, GlobalAnnotation, GlobalAnnotationError};
+use crate::domain::global_annotation::{self, GlobalAnnotation, GlobalAnnotationError, WriteError};
 use crate::domain::membership::Role;
 use crate::error::AppError;
-use crate::listing::{self, SortDirection};
+use crate::listing::{self, etag_response, etag_response_status, if_match_header, SortDirection};
 use crate::pagination::Page;
 use crate::routes::arrangements::find_arrangement_scoped;
 use crate::routes::openapi::{
@@ -47,38 +46,35 @@ pub fn router() -> OpenApiRouter<AppState> {
         ))
 }
 
-fn etag_response<T: Serialize>(
-    status: StatusCode,
-    body: T,
-    updated_at: chrono::DateTime<chrono::Utc>,
-) -> axum::response::Response {
-    let mut response = Json(body).into_response();
-    *response.status_mut() = status;
-    if let Ok(value) = axum::http::HeaderValue::from_str(&listing::etag_for(updated_at)) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::ETAG, value);
-    }
-    response
-}
-
-fn if_match(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-}
-
 fn domain_error(err: GlobalAnnotationError) -> AppError {
     match err {
-        GlobalAnnotationError::InvalidType => AppError::field(
-            "type",
-            "type must be one of tempo, dynamics, articulation, structure, general",
-        ),
+        GlobalAnnotationError::InvalidType => {
+            AppError::field("type", &global_annotation::invalid_type_message())
+        }
         GlobalAnnotationError::EmptyContent => {
             AppError::field("content", "content must not be empty")
         }
         GlobalAnnotationError::ArrangementGone => AppError::NotFound,
         GlobalAnnotationError::Database(e) => AppError::Database(e),
+    }
+}
+
+fn write_error(err: WriteError) -> AppError {
+    match err {
+        WriteError::Invalid(e) => domain_error(e),
+        WriteError::Stale => AppError::PreconditionFailed,
+        WriteError::NotFound => AppError::NotFound,
+    }
+}
+
+/// The version `If-Match` names, if it names the current one. A missing,
+/// unparseable or stale header is a 412 (CLAUDE.md: PATCH/DELETE MUST send
+/// `If-Match`). The write re-checks the same version atomically, so this early
+/// answer is a courtesy, not the guarantee.
+fn expected_version(headers: &HeaderMap, current: &GlobalAnnotation) -> Result<i64, AppError> {
+    match listing::parse_if_match(if_match_header(headers)) {
+        Some(version) if version == current.updated_at.timestamp_millis() => Ok(version),
+        _ => Err(AppError::PreconditionFailed),
     }
 }
 
@@ -152,9 +148,11 @@ async fn list_annotations(
     let (sort_column, sort_direction) = listing::resolve_sort(
         q.sort.as_deref(),
         global_annotation::SORT_ALLOWLIST,
-        ("g.created_at", SortDirection::Asc),
+        ("createdAt", SortDirection::Asc),
     )
     .map_err(AppError::Validation)?;
+    let sort = global_annotation::SortField::from_key(sort_column)
+        .unwrap_or(global_annotation::SortField::CreatedAt);
     let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, global_annotation::FILTER_ALLOWLIST)
         .map_err(AppError::Validation)?;
@@ -165,7 +163,7 @@ async fn list_annotations(
     if type_filter.is_some_and(|t| !global_annotation::is_valid_type(t)) {
         return Err(AppError::field(
             "filter[type]",
-            "type must be one of tempo, dynamics, articulation, structure, general",
+            &global_annotation::invalid_type_message(),
         ));
     }
 
@@ -174,7 +172,7 @@ async fn list_annotations(
         arrangement_id,
         i64::from(limit),
         i64::from(offset),
-        sort_column,
+        sort,
         sort_direction,
         type_filter,
     )
@@ -256,7 +254,11 @@ async fn create_annotation(
     .await;
 
     let updated_at = created.updated_at;
-    Ok(etag_response(StatusCode::CREATED, created, updated_at))
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 /// Fetch one global annotation (owner/archivist/conductor).
@@ -287,13 +289,14 @@ async fn get_annotation(
     require_org_capability_v1(&state, &auth, org_id, Role::is_staff).await?;
     let found = find_scoped(&state, org_id, arrangement_id, id).await?;
     let updated_at = found.updated_at;
-    Ok(etag_response(StatusCode::OK, found, updated_at))
+    Ok(etag_response(found, updated_at))
 }
 
 /// Request body for `PATCH …/annotations/{id}`: every field optional, and an
-/// omitted one is left unchanged.
+/// omitted one is left unchanged. Unknown fields are refused, so a misspelled
+/// key is a 400 rather than a silent no-op.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateRequest {
     #[serde(rename = "type")]
     annotation_type: Option<String>,
@@ -335,18 +338,42 @@ async fn update_annotation(
 ) -> Result<axum::response::Response, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     let current = find_scoped(&state, org_id, arrangement_id, id).await?;
-    listing::check_if_match(if_match(&headers), current.updated_at)
-        .map_err(|_| AppError::PreconditionFailed)?;
+    let expected = expected_version(&headers, &current)?;
+
+    // Nothing to change (no fields, or the same values): answer with the
+    // current row and write nothing — no new version, no audit row, no 412 for
+    // everyone else holding the current ETag.
+    let changes_type = body
+        .annotation_type
+        .as_deref()
+        .is_some_and(|t| t != current.annotation_type);
+    let changes_content = body
+        .content
+        .as_deref()
+        .is_some_and(|c| c != current.content);
+    if !changes_type && !changes_content {
+        // Still validate what was sent: an invalid value is an error even if
+        // it would not change anything.
+        if body
+            .annotation_type
+            .as_deref()
+            .is_some_and(|t| !global_annotation::is_valid_type(t))
+        {
+            return Err(domain_error(GlobalAnnotationError::InvalidType));
+        }
+        let updated_at = current.updated_at;
+        return Ok(etag_response(current, updated_at));
+    }
 
     let updated = global_annotation::update(
         &state.db,
         id,
+        expected,
         body.annotation_type.as_deref(),
         body.content.as_deref(),
     )
     .await
-    .map_err(domain_error)?
-    .ok_or(AppError::NotFound)?;
+    .map_err(write_error)?;
 
     audit(
         &state.db,
@@ -363,7 +390,7 @@ async fn update_annotation(
     .await;
 
     let updated_at = updated.updated_at;
-    Ok(etag_response(StatusCode::OK, updated, updated_at))
+    Ok(etag_response(updated, updated_at))
 }
 
 /// Delete a global annotation for good (owner/conductor; requires `If-Match`).
@@ -397,12 +424,12 @@ async fn delete_annotation(
 ) -> Result<StatusCode, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     let current = find_scoped(&state, org_id, arrangement_id, id).await?;
-    listing::check_if_match(if_match(&headers), current.updated_at)
-        .map_err(|_| AppError::PreconditionFailed)?;
-
-    if !global_annotation::delete(&state.db, id).await? {
-        return Err(AppError::NotFound);
-    }
+    let expected = expected_version(&headers, &current)?;
+    // What the write removed, not what was read before it: the audit row is
+    // the only copy left.
+    let removed = global_annotation::delete(&state.db, id, expected)
+        .await
+        .map_err(write_error)?;
 
     audit(
         &state.db,
@@ -413,9 +440,9 @@ async fn delete_annotation(
         serde_json::json!({
             "hardDelete": true,
             "arrangementId": arrangement_id,
-            "authorId": current.author_id,
-            "type": current.annotation_type,
-            "content": current.content,
+            "authorId": removed.author_id,
+            "type": removed.annotation_type,
+            "content": removed.content,
         }),
     )
     .await;

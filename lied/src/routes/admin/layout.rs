@@ -17,6 +17,17 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 /// is the session's CSRF token (see [`crate::auth::csrf::ensure_token`]); the
 /// CSRF middleware compares this field against the session value on every
 /// state-changing submit. maud auto-escapes the value.
+/// An instant as a machine-readable `<time>` whose text is explicitly UTC.
+/// CLAUDE.md: the server never guesses a display time zone, so it says which
+/// one it used rather than printing a bare date that reads as local.
+pub fn utc_time(at: chrono::DateTime<chrono::Utc>) -> Markup {
+    maud::html! {
+        time datetime=(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)) {
+            (at.format("%Y-%m-%d %H:%M UTC").to_string())
+        }
+    }
+}
+
 pub fn csrf_field(token: &str) -> Markup {
     html! { input type="hidden" name="csrf_token" value=(token); }
 }
