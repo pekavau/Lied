@@ -4,6 +4,13 @@
 //! first real screens (`orgs` submodule: org/user/membership management),
 //! sharing the `layout` submodule's maud page shell.
 
+// Console handlers early-return a ready-made error page as `Err(Response)`
+// (`console::enter`, `require_found`, `csrf_token`, …). clippy 1.99 flags that
+// as a large `Err` variant (an axum `Response` is ~128 bytes). Boxing it would
+// add an allocation and a deref at every `return response` for no gain: the
+// error is built at most once per request and returned straight to axum.
+#![allow(clippy::result_large_err)]
+
 pub mod arrangements;
 pub mod collections;
 pub mod console;

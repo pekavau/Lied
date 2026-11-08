@@ -35,11 +35,20 @@ sqlx = { version = "0.8", features = [
 ] }
 
 # Object storage (MinIO via S3 API)
-aws-sdk-s3 = "1"
+# Default features minus `rustls` and `sigv4a`. `rustls` selects the SDK's
+# legacy hyper-0.14 / rustls-0.21 / h2-0.3 client, which carries unpatched
+# advisories (RUSTSEC-2026-0258/0346/0349/0382) and is redundant: the modern
+# hyper-1 / rustls-0.23 client comes from `default-https-client`. `sigv4a` is
+# multi-region access-point signing, which MinIO and single-region S3 never use.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+  "default-https-client",
+  "http-1x",
+  "rt-tokio",
+] }
 aws-config = "1"
 
 # WebDAV
-dav-server = "0.7"
+dav-server = "0.11"
 futures-util = "0.3"
 
 # Auth
