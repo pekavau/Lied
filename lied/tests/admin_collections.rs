@@ -1042,6 +1042,7 @@ async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
         &lied::domain::voice::slugify(name),
         instrument_id,
         None,
+        None,
     )
     .await
     .expect("voice");
@@ -2061,4 +2062,352 @@ async fn the_removed_list_shows_one_restorable_entry_per_piece() {
     .await;
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
     assert_eq!(items(&ctx, coll).await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Bulk assignment: one player on one part across the collection (issue #55)
+// ---------------------------------------------------------------------------
+
+async fn seed_part(
+    state: &AppState,
+    arr_id: Uuid,
+    name: &str,
+    instrument_key: &str,
+    part_number: Option<i16>,
+) -> Uuid {
+    let instrument_id = sqlx::query_scalar!(
+        r#"SELECT id FROM instrument WHERE key = $1"#,
+        instrument_key
+    )
+    .fetch_one(&state.db)
+    .await
+    .expect("instrument");
+    let id = Uuid::now_v7();
+    lied::domain::voice::create(
+        &state.db,
+        id,
+        arr_id,
+        name,
+        &lied::domain::voice::slugify(name),
+        instrument_id,
+        part_number,
+        None,
+    )
+    .await
+    .expect("voice");
+    id
+}
+
+/// The `pair` values a bulk-assign confirm form carries.
+fn confirm_pairs(html: &str) -> Vec<String> {
+    let marker = "name=\"pair\" value=\"";
+    html.match_indices(marker)
+        .map(|(at, _)| {
+            html[at + marker.len()..]
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Three-piece march book: Trumpet 1 in pieces 1 and 3, piece 2 has only a
+/// Trumpet 2. Returns (collection, item ids, piece-1 and piece-3 Trumpet 1).
+async fn seed_march_book(
+    ctx: &Ctx,
+    browser: &Browser,
+    org_id: Uuid,
+) -> (Uuid, Vec<Uuid>, Uuid, Uuid) {
+    let coll = create_collection(ctx, browser, org_id, "March Book", "standing").await;
+    let a = seed_arrangement(&ctx.state, org_id, "Radetzky").await;
+    let b = seed_arrangement(&ctx.state, org_id, "Florentiner").await;
+    let c = seed_arrangement(&ctx.state, org_id, "Alte Kameraden").await;
+    let a1 = seed_part(&ctx.state, a, "Trumpet in Bb 1", "trumpet_bb", Some(1)).await;
+    seed_part(&ctx.state, b, "Trumpet in Bb 2", "trumpet_bb", Some(2)).await;
+    let c1 = seed_part(&ctx.state, c, "Trompete 1", "trumpet_bb", Some(1)).await;
+    for arr in [a, b, c] {
+        add_piece(ctx, browser, org_id, coll, arr).await;
+    }
+    let item_ids = items(ctx, coll).await.iter().map(|i| i.item.id).collect();
+    (coll, item_ids, a1, c1)
+}
+
+#[tokio::test]
+async fn a_player_is_put_on_one_part_across_the_collection_after_a_preview() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
+    // Spaces and an umlaut: the redirect back must encode the username.
+    seed_user(&ctx.state, "jörg first").await;
+    let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
+
+    // The collection's screens link here.
+    let (_, detail) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{coll}", fx.org_id),
+    )
+    .await;
+    assert!(
+        detail.contains("/bulk-assign"),
+        "linked from the collection"
+    );
+
+    // The picker offers the parts that exist, with how widely.
+    let (status, html) = load_page(&ctx.app, &browser, &page).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(
+        html.contains("Trumpet in B♭ — part 1 (in 2 pieces)"),
+        "{html}"
+    );
+    assert!(html.contains("Trumpet in B♭ — part 2 (in 1 piece)"));
+    assert!(
+        confirm_pairs(&html).is_empty(),
+        "no confirm before a preview"
+    );
+
+    // Preview: two pieces to assign, one without the part. Nothing written.
+    let trumpet: Uuid = sqlx::query_scalar!("SELECT id FROM instrument WHERE key = 'trumpet_bb'")
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    let preview = format!(
+        "{page}?part={trumpet}%3A1&username={}",
+        form_urlencoded("", "jörg first").trim_start_matches('=')
+    );
+    let (status, html) = load_page(&ctx.app, &browser, &preview).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{html}");
+    assert_eq!(html.matches("will assign").count(), 2);
+    assert!(html.contains("no such part in this piece"));
+    assert!(html.contains("Trumpet in Bb 2"), "the near miss is shown");
+    let pairs = confirm_pairs(&html);
+    assert_eq!(
+        pairs,
+        vec![
+            format!("{}:{a1}", item_ids[0]),
+            format!("{}:{c1}", item_ids[2])
+        ]
+    );
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_none());
+
+    // Confirm.
+    let token = form_csrf(&html);
+    let part_value = format!("{trumpet}:1");
+    let mut fields: Vec<(&str, &str)> = vec![("username", "jörg first"), ("part", &part_value)];
+    for pair in &pairs {
+        fields.push(("pair", pair));
+    }
+    let response = post_form(&ctx.app, &browser, &page, &fields, &token).await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let location = response
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.contains("username=j%C3%B6rg%20first"),
+        "{location}"
+    );
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_some());
+    assert!(assignment_for(&ctx, item_ids[2], c1).await.is_some());
+    assert_eq!(audit_count(&ctx.pool, "part_assignment.create").await, 2);
+
+    // Back on the preview, the work reads as done.
+    let (status, html) = load_page(&ctx.app, &browser, &location).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(html.matches("already plays").count(), 2);
+    assert!(html.contains("Nothing to assign."));
+}
+
+#[tokio::test]
+async fn a_stale_bulk_confirm_is_refused_and_nothing_is_assigned() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let (coll, item_ids, a1, c1) = seed_march_book(&ctx, &browser, fx.org_id).await;
+    seed_user(&ctx.state, "player").await;
+    let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
+    let token = session_csrf(&ctx.app, &browser, &page).await;
+
+    // Piece 3's part is deleted after the preview was rendered.
+    sqlx::query!("UPDATE voice SET deleted_at = now() WHERE id = $1", c1)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let first = format!("{}:{a1}", item_ids[0]);
+    let third = format!("{}:{c1}", item_ids[2]);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &page,
+        &[("username", "player"), ("pair", &first), ("pair", &third)],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert!(body_text(response).await.contains("preview again"));
+    assert!(
+        assignment_for(&ctx, item_ids[0], a1).await.is_none(),
+        "all or nothing"
+    );
+}
+
+#[tokio::test]
+async fn bulk_assignment_is_for_part_assigners_only() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let archivist = Browser::login(&ctx.app, "arch").await;
+    let (coll, item_ids, a1, _) = seed_march_book(&ctx, &archivist, fx.org_id).await;
+    seed_user(&ctx.state, "player").await;
+    let page = format!("/admin/orgs/{}/collections/{coll}/bulk-assign", fx.org_id);
+    let pair = format!("{}:{a1}", item_ids[0]);
+
+    let musician = Browser::login(&ctx.app, "mus").await;
+    let (status, _) = load_page(&ctx.app, &musician, &page).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    let token = session_csrf(&ctx.app, &musician, "/admin").await;
+    let response = post_form(
+        &ctx.app,
+        &musician,
+        &page,
+        &[("username", "player"), ("pair", &pair)],
+        &token,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::FORBIDDEN,
+        "refused with the musician's own valid CSRF token"
+    );
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_none());
+
+    // A plain musician is already stopped at the console door, so the check
+    // above would pass even if this screen forgot its own gate. A principal
+    // gets INTO the console (for coverage) and is the case that pins it.
+    let trumpet: Uuid = sqlx::query_scalar!("SELECT id FROM instrument WHERE key = 'trumpet_bb'")
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    let principal = seed_user(&ctx.state, "principal").await;
+    membership::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        principal,
+        fx.org_id,
+        membership::MembershipFields {
+            role: membership::Role::Musician,
+            instrument_ids: &[trumpet],
+            is_principal: true,
+            principal_instrument_ids: &[trumpet],
+        },
+        None,
+    )
+    .await
+    .expect("principal membership");
+    let principal = Browser::login(&ctx.app, "principal").await;
+    let (status, _) = load_page(&ctx.app, &principal, &page).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    let token = session_csrf(&ctx.app, &principal, &page).await;
+    let response = post_form(
+        &ctx.app,
+        &principal,
+        &page,
+        &[("username", "player"), ("pair", &pair)],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_none());
+
+    let conductor = Browser::login(&ctx.app, "cond").await;
+    let token = session_csrf(&ctx.app, &conductor, &page).await;
+    let response = post_form(
+        &ctx.app,
+        &conductor,
+        &page,
+        &[("username", "player"), ("pair", &pair)],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert!(assignment_for(&ctx, item_ids[0], a1).await.is_some());
+}
+
+#[tokio::test]
+async fn a_voice_part_number_is_set_from_the_catalog_screens() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let voices_url = format!("/admin/orgs/{}/arrangements/{arr}/voices", fx.org_id);
+    let trumpet: Uuid = sqlx::query_scalar!("SELECT id FROM instrument WHERE key = 'trumpet_bb'")
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    let (_, html) = load_page(&ctx.app, &browser, &voices_url).await;
+    assert!(html.contains("name=\"part_number\""));
+    let token = form_csrf(&html);
+    let trumpet_str = trumpet.to_string();
+
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &voices_url,
+        &[
+            ("name", "Trumpet in Bb 2"),
+            ("instrument_id", &trumpet_str),
+            ("part_number", "2"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let stored: Option<i16> = sqlx::query_scalar!(
+        "SELECT part_number FROM voice WHERE arrangement_id = $1",
+        arr
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, Some(2));
+
+    // Zero is refused; blank means "no number".
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &voices_url,
+        &[
+            ("name", "Trumpet 0"),
+            ("instrument_id", &trumpet_str),
+            ("part_number", "0"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &voices_url,
+        &[
+            ("name", "Trumpet"),
+            ("instrument_id", &trumpet_str),
+            ("part_number", ""),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let unnumbered: Option<i16> = sqlx::query_scalar!(
+        "SELECT part_number FROM voice WHERE arrangement_id = $1 AND name = 'Trumpet'",
+        arr
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(unnumbered, None);
 }

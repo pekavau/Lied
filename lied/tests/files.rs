@@ -236,6 +236,7 @@ async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
         &voice::slugify(name),
         instrument_id,
         None,
+        None,
     )
     .await
     .expect("voice");

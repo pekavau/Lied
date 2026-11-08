@@ -428,6 +428,13 @@ async fn collection_detail_page(
             }
         }
         @if items.is_empty() { p class="muted" { "No pieces yet." } }
+        @if !items.is_empty() {
+            p {
+                a href=(format!("{}/bulk-assign", detail_url(org_id, collection_id))) {
+                    "Assign a player to one part across the whole collection →"
+                }
+            }
+        }
 
         // Removing a piece is its own form: it must not ride the reorder form's
         // submit, and a urlencoded POST carries its CSRF token in the body.
@@ -807,7 +814,7 @@ async fn scoped_item_including_deleted(
 
 /// Enter, gate, and resolve the collection — the preamble every item write
 /// shares.
-async fn enter_collection(
+pub(crate) async fn enter_collection(
     state: &AppState,
     auth: Option<AuthSession>,
     org_id: Uuid,
@@ -1235,10 +1242,20 @@ async fn assignments_page(
     // hidden through it, so an assignment would grant access to nothing.
     // Existing assignments stay visible and removable so the archivist can
     // clean up.
-    let live_arrangement = arrangement::find_by_id(&state.db, item.arrangement_id)
-        .await
-        .ok()
-        .flatten();
+    // A failed lookup must not read as "removed": that would hide the add
+    // controls and tell the archivist the piece is gone when the database
+    // merely hiccuped.
+    let live_arrangement = match arrangement::find_by_id(&state.db, item.arrangement_id).await {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::error!(%error, "failed to load the piece's arrangement");
+            return error_page(
+                &ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load this piece's arrangement.",
+            );
+        }
+    };
     let arrangement_removed = live_arrangement.is_none();
     let arrangement_title = live_arrangement
         .map(|a| a.title)

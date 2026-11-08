@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.id as item_id,\n            ci.index as item_index,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\",\n            v.id as \"voice_id?\",\n            v.name as \"voice_name?\",\n            v.part_number as \"part_number?\",\n            EXISTS (\n                SELECT 1 FROM part_assignment pa\n                WHERE pa.collection_item_id = ci.id\n                  AND pa.voice_id = v.id\n                  AND pa.user_id = $3\n            ) as \"held!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        -- LEFT JOIN: a piece without this instrument must still appear, as a\n        -- reported skip, not vanish from the plan.\n        LEFT JOIN voice v\n          ON v.arrangement_id = a.id\n         AND v.deleted_at IS NULL\n         AND v.instrument_id = $2\n        WHERE ci.collection_id = $1\n          AND ci.deleted_at IS NULL\n          AND c.deleted_at IS NULL\n        ORDER BY ci.index ASC, ci.id ASC, v.part_number ASC NULLS LAST, v.name ASC, v.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_index",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "arrangement_removed!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "voice_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "voice_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "part_number?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "held!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "11815215b3c4c1627d0dc01491be7055e0558b3acf870a380237f07664bd940f"
+}

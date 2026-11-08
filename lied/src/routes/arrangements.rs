@@ -1023,6 +1023,10 @@ pub(crate) struct VoiceResponse {
     pub name: String,
     pub slug: String,
     pub instrument_id: Uuid,
+    /// Which part of its instrument this is (the `1` of "Trumpet in Bb 1");
+    /// `null` for parts that carry no number. Bulk assignment across a
+    /// collection matches on `(instrumentId, partNumber)`.
+    pub part_number: Option<i16>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1036,6 +1040,7 @@ impl From<voice::Voice> for VoiceResponse {
             name: v.name,
             slug: v.slug,
             instrument_id: v.instrument_id,
+            part_number: v.part_number,
             created_at: v.created_at,
             updated_at: v.updated_at,
             deleted_at: v.deleted_at,
@@ -1049,6 +1054,11 @@ impl From<voice::Voice> for VoiceResponse {
 struct VoiceRequest {
     name: String,
     instrument_id: Uuid,
+    /// At least 1, or omitted/`null` for a part with no number. Like the rest
+    /// of this body it is replaced wholesale on update (issue #23), so an
+    /// update that omits it clears it.
+    #[serde(default)]
+    part_number: Option<i16>,
 }
 
 fn voice_error_to_app_error(err: voice::VoiceError) -> AppError {
@@ -1063,6 +1073,14 @@ fn voice_error_to_app_error(err: voice::VoiceError) -> AppError {
             report.append(
                 garde::Path::new("instrumentId"),
                 garde::Error::new("instrumentId does not reference a live instrument"),
+            );
+            AppError::Validation(report)
+        }
+        voice::VoiceError::InvalidPartNumber => {
+            let mut report = garde::Report::new();
+            report.append(
+                garde::Path::new("partNumber"),
+                garde::Error::new("partNumber must be at least 1"),
             );
             AppError::Validation(report)
         }
@@ -1212,6 +1230,7 @@ async fn create_voice(
         &body.name,
         &slug,
         body.instrument_id,
+        body.part_number,
         Some(auth.user.id),
     )
     .await
@@ -1227,7 +1246,13 @@ async fn create_voice(
         "voice.create",
         "voice",
         Some(created.id),
-        serde_json::json!({ "name": created.name, "slug": created.slug, "arrangementId": arrangement_id }),
+        serde_json::json!({
+            "name": created.name,
+            "slug": created.slug,
+            "arrangementId": arrangement_id,
+            "instrumentId": created.instrument_id,
+            "partNumber": created.part_number,
+        }),
     )
     .await;
 
@@ -1346,10 +1371,16 @@ async fn update_voice(
         return Err(AppError::Validation(report));
     }
 
-    let updated = voice::update(&state.db, id, &body.name, body.instrument_id)
-        .await
-        .map_err(voice_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let updated = voice::update(
+        &state.db,
+        id,
+        &body.name,
+        body.instrument_id,
+        body.part_number,
+    )
+    .await
+    .map_err(voice_error_to_app_error)?
+    .ok_or(AppError::NotFound)?;
 
     audit(
         &state.db,
@@ -1362,8 +1393,16 @@ async fn update_voice(
         "voice",
         Some(id),
         serde_json::json!({
-            "before": { "name": current.name, "instrumentId": current.instrument_id },
-            "after": { "name": updated.name, "instrumentId": updated.instrument_id },
+            "before": {
+                "name": current.name,
+                "instrumentId": current.instrument_id,
+                "partNumber": current.part_number,
+            },
+            "after": {
+                "name": updated.name,
+                "instrumentId": updated.instrument_id,
+                "partNumber": updated.part_number,
+            },
         }),
     )
     .await;
