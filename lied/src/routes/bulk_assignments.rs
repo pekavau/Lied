@@ -10,7 +10,8 @@
 //! Both require `owner`/`archivist`/`conductor` (CLAUDE.md Permission matrix:
 //! "Part assignments") — the preview included, since it reveals which parts a
 //! named user holds across the collection. Neither is paginated: both are
-//! bounded by the collection's size, like the coverage report.
+//! bounded by the collection's size, like the coverage report — an exception to
+//! the list-endpoint envelope recorded in CLAUDE.md.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -21,10 +22,11 @@ use uuid::Uuid;
 
 use crate::auth::authz::require_collection_editor_v1;
 use crate::auth::extractors::BearerOrSession;
-use crate::domain::audit_log::{audit, AuditContext};
+use crate::domain::audit_log::AuditContext;
 use crate::domain::bulk_assign::{self, PartKey, PlanItem};
-use crate::domain::{collection, instrument, part_assignment, user};
+use crate::domain::{instrument, part_assignment, user};
 use crate::error::AppError;
+use crate::routes::collections::find_collection_scoped;
 use crate::routes::openapi::{CommonErrors, Conflict409, Forbidden403, NotFound404, Validation400};
 use crate::routes::RequestId;
 use crate::state::AppState;
@@ -33,24 +35,6 @@ pub fn router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(preview_bulk_assignment))
         .routes(routes!(apply_bulk_assignment))
-}
-
-fn field_error(field: &str, msg: &str) -> AppError {
-    let mut report = garde::Report::new();
-    report.append(garde::Path::new(field), garde::Error::new(msg.to_string()));
-    AppError::Validation(report)
-}
-
-/// Resolve a live collection, verifying it belongs to `org_id`.
-async fn find_collection_scoped(
-    state: &AppState,
-    org_id: Uuid,
-    id: Uuid,
-) -> Result<collection::Collection, AppError> {
-    collection::find_by_id(&state.db, id)
-        .await?
-        .filter(|c| c.organization_id == org_id)
-        .ok_or(AppError::NotFound)
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -112,15 +96,18 @@ async fn preview_bulk_assignment(
     find_collection_scoped(&state, org_id, collection_id).await?;
 
     if q.part_number.is_some_and(|n| n < 1) {
-        return Err(field_error("partNumber", "partNumber must be at least 1"));
+        return Err(AppError::field(
+            "partNumber",
+            "partNumber must be at least 1",
+        ));
     }
     // Unknown ids would otherwise yield a plausible plan ("no piece has this
     // part", "holds nothing") for a request that names nothing real.
     if !instrument::exists(&state.db, q.instrument_id).await? {
-        return Err(field_error("instrumentId", "instrument does not exist"));
+        return Err(AppError::field("instrumentId", "instrument does not exist"));
     }
     if user::find_by_id(&state.db, q.user_id).await?.is_none() {
-        return Err(field_error("userId", "user does not exist"));
+        return Err(AppError::field("userId", "user does not exist"));
     }
 
     let items = bulk_assign::plan(
@@ -148,6 +135,14 @@ struct PairRequest {
 #[serde(rename_all = "camelCase")]
 struct ApplyRequest {
     user_id: Uuid,
+    /// The part being assigned — the same `instrumentId` / `partNumber` the
+    /// preview was asked for. Every pair must still be that part, or the
+    /// request is refused with `409`: a voice renumbered or re-instrumented
+    /// since the preview is no longer the part the client was shown.
+    instrument_id: Uuid,
+    /// Omitted or `null` for a part without a number.
+    #[serde(default)]
+    part_number: Option<i16>,
     /// The `(collectionItemId, voiceId)` pairs to assign — normally the
     /// `assign` entries of a preview. At least one.
     assignments: Vec<PairRequest>,
@@ -175,8 +170,10 @@ struct ApplyResponse {
 /// Each created row is an ordinary part assignment. Pairs the player already
 /// holds are reported in `alreadyHeld`, not duplicated, so the same request can
 /// be re-sent after pieces are added. If any pair no longer names a live piece
-/// of this collection and a live voice of its arrangement, nothing is written
-/// and the response is `409` — preview again.
+/// of this collection and a live voice of its arrangement that is still the
+/// requested part (`instrumentId` + `partNumber`), nothing is written and the
+/// response is `409` — preview again. Audit rows are written in the same
+/// transaction as the assignments.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/collections/{collectionId}/bulk-assignments",
@@ -212,50 +209,43 @@ async fn apply_bulk_assignment(
         .iter()
         .map(|p| (p.collection_item_id, p.voice_id))
         .collect();
-    let applied = bulk_assign::apply(
-        &state.db,
-        collection_id,
-        body.user_id,
-        &pairs,
-        Some(auth.user.id),
-    )
-    .await
-    .map_err(|err| match err {
-        bulk_assign::BulkAssignError::Empty => {
-            field_error("assignments", "at least one assignment is required")
-        }
-        bulk_assign::BulkAssignError::UnknownUser => field_error("userId", "user does not exist"),
-        bulk_assign::BulkAssignError::Stale => AppError::Conflict(
-            "the collection changed since the preview: a piece or voice is no longer \
-             live here — preview again"
-                .to_string(),
-        ),
-        bulk_assign::BulkAssignError::Database(e) => AppError::Database(e),
-    })?;
-
-    let ctx = AuditContext {
+    if body.part_number.is_some_and(|n| n < 1) {
+        return Err(AppError::field(
+            "partNumber",
+            "partNumber must be at least 1",
+        ));
+    }
+    let audit_ctx = AuditContext {
         actor_user_id: Some(auth.user.id),
         org_id: Some(org_id),
         request_id: Some(request_id),
     };
-    // One audit row per assignment, the same action the single-assign route
-    // writes, so an assignment's history reads the same however it was made.
-    for created in &applied.created {
-        audit(
-            &state.db,
-            &ctx,
-            "part_assignment.create",
-            "part_assignment",
-            Some(created.id),
-            serde_json::json!({
-                "collectionItemId": created.collection_item_id,
-                "voiceId": created.voice_id,
-                "userId": created.user_id,
-                "via": "bulk",
-            }),
-        )
-        .await;
-    }
+    let applied = bulk_assign::apply(
+        &state.db,
+        collection_id,
+        PartKey {
+            instrument_id: body.instrument_id,
+            part_number: body.part_number,
+        },
+        body.user_id,
+        &pairs,
+        &audit_ctx,
+    )
+    .await
+    .map_err(|err| match err {
+        bulk_assign::BulkAssignError::Empty => {
+            AppError::field("assignments", "at least one assignment is required")
+        }
+        bulk_assign::BulkAssignError::UnknownUser => {
+            AppError::field("userId", "user does not exist")
+        }
+        bulk_assign::BulkAssignError::Stale => AppError::Conflict(
+            "the collection changed since the preview: a piece or voice is gone, or is \
+             no longer this part — preview again"
+                .to_string(),
+        ),
+        bulk_assign::BulkAssignError::Database(e) => AppError::Database(e),
+    })?;
 
     Ok(Json(ApplyResponse {
         created: applied.created,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)\n        VALUES ($1, $2, $3, $4, $5, $6, $7)\n        RETURNING\n            id, arrangement_id, name, slug, instrument_id, part_number,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "query": "\n        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)\n        VALUES (\n            $1, $2, $3, $4, $5,\n            CASE WHEN $8 THEN lied_guess_part_number($3) ELSE $6 END,\n            $7\n        )\n        RETURNING\n            id, arrangement_id, name, slug, instrument_id, part_number,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
   "describe": {
     "columns": [
       {
@@ -62,7 +62,8 @@
         "Text",
         "Uuid",
         "Int2",
-        "Uuid"
+        "Uuid",
+        "Bool"
       ]
     },
     "nullable": [
@@ -78,5 +79,5 @@
       true
     ]
   },
-  "hash": "a00e479da5dd7792a4e44421286af6ca4db5a5c78693b130ed65c19963d89596"
+  "hash": "dc378c4e2568b8f0b6eede45f1de3ba558e8eabd5c49ba7b839761e471f36e2c"
 }

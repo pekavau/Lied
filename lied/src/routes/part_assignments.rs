@@ -30,7 +30,7 @@ use crate::auth::authz::{require_collection_editor_v1, require_org_role_v1};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
-use crate::domain::{collection, collection_item, part_assignment};
+use crate::domain::{collection_item, part_assignment};
 use crate::error::AppError;
 use crate::pagination::Page;
 use crate::routes::openapi::{
@@ -81,41 +81,20 @@ fn etag_response_status<T: Serialize>(
     response
 }
 
-fn empty_field(field: &str, msg: &str) -> AppError {
-    let mut report = garde::Report::new();
-    report.append(garde::Path::new(field), garde::Error::new(msg.to_string()));
-    AppError::Validation(report)
-}
-
 fn part_assignment_error_to_app_error(err: part_assignment::PartAssignmentError) -> AppError {
     match err {
         part_assignment::PartAssignmentError::Duplicate => {
             AppError::Conflict("this musician already plays this voice on this piece".to_string())
         }
-        part_assignment::PartAssignmentError::VoiceNotInArrangement => empty_field(
+        part_assignment::PartAssignmentError::VoiceNotInArrangement => AppError::field(
             "voiceId",
             "voice does not exist or does not belong to this item's arrangement",
         ),
         part_assignment::PartAssignmentError::UnknownReference => {
-            empty_field("userId", "user does not exist")
+            AppError::field("userId", "user does not exist")
         }
         part_assignment::PartAssignmentError::Database(e) => AppError::Database(e),
     }
-}
-
-/// Resolve a collection, verifying it belongs to `org_id`.
-async fn find_collection_scoped(
-    state: &AppState,
-    org_id: Uuid,
-    id: Uuid,
-) -> Result<collection::Collection, AppError> {
-    let found = collection::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if found.organization_id != org_id {
-        return Err(AppError::NotFound);
-    }
-    Ok(found)
 }
 
 /// Resolve an item, verifying the collection belongs to the org and the item
@@ -126,7 +105,7 @@ async fn find_item_scoped(
     collection_id: Uuid,
     item_id: Uuid,
 ) -> Result<collection_item::CollectionItem, AppError> {
-    find_collection_scoped(state, org_id, collection_id).await?;
+    crate::routes::collections::find_collection_scoped(state, org_id, collection_id).await?;
     let found = collection_item::find_by_id(&state.db, item_id)
         .await?
         .ok_or(AppError::NotFound)?;

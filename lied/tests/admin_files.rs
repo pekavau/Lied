@@ -250,7 +250,7 @@ async fn seed(state: &AppState) -> Fixture {
         "Flute 1",
         &voice_slug,
         instrument_id,
-        None,
+        lied::domain::voice::NewPartNumber::Set(None),
         None,
     )
     .await

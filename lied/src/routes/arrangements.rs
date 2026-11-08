@@ -1054,11 +1054,27 @@ impl From<voice::Voice> for VoiceResponse {
 struct VoiceRequest {
     name: String,
     instrument_id: Uuid,
-    /// At least 1, or omitted/`null` for a part with no number. Like the rest
-    /// of this body it is replaced wholesale on update (issue #23), so an
-    /// update that omits it clears it.
-    #[serde(default)]
-    part_number: Option<i16>,
+    /// Which part of its instrument this is: at least 1, or `null` for a part
+    /// with no number (Timpani, Harp).
+    ///
+    /// **Omitting it is not the same as `null`.** On create, an omitted
+    /// `partNumber` is guessed from the name ("Trumpet in Bb 1" → 1; combined
+    /// parts such as "Horn 1 & 3" get none). On update, an omitted
+    /// `partNumber` keeps the current value, so a client that predates the
+    /// field cannot erase it; send `null` to clear it.
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<i16>, nullable)]
+    part_number: Option<Option<i16>>,
+}
+
+/// Deserialize a field that distinguishes *absent* (outer `None`, via
+/// `#[serde(default)]`) from *explicitly `null`* (`Some(None)`).
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 fn voice_error_to_app_error(err: voice::VoiceError) -> AppError {
@@ -1230,7 +1246,10 @@ async fn create_voice(
         &body.name,
         &slug,
         body.instrument_id,
-        body.part_number,
+        match body.part_number {
+            None => voice::NewPartNumber::FromName,
+            Some(n) => voice::NewPartNumber::Set(n),
+        },
         Some(auth.user.id),
     )
     .await
@@ -1376,7 +1395,10 @@ async fn update_voice(
         id,
         &body.name,
         body.instrument_id,
-        body.part_number,
+        match body.part_number {
+            None => voice::PartNumberChange::Keep,
+            Some(n) => voice::PartNumberChange::Set(n),
+        },
     )
     .await
     .map_err(voice_error_to_app_error)?

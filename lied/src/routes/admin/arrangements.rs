@@ -1162,16 +1162,24 @@ fn parse_part_number(raw: Option<String>) -> Result<Option<i16>, ()> {
 const PART_NUMBER_HELP: &str =
     "Part number must be a whole number of at least 1, or blank for a part with no number.";
 
-/// The part-number input, shared by the add and edit forms.
-fn part_number_input(current: Option<i16>) -> Markup {
+/// The part-number input. On the add form a blank field means "take it from
+/// the name" (the same guess the migration backfilled with); on the edit form
+/// the current value is shown and blank means "no number".
+fn part_number_input(current: Option<i16>, adding: bool) -> Markup {
     html! {
         label {
             "Part number "
             input type="number" name="part_number" min="1" step="1"
-                  value=[current] placeholder="none";
+                  value=[current] placeholder=(if adding { "from the name" } else { "none" });
         }
         small class="muted" {
-            " The 1 of \"Trumpet in B♭ 1\". Leave blank for parts without a number. "
+            " The 1 of \"Trumpet in B♭ 1\". "
+            @if adding {
+                "Leave blank to take it from the name — \"Trumpet in B♭ 1\" becomes 1, "
+                "\"Timpani\" or a combined \"Horn 1 & 3\" get none. "
+            } @else {
+                "Leave blank for parts without a number. "
+            }
             "Assigning a player across a whole collection matches on instrument + part number."
         }
     }
@@ -1320,7 +1328,7 @@ async fn voices_page(
                 (layout::csrf_field(&token))
                 label { "Name " input type="text" name="name" required; }
                 label { "Instrument " (instrument_picker(&instruments, None)) }
-                (part_number_input(None))
+                (part_number_input(None, true))
                 button type="submit" { "Add voice" }
             }
         }
@@ -1403,7 +1411,10 @@ async fn create_voice(
         &name,
         &slug,
         instrument_id,
-        part_number,
+        match part_number {
+            None => voice::NewPartNumber::FromName,
+            Some(n) => voice::NewPartNumber::Set(Some(n)),
+        },
         Some(ctx.user().id),
     )
     .await
@@ -1500,7 +1511,7 @@ async fn voice_detail_page(
                 input type="hidden" name="expected_version" value=(version);
                 label { "Name " input type="text" name="name" value=(v.name) required; }
                 label { "Instrument " (instrument_picker(&instruments, Some(v.instrument_id))) }
-                (part_number_input(v.part_number))
+                (part_number_input(v.part_number, false))
                 button type="submit" { "Save changes" }
             }
             form method="post" action=(format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/delete")) {
@@ -1580,7 +1591,15 @@ async fn update_voice(
     let Ok(part_number) = parse_part_number(form.part_number) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP);
     };
-    match voice::update(&state.db, voice_id, &name, instrument_id, part_number).await {
+    match voice::update(
+        &state.db,
+        voice_id,
+        &name,
+        instrument_id,
+        voice::PartNumberChange::Set(part_number),
+    )
+    .await
+    {
         Ok(Some(updated)) => {
             audit(
                 &state.db,

@@ -78,6 +78,18 @@ struct ProblemDetails {
 }
 
 impl AppError {
+    /// A 400 Problem Details carrying one field error — the shape garde's
+    /// reports produce, for checks garde cannot express (a referenced row
+    /// that does not exist, a value outside a domain rule).
+    pub fn field(field: &str, message: &str) -> Self {
+        let mut report = garde::Report::new();
+        report.append(
+            garde::Path::new(field),
+            garde::Error::new(message.to_string()),
+        );
+        AppError::Validation(report)
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
