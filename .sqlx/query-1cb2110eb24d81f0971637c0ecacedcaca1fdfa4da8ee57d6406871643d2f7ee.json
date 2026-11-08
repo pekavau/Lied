@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO global_annotation (id, arrangement_id, author_id, type, content, created_by)\n        SELECT $1, a.id, $3, $4, $5, $3\n        FROM arrangement a\n        WHERE a.id = $2 AND a.deleted_at IS NULL\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1cb2110eb24d81f0971637c0ecacedcaca1fdfa4da8ee57d6406871643d2f7ee"
+}

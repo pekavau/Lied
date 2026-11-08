@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            g.id, g.arrangement_id, g.author_id,\n            u.display_name as author_display_name,\n            g.type as annotation_type, g.content,\n            g.created_at as \"created_at: DateTime<Utc>\",\n            g.updated_at as \"updated_at: DateTime<Utc>\",\n            a.title as arrangement_title\n        FROM global_annotation g\n        JOIN arrangement a ON a.id = g.arrangement_id AND a.deleted_at IS NULL\n        JOIN \"user\" u ON u.id = g.author_id\n        WHERE a.organization_id = $1\n        ORDER BY g.updated_at DESC, g.id ASC\n        LIMIT $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "author_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "author_display_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "annotation_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0bdc0d3e88ebee4927a607424f2748e11e0a6178f078ce09800343d6580cdf5d"
+}

@@ -18,6 +18,7 @@ pub mod arrangements;
 pub mod bulk_assignments;
 pub mod collections;
 pub mod files;
+pub mod global_annotations;
 pub mod infra;
 pub mod openapi;
 pub mod orgs;

@@ -754,7 +754,7 @@ async fn create_arrangement(
     Ok((StatusCode::CREATED, Json(created.into())))
 }
 
-async fn find_arrangement_scoped(
+pub(crate) async fn find_arrangement_scoped(
     state: &AppState,
     org_id: Uuid,
     id: Uuid,

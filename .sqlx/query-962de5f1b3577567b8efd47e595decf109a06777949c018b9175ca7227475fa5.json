@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE global_annotation g\n        SET type = COALESCE($2, g.type),\n            content = COALESCE($3, g.content),\n            updated_at = now()\n        FROM arrangement a\n        WHERE g.id = $1 AND a.id = g.arrangement_id AND a.deleted_at IS NULL\n        RETURNING g.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "962de5f1b3577567b8efd47e595decf109a06777949c018b9175ca7227475fa5"
+}

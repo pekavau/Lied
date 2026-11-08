@@ -175,6 +175,22 @@ pub async fn require_collection_editor_v1(
     auth: &BearerOrSession,
     organization_id: Uuid,
 ) -> Result<(), AppError> {
+    require_org_capability_v1(state, auth, organization_id, Role::can_build_collections).await
+}
+
+/// Require the caller's role in the org to satisfy `capability` — one of the
+/// permission-matrix predicates on [`Role`] (`is_staff`,
+/// `can_author_global_annotations`, …). For matrix rows that are not a single
+/// `at_least` threshold, because archivist and conductor are incomparable.
+/// `is_system_admin` short-circuits, as with [`require_org_role`]. A
+/// non-member, or a member whose role fails the predicate, gets
+/// `403 Forbidden`.
+pub async fn require_org_capability_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    capability: fn(Role) -> bool,
+) -> Result<(), AppError> {
     if auth.user.is_system_admin {
         return Ok(());
     }
@@ -182,7 +198,7 @@ pub async fn require_collection_editor_v1(
         .await
         .map_err(AppError::from)?;
     match found {
-        Some(m) if m.role.can_build_collections() => Ok(()),
+        Some(m) if capability(m.role) => Ok(()),
         _ => Err(AppError::Forbidden),
     }
 }

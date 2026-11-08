@@ -569,7 +569,13 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
   **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
   **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
-- **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director.
+- **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director. Issue #36 activated authoring:
+  - **Vocabulary:** `type` is a controlled vocabulary (`tempo`, `dynamics`, `articulation`, `structure` for cuts/repeats/vamps, `general`), text + CHECK per the enum convention. It was free text in 0017, before anything wrote to it.
+  - **Access:** owner and conductor write; all staff (owner, archivist, conductor) read. A plain musician gets 403 for now. Whether musicians read annotations over `/v1` is a phase-3 client decision, not a default made here.
+  - **Edits:** `PATCH` is a true partial update; omitted fields are kept.
+  - **Delete:** hard delete (no `deleted_at`). The `global_annotation.delete` audit row keeps the removed content, so it is the only remaining copy.
+  - **Arrangement scoping:** annotations reach their org only through the arrangement, and a soft-deleted arrangement hides them (hide-with-references) until it is restored.
+  - **Console:** an Annotations block on the arrangement screen (read for staff, add/edit for authors), plus an org-wide "most recently changed" list in the Annotations section, which is visible to authors only.
 
 #### Search & metadata
 - **Search backend.** Postgres FTS (`tsvector` + GIN) over title, composer, arranger, instrumentation description, and tag names; `pg_trgm` for fuzzy matching on title and composer. No external search service — preserves the single-Postgres self-hostable footprint. If volume ever outgrows this, swap is mechanical.
@@ -668,7 +674,7 @@ A PartAssignment does **not** require the user to hold a Membership in the org �
 
 **GlobalAnnotation**
 A conductor- or director-level annotation on an arrangement, visible to all.
-Fields: arrangement FK, author (user FK), type, content, audit fields.
+Fields: arrangement FK, author (user FK), `type` (`tempo`, `dynamics`, `articulation`, `structure`, `general` — text + CHECK, migration 0025), content, audit fields.
 
 **Tag**
 An open-ended classifier scoped to an organization, used for theme/mood/era/occasion/style and similar dimensions the conductor searches by.

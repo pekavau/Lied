@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::{arrangement, instrument, tag, voice, work};
+use crate::domain::{arrangement, global_annotation, instrument, tag, voice, work};
 use crate::listing::{check_if_match, SortDirection};
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
@@ -567,6 +567,34 @@ async fn detail_page(
             .unwrap_or_default();
     let version = a.updated_at.timestamp_millis();
     let deleted = a.deleted_at.is_some();
+    // A removed arrangement hides its annotations, so there is nothing to
+    // load. A failed load is an error page, not an empty list: "no
+    // annotations" must never be what a database hiccup looks like.
+    let (annotations, annotation_total) = if deleted {
+        (Vec::new(), 0)
+    } else {
+        match global_annotation::list_for_arrangement(
+            &state.db,
+            arr_id,
+            i64::from(state.config.max_page_size),
+            0,
+            "g.created_at",
+            SortDirection::Asc,
+            None,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "failed to load the arrangement's annotations");
+                return error_page(
+                    &ctx,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not load the arrangement's annotations.",
+                );
+            }
+        }
+    };
 
     let body = html! {
         p { "Slug: " code { (a.slug) } " · Status: " (a.status)
@@ -591,6 +619,16 @@ async fn detail_page(
         } @else {
             (arrangement_readonly(&a, &works))
         }
+
+        (crate::routes::admin::annotations::section(
+            &ctx,
+            org_id,
+            arr_id,
+            deleted,
+            &annotations,
+            annotation_total,
+            &token,
+        ))
 
         h2 { "Tags" }
         @if attached_tags.is_empty() {

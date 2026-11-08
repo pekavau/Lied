@@ -272,21 +272,6 @@ impl Section {
         format!("/admin/orgs/{org_id}/{}", self.segment())
     }
 
-    /// The issue that replaces this stub with a real screen (shown in the
-    /// placeholder body so the foundation documents its own follow-ups).
-    fn follow_up(self) -> Option<&'static str> {
-        match self {
-            Section::Home => None,
-            Section::Arrangements => Some("#31 / #32"),
-            Section::Collections => Some("#33"),
-            Section::Coverage => Some("#35"),
-            Section::Annotations => Some("#36"),
-            Section::Search => Some("#34"),
-            // Members is a real screen (admin::members), not a stub.
-            Section::Members => None,
-        }
-    }
-
     /// Whether `access` may see this section in the nav — and, since the
     /// section handlers gate on this same predicate, whether they may open it
     /// at all. One source of truth for both the nav and the route gate.
@@ -301,17 +286,6 @@ impl Section {
             Section::Members => access.can_manage_members(),
         }
     }
-
-    /// Whether this section is read-only for `access`: the arrangements screen
-    /// is read-only for a conductor (view-only per the matrix), and coverage
-    /// is read-only for everyone. Drives the read-only note on the stub.
-    fn is_read_only_for(self, access: &Access) -> bool {
-        match self {
-            Section::Arrangements => !access.can_edit_arrangements(),
-            Section::Coverage => true,
-            _ => false,
-        }
-    }
 }
 
 /// Whether a member with `role`/`is_principal` may enter the console at all —
@@ -323,11 +297,8 @@ pub fn can_enter(role: Role, is_principal: bool) -> bool {
 }
 
 pub fn router() -> Router<AppState> {
-    // Arrangements, Collections, Search and Coverage are real screens merged
-    // separately in `admin::router`; annotations (#36) is still a gated stub.
-    Router::new()
-        .route("/orgs/:org_id/console", get(home_page))
-        .route("/orgs/:org_id/annotations", get(annotations_stub))
+    // Every section is a real screen merged separately in `admin::router`.
+    Router::new().route("/orgs/:org_id/console", get(home_page))
 }
 
 /// Render a full console page inside the org's role-aware nav shell, with
@@ -353,26 +324,6 @@ pub(crate) fn console_page(ctx: &ConsoleCtx, active: Section, body: Markup) -> M
     };
     let title = format!("{} — {}", ctx.org.name, active.label());
     layout::document(&title, nav, body)
-}
-
-/// A stub body for a section whose real screen lands in a later issue.
-fn stub_body(section: Section, read_only: bool) -> Markup {
-    html! {
-        p {
-            "This section is part of the Phase 2 console foundation. Its screen "
-            @if let Some(issue) = section.follow_up() {
-                "arrives in issue " (issue) "."
-            } @else {
-                "is being built."
-            }
-        }
-        @if read_only {
-            p class="muted" {
-                "You have read-only access to this section — you can view it "
-                "but not make changes."
-            }
-        }
-    }
 }
 
 /// Resolve the session for a console handler, redirecting to the login page
@@ -511,37 +462,6 @@ async fn home_page(
     };
     Html(console_page(&ctx, Section::Home, body).into_string()).into_response()
 }
-
-/// Build a gated section-stub handler. Visibility *is* the gate — the handler
-/// admits exactly the callers the nav would show a link to
-/// ([`Section::is_visible_to`]), so nav and gate can't disagree — and the
-/// read-only note comes from the same [`Section::is_read_only_for`] the stub
-/// body uses. Each section's policy therefore lives only on `Section`.
-macro_rules! section_handler {
-    ($name:ident, $section:expr) => {
-        async fn $name(
-            State(state): State<AppState>,
-            auth: Option<AuthSession>,
-            Path(org_id): Path<Uuid>,
-        ) -> Response {
-            let user = match require_login(auth) {
-                Ok(user) => user,
-                Err(redirect) => return redirect.into_response(),
-            };
-            let ctx = match ConsoleCtx::load(&state, &user, org_id).await {
-                Ok(ctx) => ctx,
-                Err(err) => return load_error_response(err),
-            };
-            if !$section.is_visible_to(&ctx.access) {
-                return section_forbidden(&ctx);
-            }
-            let body = stub_body($section, $section.is_read_only_for(&ctx.access));
-            Html(console_page(&ctx, $section, body).into_string()).into_response()
-        }
-    };
-}
-
-section_handler!(annotations_stub, Section::Annotations);
 
 #[cfg(test)]
 mod tests {

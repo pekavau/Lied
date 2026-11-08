@@ -423,6 +423,8 @@ pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
         .merge(crate::routes::part_assignments::router())
         // One player on one part across a whole collection (issue #55).
         .merge(crate::routes::bulk_assignments::router())
+        // Conductor's global annotations on an arrangement (issue #36).
+        .merge(crate::routes::global_annotations::router())
 }
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {

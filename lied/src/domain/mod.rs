@@ -16,6 +16,7 @@ pub mod collection;
 pub mod collection_item;
 pub mod coverage;
 pub mod file;
+pub mod global_annotation;
 pub mod instrument;
 pub mod membership;
 pub mod organization;
