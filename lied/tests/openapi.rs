@@ -562,3 +562,34 @@ fn operations_with_parameters_declare_400() {
         violations.join("\n")
     );
 }
+
+/// Every `/v1` path parameter is a UUID. `routes::params::ApiPath` relies on
+/// it: when a path value fails inside its own `Deserialize` (which is how a
+/// bad `Uuid` fails), axum reports neither key nor position, and the
+/// extractor names the first segment that is not a UUID. A route with a
+/// non-UUID path parameter (a slug, an enum) must teach `ApiPath` how to
+/// name it — this test is the reminder.
+#[test]
+fn every_path_parameter_is_a_uuid() {
+    let json = build_openapi_json();
+    let mut violations = Vec::new();
+    for (path, item) in json["paths"].as_object().expect("paths object") {
+        for (method, op) in item.as_object().expect("path item") {
+            for param in op["parameters"].as_array().into_iter().flatten() {
+                if param["in"] == "path" && param["schema"]["format"] != "uuid" {
+                    violations.push(format!(
+                        "{} {path}: {{{}}} is {}",
+                        method.to_uppercase(),
+                        param["name"].as_str().unwrap_or("?"),
+                        param["schema"]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Path parameters that are not UUIDs (see routes::params::path_error):\n{}",
+        violations.join("\n")
+    );
+}
