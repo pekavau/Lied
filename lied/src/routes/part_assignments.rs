@@ -36,6 +36,7 @@ use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
+use crate::routes::patch::present_or_null;
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -281,15 +282,19 @@ async fn get_assignment(
     Ok(etag_response(found, updated_at))
 }
 
-/// Request body for `PATCH .../assignments/{assignmentId}` — sets
+/// Request body for `PATCH .../assignments/{assignmentId}` — sets or clears
 /// `notifiedAt`/`acknowledgedAt`. The notification/acknowledgement
 /// *workflow* is deferred (CLAUDE.md phase-1 cut), but the fields are
-/// settable now. Omitted fields are left unchanged.
+/// settable now. A partial update: an omitted field is kept, `null` clears it.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateAssignmentStateRequest {
-    notified_at: Option<DateTime<Utc>>,
-    acknowledged_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<DateTime<Utc>>, nullable)]
+    notified_at: Option<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<DateTime<Utc>>, nullable)]
+    acknowledged_at: Option<Option<DateTime<Utc>>>,
 }
 
 /// Set `notifiedAt`/`acknowledgedAt` on an assignment (owner/archivist/
@@ -333,14 +338,31 @@ async fn update_assignment(
     crate::listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let updated = part_assignment::update_state(
-        &state.db,
-        assignment_id,
-        body.notified_at,
-        body.acknowledged_at,
-    )
-    .await?
-    .ok_or(AppError::NotFound)?;
+    let change = |field: Option<Option<DateTime<Utc>>>| match field {
+        None => part_assignment::StampChange::Keep,
+        Some(value) => part_assignment::StampChange::Set(value),
+    };
+    let notified_at = change(body.notified_at);
+    let acknowledged_at = change(body.acknowledged_at);
+    // Compared at the stored (millisecond) precision, so re-sending the value
+    // a GET returned is recognised as no change.
+    let same = |a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>| {
+        a.map(|d| d.timestamp_millis()) == b.map(|d| d.timestamp_millis())
+    };
+    if same(notified_at.apply(current.notified_at), current.notified_at)
+        && same(
+            acknowledged_at.apply(current.acknowledged_at),
+            current.acknowledged_at,
+        )
+    {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(current, updated_at));
+    }
+
+    let updated =
+        part_assignment::update_state(&state.db, assignment_id, notified_at, acknowledged_at)
+            .await?
+            .ok_or(AppError::NotFound)?;
 
     audit(
         &state.db,

@@ -221,10 +221,27 @@ pub async fn list_for_item(
     Ok((rows, total))
 }
 
-/// Set `notified_at` / `acknowledged_at`. A `None` argument leaves that field
-/// unchanged (this is a "set if provided" PATCH, not a way to clear a
-/// timestamp back to `NULL` — clearing isn't a phase-1 need). Returns `None`
-/// if no row matched.
+/// What an update does to one distribution timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampChange {
+    /// Leave it as it is.
+    Keep,
+    /// Replace it — `None` clears it (a "notified" recorded by mistake).
+    Set(Option<DateTime<Utc>>),
+}
+
+impl StampChange {
+    /// The value this change leaves behind, given the current one.
+    pub fn apply(self, current: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+        match self {
+            StampChange::Keep => current,
+            StampChange::Set(value) => value,
+        }
+    }
+}
+
+/// Set or clear `notified_at` / `acknowledged_at`; [`StampChange::Keep`]
+/// leaves that field unchanged. Returns `None` if no row matched.
 ///
 /// Timestamps are passed through as millisecond-epoch `i64` (via
 /// `to_timestamp(.../1000.0)`) rather than binding `DateTime<Utc>` directly:
@@ -240,17 +257,25 @@ pub async fn list_for_item(
 pub async fn update_state(
     pool: &PgPool,
     id: Uuid,
-    notified_at: Option<DateTime<Utc>>,
-    acknowledged_at: Option<DateTime<Utc>>,
+    notified_at: StampChange,
+    acknowledged_at: StampChange,
 ) -> Result<Option<PartAssignment>, sqlx::Error> {
-    let notified_at_ms = notified_at.map(|d| d.timestamp_millis() as f64);
-    let acknowledged_at_ms = acknowledged_at.map(|d| d.timestamp_millis() as f64);
+    fn bind(change: StampChange) -> (bool, Option<f64>) {
+        match change {
+            StampChange::Keep => (true, None),
+            StampChange::Set(value) => (false, value.map(|d| d.timestamp_millis() as f64)),
+        }
+    }
+    let (keep_notified, notified_at_ms) = bind(notified_at);
+    let (keep_acknowledged, acknowledged_at_ms) = bind(acknowledged_at);
     sqlx::query_as!(
         PartAssignment,
         r#"
         UPDATE part_assignment
-        SET notified_at = COALESCE(to_timestamp($2::double precision / 1000.0), notified_at),
-            acknowledged_at = COALESCE(to_timestamp($3::double precision / 1000.0), acknowledged_at),
+        SET notified_at = CASE WHEN $4 THEN notified_at
+                               ELSE to_timestamp($2::double precision / 1000.0) END,
+            acknowledged_at = CASE WHEN $5 THEN acknowledged_at
+                                   ELSE to_timestamp($3::double precision / 1000.0) END,
             updated_at = now()
         WHERE id = $1
         RETURNING
@@ -264,6 +289,8 @@ pub async fn update_state(
         id,
         notified_at_ms,
         acknowledged_at_ms,
+        keep_notified,
+        keep_acknowledged,
     )
     .fetch_optional(pool)
     .await

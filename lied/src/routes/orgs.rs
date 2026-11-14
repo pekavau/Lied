@@ -24,11 +24,12 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{organization, user};
 use crate::error::AppError;
-use crate::listing::{self, SortDirection};
+use crate::listing::{self, etag_response, if_match_header, SortDirection};
 use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
+use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -100,11 +101,13 @@ struct CreateOrgRequest {
     name: String,
 }
 
-/// Request body for `PATCH /v1/orgs/{id}`.
+/// Request body for `PATCH /v1/orgs/{id}`: a partial update; an omitted
+/// `name` is kept. The slug never changes here (slug rename is its own,
+/// admin-gated operation).
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateOrgRequest {
-    name: String,
+    name: Option<String>,
 }
 
 /// List organizations (any authenticated identity; federation trust model).
@@ -304,20 +307,29 @@ async fn update_org(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateOrgRequest>,
-) -> Result<Json<OrganizationResponse>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_system_admin(&auth.user)?;
 
     let current = organization::find_by_id(&state.db, id)
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let if_match = headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok());
-    listing::check_if_match(if_match, current.updated_at)
+    listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let updated = organization::update_name(&state.db, id, &body.name)
+    reject_blank("name", body.name.as_deref())?;
+    let name = match body.name {
+        Some(name) if name != current.name => name,
+        _ => {
+            let updated_at = current.updated_at;
+            return Ok(etag_response(
+                OrganizationResponse::from(current),
+                updated_at,
+            ));
+        }
+    };
+
+    let updated = organization::update_name(&state.db, id, &name)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -335,7 +347,11 @@ async fn update_org(
     )
     .await;
 
-    Ok(Json(updated.into()))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(
+        OrganizationResponse::from(updated),
+        updated_at,
+    ))
 }
 
 /// Hard-delete an organization and all its data (system-admin only; requires `If-Match`).
@@ -726,11 +742,13 @@ struct CreateMemberRequest {
     principal_instrument_ids: Option<Vec<Uuid>>,
 }
 
-/// Request body for `PATCH /v1/orgs/{orgId}/members/{id}`.
+/// Request body for `PATCH /v1/orgs/{orgId}/members/{id}`: a partial
+/// update. An omitted field is kept; none of these fields is nullable, so
+/// `null` is the same as omitting it (send `[]` to empty an instrument list).
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateMemberRequest {
-    role: String,
+    role: Option<String>,
     instrument_ids: Option<Vec<Uuid>>,
     is_principal: Option<bool>,
     principal_instrument_ids: Option<Vec<Uuid>>,
@@ -1009,18 +1027,18 @@ async fn update_member(
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(body): Json<UpdateMemberRequest>,
-) -> Result<Json<MembershipResponse>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Owner).await?;
 
     let current = find_member_scoped(&state, org_id, id).await?;
 
-    let if_match = headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok());
-    listing::check_if_match(if_match, current.updated_at)
+    listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let role = parse_role_or_validation_error(&body.role)?;
+    let role = match body.role.as_deref() {
+        Some(role) => parse_role_or_validation_error(role)?,
+        None => current.role,
+    };
     let instrument_ids = body
         .instrument_ids
         .unwrap_or_else(|| current.instrument_ids.clone());
@@ -1028,6 +1046,15 @@ async fn update_member(
         .principal_instrument_ids
         .unwrap_or_else(|| current.principal_instrument_ids.clone());
     let is_principal = body.is_principal.unwrap_or(current.is_principal);
+
+    if role == current.role
+        && instrument_ids == current.instrument_ids
+        && is_principal == current.is_principal
+        && principal_instrument_ids == current.principal_instrument_ids
+    {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(MembershipResponse::from(current), updated_at));
+    }
 
     let updated = membership::update(
         &state.db,
@@ -1078,7 +1105,8 @@ async fn update_member(
     )
     .await;
 
-    Ok(Json(updated.into()))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(MembershipResponse::from(updated), updated_at))
 }
 
 /// Remove a member from an organization (owner only; requires `If-Match`).

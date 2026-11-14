@@ -317,9 +317,14 @@ async fn assign(pool: &PgPool, item: Uuid, voice: Uuid, user: Uuid) -> Uuid {
 }
 
 async fn acknowledge(pool: &PgPool, assignment: Uuid) {
-    part_assignment::update_state(pool, assignment, None, Some(chrono::Utc::now()))
-        .await
-        .expect("acknowledge");
+    part_assignment::update_state(
+        pool,
+        assignment,
+        part_assignment::StampChange::Keep,
+        part_assignment::StampChange::Set(Some(chrono::Utc::now())),
+    )
+    .await
+    .expect("acknowledge");
 }
 
 async fn coverage_json(

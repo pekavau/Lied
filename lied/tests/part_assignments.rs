@@ -659,3 +659,58 @@ async fn assignment_writes_are_audited() {
     .expect("count");
     assert_eq!(audited, 1, "part_assignment.create must be audited");
 }
+
+#[tokio::test]
+async fn patch_sets_keeps_and_clears_the_distribution_timestamps() {
+    let (ctx, tok, _actor) = setup(membership::Role::Archivist).await;
+    let (coll, item, voice) = seed_item_and_voice(&ctx).await;
+    let musician = create_user(&ctx.pool, "muso").await;
+    let url = assignments_url(ctx.org, coll, item);
+    let (_s, created, _h) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &url,
+            &tok,
+            Some(serde_json::json!({ "userId": musician, "voiceId": voice })),
+        ),
+    )
+    .await;
+    let one = format!("{url}/{}", created["id"].as_str().unwrap());
+
+    let patch = |body: serde_json::Value| {
+        let app = ctx.app.clone();
+        let one = one.clone();
+        let tok = tok.clone();
+        async move {
+            let (_s, _b, headers) = send(&app, req("GET", &one, &tok, None)).await;
+            let etag = headers["etag"].to_str().unwrap().to_string();
+            send(
+                &app,
+                req_with_if_match("PATCH", &one, &tok, Some(&etag), Some(body)),
+            )
+            .await
+        }
+    };
+
+    let (status, body, _h) = patch(serde_json::json!({
+        "notifiedAt": "2026-11-01T10:00:00Z",
+        "acknowledgedAt": "2026-11-02T10:00:00Z",
+    }))
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["acknowledgedAt"], "2026-11-02T10:00:00Z");
+
+    // Omitted keeps; `null` clears (an acknowledgement recorded by mistake).
+    let (status, body, _h) = patch(serde_json::json!({ "acknowledgedAt": null })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body["acknowledgedAt"].is_null());
+    assert_eq!(body["notifiedAt"], "2026-11-01T10:00:00Z");
+
+    // Re-sending the stored value changes nothing: same ETag back.
+    let (_s, _b, before) = send(&ctx.app, req("GET", &one, &tok, None)).await;
+    let (status, _b, after) =
+        patch(serde_json::json!({ "notifiedAt": "2026-11-01T10:00:00Z" })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(before["etag"], after["etag"]);
+}

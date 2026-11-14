@@ -28,6 +28,7 @@ use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
+use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -148,7 +149,7 @@ async fn find_item_scoped(
 
 // ── Collection ─────────────────────────────────────────────────────────────
 
-/// Request body for creating or updating a collection.
+/// Request body for creating a collection.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CollectionRequest {
@@ -156,6 +157,17 @@ struct CollectionRequest {
     /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
     #[serde(rename = "type")]
     collection_type: String,
+}
+
+/// Request body for `PATCH …/collections/{id}`: a partial update; an omitted
+/// field is kept.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateCollectionRequest {
+    name: Option<String>,
+    /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
+    #[serde(rename = "type")]
+    collection_type: Option<String>,
 }
 
 /// List an organization's collections (requires org membership).
@@ -345,7 +357,7 @@ async fn get_collection(
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = CollectionRequest,
+    request_body = UpdateCollectionRequest,
     responses(
         (status = 200, description = "Updated collection", body = collection::Collection,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -363,7 +375,7 @@ async fn update_collection(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<CollectionRequest>,
+    Json(body): Json<UpdateCollectionRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
@@ -371,17 +383,27 @@ async fn update_collection(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if body.name.trim().is_empty() {
-        return Err(AppError::field("name", "name must not be empty"));
-    }
-    if !collection::is_valid_type(&body.collection_type) {
+    reject_blank("name", body.name.as_deref())?;
+    if body
+        .collection_type
+        .as_deref()
+        .is_some_and(|t| !collection::is_valid_type(t))
+    {
         return Err(AppError::field(
             "type",
             "type must be `program` or `standing`",
         ));
     }
+    let name = body.name.unwrap_or_else(|| current.name.clone());
+    let collection_type = body
+        .collection_type
+        .unwrap_or_else(|| current.collection_type.clone());
+    if name == current.name && collection_type == current.collection_type {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(current, updated_at));
+    }
 
-    let updated = collection::update(&state.db, id, &body.name, &body.collection_type)
+    let updated = collection::update(&state.db, id, &name, &collection_type)
         .await
         .map_err(collection_error_to_app_error)?
         .ok_or(AppError::NotFound)?;
@@ -719,11 +741,12 @@ async fn get_item(
     Ok(etag_response(item, updated_at))
 }
 
-/// Request body for moving an item to a new index.
+/// Request body for moving an item to a new index: a partial update like
+/// every `PATCH`, so `{}` (or the item's current index) changes nothing.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateItemRequest {
-    index: i32,
+    index: Option<i32>,
 }
 
 /// Move a collection item to a new index (owner/archivist/conductor; requires `If-Match`).
@@ -763,9 +786,16 @@ async fn update_item(
     let current = find_item_scoped(&state, org_id, collection_id, item_id, false).await?;
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
-    validate_index(body.index)?;
+    let index = match body.index {
+        Some(index) if index != current.index => index,
+        _ => {
+            let updated_at = current.updated_at;
+            return Ok(etag_response(current, updated_at));
+        }
+    };
+    validate_index(index)?;
 
-    let updated = collection_item::update_index(&state.db, item_id, body.index)
+    let updated = collection_item::update_index(&state.db, item_id, index)
         .await
         .map_err(item_error_to_app_error)?
         .ok_or(AppError::NotFound)?;

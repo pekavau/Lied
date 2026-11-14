@@ -1024,3 +1024,81 @@ async fn admin_writes_are_csrf_protected_via_form_field() {
         "a write with no csrf_token field and no HX-CSRF header must be rejected"
     );
 }
+
+/// PATCH with a given ETag; returns status, response ETag and JSON body.
+async fn patch_with(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+    etag: &str,
+    body: &str,
+) -> (axum::http::StatusCode, String, serde_json::Value) {
+    let request = bearer_request("PATCH", uri, token)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::IF_MATCH, etag)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.expect("request runs");
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    (status, etag, body_json(response).await)
+}
+
+#[tokio::test]
+async fn member_patch_without_a_role_keeps_the_role() {
+    let db = TestDb::create_and_migrate().await;
+    let owner = create_plain_user(&db.pool, "owner", "correct horse battery staple").await;
+    let player = create_plain_user(&db.pool, "player", "correct horse battery staple").await;
+    let org = create_org(&db.pool, "Partial Org").await;
+    add_member(&db.pool, org.id, owner.id, membership::Role::Owner).await;
+    let member = add_member(&db.pool, org.id, player.id, membership::Role::Conductor).await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let token = mint_token(&state, owner.id);
+    let uri = format!("/v1/orgs/{}/members/{}", org.id, member.id);
+
+    let (status, etag, body) = patch_with(
+        &app,
+        &token,
+        &uri,
+        &lied::listing::etag_for(member.updated_at),
+        r#"{"isPrincipal":true}"#,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["role"], "conductor");
+    assert_eq!(body["isPrincipal"], true);
+
+    // Re-sending what is already there writes nothing.
+    let (status, again, _) = patch_with(&app, &token, &uri, &etag, r#"{"role":"conductor"}"#).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(again, etag);
+}
+
+#[tokio::test]
+async fn org_patch_is_partial_and_an_empty_one_writes_nothing() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "admin", "correct horse battery staple").await;
+    let org = create_org(&db.pool, "Quiet Org").await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let token = mint_token(&state, admin.id);
+    let uri = format!("/v1/orgs/{}", org.id);
+    let etag = lied::listing::etag_for(org.updated_at);
+
+    let (status, same, body) = patch_with(&app, &token, &uri, &etag, "{}").await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(same, etag);
+    assert_eq!(body["name"], "Quiet Org");
+
+    let (status, _, _) = patch_with(&app, &token, &uri, &etag, r#"{"name":"  "}"#).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    let (status, renamed, body) =
+        patch_with(&app, &token, &uri, &etag, r#"{"name":"Loud Org"}"#).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Loud Org");
+    assert_ne!(renamed, etag, "a real change moves the ETag");
+}

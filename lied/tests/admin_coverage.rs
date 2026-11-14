@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use lied::auth;
 use lied::config::{AppConfig, Secret};
+use lied::domain::part_assignment::StampChange;
 use lied::domain::{arrangement, membership, organization, user};
 use lied::state::AppState;
 use sqlx::postgres::PgPoolOptions;
@@ -453,8 +454,8 @@ async fn the_dashboard_summarises_every_collection_and_links_through() {
     lied::domain::part_assignment::update_state(
         &ctx.state.db,
         assignment.id,
-        None,
-        Some(chrono::Utc::now()),
+        StampChange::Keep,
+        StampChange::Set(Some(chrono::Utc::now())),
     )
     .await
     .expect("acknowledge");
@@ -515,8 +516,8 @@ async fn the_detail_screen_names_each_voices_state() {
     lied::domain::part_assignment::update_state(
         &ctx.state.db,
         assignment.id,
-        Some(chrono::Utc::now()),
-        None,
+        StampChange::Set(Some(chrono::Utc::now())),
+        StampChange::Keep,
     )
     .await
     .expect("notify");

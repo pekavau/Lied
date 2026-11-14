@@ -23,6 +23,7 @@ pub mod infra;
 pub mod openapi;
 pub mod orgs;
 pub mod part_assignments;
+pub(crate) mod patch;
 pub mod v1;
 pub mod webdav;
 
