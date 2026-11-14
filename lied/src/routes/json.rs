@@ -95,16 +95,25 @@ fn shape_or_syntax(err: serde_path_to_error::Error<serde_json::Error>) -> AppErr
     if !inner.is_data() {
         return syntax_error(&inner);
     }
-    let message = without_value(&without_position(&inner.to_string()));
+    field_error(&path, &without_position(&inner.to_string()), "body")
+}
+
+/// The field error for a serde_path_to_error failure at `path` with serde's
+/// `message`, shared by bodies ([`ApiJson`]) and queries
+/// ([`ApiQuery`](super::params::ApiQuery)). The value the client sent is cut
+/// from the message; a field named by the message (missing, unknown,
+/// duplicate) is the key, else the failing path, else `fallback` (the root).
+pub(super) fn field_error(path: &str, message: &str, fallback: &str) -> AppError {
+    let message = without_value(message);
     // A missing or unknown field is reported against its parent; name the
     // field itself, so `errors` points at what the client has to fix.
     let field = named_field(&message)
-        .map(|name| join(&path, name))
+        .map(|name| join(path, name))
         .unwrap_or_else(|| {
             if path == "." {
-                "body".to_string()
+                fallback.to_string()
             } else {
-                path
+                path.to_string()
             }
         });
     AppError::field(&field, &message)
@@ -122,12 +131,12 @@ fn syntax_error(err: &serde_json::Error) -> AppError {
     AppError::BadRequest(detail)
 }
 
-/// The field a "missing field `x`" / "unknown field `x`, expected …" message
-/// is about.
+/// The field a "missing field `x`" / "unknown field `x`, expected …" /
+/// "duplicate field `x`" message is about.
 pub(super) fn named_field(message: &str) -> Option<&str> {
-    let rest = message
-        .strip_prefix("missing field `")
-        .or_else(|| message.strip_prefix("unknown field `"))?;
+    let rest = ["missing field `", "unknown field `", "duplicate field `"]
+        .iter()
+        .find_map(|prefix| message.strip_prefix(prefix))?;
     rest.split_once('`').map(|(name, _)| name)
 }
 
@@ -150,6 +159,12 @@ pub(super) fn join(path: &str, field: &str) -> String {
 /// Field names in "missing/unknown field" messages are keys, not values, and
 /// stay.
 pub(super) fn without_value(message: &str) -> String {
+    // A type's own parser may quote a piece of the value in passing — uuid's
+    // "UUID parsing failed: invalid character: found `n` at 0". Cut it there.
+    let message = match message.find("found `") {
+        Some(at) => message[..at].trim_end_matches([' ', ',', ':']),
+        None => message,
+    };
     let quotes_a_value = [
         "invalid type: ",
         "invalid value: ",
@@ -258,6 +273,14 @@ mod tests {
         assert_eq!(
             without_value("unknown field `publsher`, expected `title`"),
             "unknown field `publsher`, expected `title`"
+        );
+        assert_eq!(
+            without_value(
+                "invalid character: expected an optional prefix of `urn:uuid:` followed by \
+                 [0-9a-fA-F-], found `n` at 1"
+            ),
+            "invalid character: expected an optional prefix of `urn:uuid:` followed by \
+             [0-9a-fA-F-]"
         );
         let Err(AppError::Validation(report)) = parse::<Body>(br#"{"title":12345678}"#) else {
             panic!("expected a validation error");

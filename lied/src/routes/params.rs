@@ -24,7 +24,7 @@ use axum::extract::{FromRequestParts, RawPathParams};
 use axum::http::request::Parts;
 use serde::de::DeserializeOwned;
 
-use super::json::{join, named_field, without_value};
+use super::json::{field_error, without_value};
 use crate::error::AppError;
 
 /// Path parameters, deserialized into `T`; a segment that does not parse is a
@@ -82,7 +82,9 @@ async fn path_error<S: Send + Sync>(
         ErrorKind::InvalidUtf8InPathParam { key } => AppError::field(&key, "must be valid UTF-8"),
         // A type with its own `Deserialize` — `Uuid`, which every /v1 path
         // parameter is — fails with a bare message: no key, no position.
-        // Name the first segment that is not a UUID.
+        // Name the first segment that is not a UUID. That every /v1 path
+        // parameter is a UUID is pinned by `every_path_parameter_is_a_uuid`
+        // in tests/openapi.rs; a non-UUID one needs naming here first.
         ErrorKind::Message(message) => {
             let raw = RawPathParams::from_request_parts(parts, state).await.ok();
             let bad_uuid = raw.as_ref().and_then(|raw| {
@@ -135,20 +137,8 @@ where
 pub(crate) fn parse_query<T: DeserializeOwned>(query: &str) -> Result<T, AppError> {
     let deserializer =
         serde_urlencoded::Deserializer::new(form_urlencoded::parse(query.as_bytes()));
-    serde_path_to_error::deserialize(deserializer).map_err(|err| {
-        let path = err.path().to_string();
-        let message = without_value(&err.inner().to_string());
-        let field = named_field(&message)
-            .map(|name| join(&path, name))
-            .unwrap_or_else(|| {
-                if path == "." {
-                    "query".to_string()
-                } else {
-                    path
-                }
-            });
-        AppError::field(&field, &message)
-    })
+    serde_path_to_error::deserialize(deserializer)
+        .map_err(|err| field_error(&err.path().to_string(), &err.inner().to_string(), "query"))
 }
 
 #[cfg(test)]
@@ -183,6 +173,17 @@ mod tests {
         assert_eq!(field_of(&format!("userId={id}&limit=-1")), "limit");
         assert_eq!(field_of("limit=5"), "userId");
         assert_eq!(field_of("userId=not-a-uuid"), "userId");
+    }
+
+    #[test]
+    fn a_duplicated_key_is_named_and_a_bad_uuid_is_not_echoed() {
+        let id = uuid::Uuid::now_v7();
+        assert_eq!(field_of(&format!("userId={id}&limit=5&limit=6")), "limit");
+        let Err(AppError::Validation(report)) = parse_query::<Q>("userId=n0t-a-uuid") else {
+            panic!("expected a validation error");
+        };
+        let rendered: Vec<String> = report.iter().map(|(_, e)| e.to_string()).collect();
+        assert!(!rendered.iter().any(|m| m.contains("`n`")), "{rendered:?}");
     }
 
     #[test]
