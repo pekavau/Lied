@@ -191,7 +191,7 @@ async fn list_annotations(
 /// Request body for `POST …/annotations`.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CreateRequest {
+struct CreateAnnotationRequest {
     /// One of `tempo`, `dynamics`, `articulation`, `structure`, `general`.
     #[serde(rename = "type")]
     annotation_type: String,
@@ -211,7 +211,7 @@ struct CreateRequest {
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = CreateRequest,
+    request_body = CreateAnnotationRequest,
     responses(
         (status = 201, description = "Annotation created", body = GlobalAnnotation,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -227,7 +227,7 @@ async fn create_annotation(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    ApiJson(body): ApiJson<CreateRequest>,
+    ApiJson(body): ApiJson<CreateAnnotationRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
@@ -302,7 +302,7 @@ async fn get_annotation(
 /// key is a 400 rather than a silent no-op.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateRequest {
+struct UpdateAnnotationRequest {
     #[serde(rename = "type")]
     annotation_type: Option<String>,
     content: Option<String>,
@@ -322,7 +322,7 @@ struct UpdateRequest {
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = UpdateRequest,
+    request_body = UpdateAnnotationRequest,
     responses(
         (status = 200, description = "Updated annotation", body = GlobalAnnotation,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -340,7 +340,7 @@ async fn update_annotation(
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id, id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    ApiJson(body): ApiJson<UpdateRequest>,
+    ApiJson(body): ApiJson<UpdateAnnotationRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     let current = find_scoped(&state, org_id, arrangement_id, id).await?;

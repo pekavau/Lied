@@ -477,7 +477,7 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
 /// Request body for creating an arrangement.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ArrangementRequest {
+struct CreateArrangementRequest {
     title: String,
     work_id: Option<Uuid>,
     instrumentation: Option<String>,
@@ -728,7 +728,7 @@ async fn list_arrangements(
         ("orgId" = Uuid, Path, description = "Organization ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = ArrangementRequest,
+    request_body = CreateArrangementRequest,
     responses(
         (status = 201, description = "Arrangement created", body = ArrangementResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -745,7 +745,7 @@ async fn create_arrangement(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    ApiJson(body): ApiJson<ArrangementRequest>,
+    ApiJson(body): ApiJson<CreateArrangementRequest>,
 ) -> Result<(StatusCode, Json<ArrangementResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1138,7 +1138,7 @@ impl From<voice::Voice> for VoiceResponse {
 /// Request body for creating a voice.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct VoiceRequest {
+struct CreateVoiceRequest {
     name: String,
     instrument_id: Uuid,
     /// Which part of its instrument this is: at least 1, or `null` for a part
@@ -1294,7 +1294,7 @@ async fn list_voices(
         ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = VoiceRequest,
+    request_body = CreateVoiceRequest,
     responses(
         (status = 201, description = "Voice created", body = VoiceResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -1311,7 +1311,7 @@ async fn create_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    ApiJson(body): ApiJson<VoiceRequest>,
+    ApiJson(body): ApiJson<CreateVoiceRequest>,
 ) -> Result<(StatusCode, Json<VoiceResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1673,7 +1673,7 @@ impl From<tag::Tag> for TagResponse {
 /// Request body for creating a tag.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TagRequest {
+struct CreateTagRequest {
     name: String,
     kind: Option<String>,
 }
@@ -1785,7 +1785,7 @@ async fn list_tags(
         ("orgId" = Uuid, Path, description = "Organization ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = TagRequest,
+    request_body = CreateTagRequest,
     responses(
         (status = 201, description = "Tag created", body = TagResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -1801,7 +1801,7 @@ async fn create_tag(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    ApiJson(body): ApiJson<TagRequest>,
+    ApiJson(body): ApiJson<CreateTagRequest>,
 ) -> Result<(StatusCode, Json<TagResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
