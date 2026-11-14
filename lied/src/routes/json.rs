@@ -124,7 +124,7 @@ fn syntax_error(err: &serde_json::Error) -> AppError {
 
 /// The field a "missing field `x`" / "unknown field `x`, expected …" message
 /// is about.
-fn named_field(message: &str) -> Option<&str> {
+pub(super) fn named_field(message: &str) -> Option<&str> {
     let rest = message
         .strip_prefix("missing field `")
         .or_else(|| message.strip_prefix("unknown field `"))?;
@@ -133,7 +133,7 @@ fn named_field(message: &str) -> Option<&str> {
 
 /// The path to `field`. serde_path_to_error already ends the path with an
 /// unknown field's name, but leaves a missing field's path at its parent.
-fn join(path: &str, field: &str) -> String {
+pub(super) fn join(path: &str, field: &str) -> String {
     if path == "." {
         field.to_string()
     } else if path == field || path.ends_with(&format!(".{field}")) {
@@ -149,7 +149,7 @@ fn join(path: &str, field: &str) -> String {
 /// that would otherwise come back in the response and in any log of it.
 /// Field names in "missing/unknown field" messages are keys, not values, and
 /// stay.
-fn without_value(message: &str) -> String {
+pub(super) fn without_value(message: &str) -> String {
     let quotes_a_value = [
         "invalid type: ",
         "invalid value: ",

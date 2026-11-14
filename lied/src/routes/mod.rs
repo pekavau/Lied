@@ -23,6 +23,7 @@ pub mod infra;
 pub(crate) mod json;
 pub mod openapi;
 pub mod orgs;
+pub(crate) mod params;
 pub mod part_assignments;
 pub(crate) mod patch;
 pub mod v1;

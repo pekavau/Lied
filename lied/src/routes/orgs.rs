@@ -9,7 +9,7 @@
 //! (`crate::auth::authz`). Every later phase-1 item's list/detail/mutate
 //! handlers are expected to follow this same shape.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -33,6 +33,8 @@ use crate::routes::openapi::{
 };
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -272,6 +274,7 @@ async fn create_org(
         (status = 200, description = "Organization", body = OrganizationResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         NotFound404,
     )
 )]
@@ -391,6 +394,7 @@ async fn update_org(
     responses(
         (status = 204, description = "Organization deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -621,6 +625,7 @@ async fn create_user(
         (status = 200, description = "User", body = user::User,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -663,6 +668,7 @@ async fn get_user(
     responses(
         (status = 204, description = "User deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -996,6 +1002,7 @@ async fn find_member_scoped(
         (status = 200, description = "Membership", body = MembershipResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1161,6 +1168,7 @@ async fn update_member(
     responses(
         (status = 204, description = "Member removed"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,

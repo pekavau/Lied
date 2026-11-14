@@ -1,0 +1,11 @@
+# The /v1 JSON tree must answer every error as RFC 7807 Problem Details
+# (CLAUDE.md, HTTP & REST API conventions). axum's own extractors reject a bad
+# request in plain text, so /v1 uses the crate's wrappers instead
+# (`routes::json::ApiJson`, `routes::params::{ApiPath, ApiQuery}`). The HTMX
+# console renders HTML and is exempt (`routes::admin`). `axum::Json` is not
+# listed: it is also the response type, which is fine, and clippy cannot tell
+# the two uses apart.
+disallowed-types = [
+    { path = "axum::extract::Path", reason = "use routes::params::ApiPath, which answers with Problem Details (issue #66)" },
+    { path = "axum::extract::Query", reason = "use routes::params::ApiQuery, which answers with Problem Details (issue #66)" },
+]

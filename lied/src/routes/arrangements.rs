@@ -4,7 +4,7 @@
 //! issue #6 (Arrangement metadata management: Works, Arrangements, Voices,
 //! Tags — the catalog backbone).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,8 @@ use crate::routes::openapi::{
 };
 use crate::routes::patch::{changed_fields, present_or_null, reject_blank};
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -249,6 +251,7 @@ async fn create_work(
         (status = 200, description = "Work", body = work::Work,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         NotFound404,
     )
 )]
@@ -361,6 +364,7 @@ async fn update_work(
     responses(
         (status = 204, description = "Work deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -835,6 +839,7 @@ async fn find_arrangement_scoped_including_deleted(
         (status = 200, description = "Arrangement", body = ArrangementResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1004,6 +1009,7 @@ async fn update_arrangement(
     responses(
         (status = 204, description = "Arrangement soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -1060,6 +1066,7 @@ async fn delete_arrangement(
     responses(
         (status = 204, description = "Arrangement restored"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1414,6 +1421,7 @@ async fn find_voice_scoped_including_deleted(
         (status = 200, description = "Voice", body = VoiceResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1542,6 +1550,7 @@ async fn update_voice(
     responses(
         (status = 204, description = "Voice soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -1599,6 +1608,7 @@ async fn delete_voice(
     responses(
         (status = 204, description = "Voice restored"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1866,6 +1876,7 @@ async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag
         (status = 200, description = "Tag", body = TagResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -1978,6 +1989,7 @@ async fn update_tag(
     responses(
         (status = 204, description = "Tag soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -2032,6 +2044,7 @@ async fn delete_tag(
     responses(
         (status = 204, description = "Tag restored"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -2099,6 +2112,7 @@ async fn undelete_tag(
         (status = 200, description = "Tags attached to the arrangement",
             body = Vec<TagResponse>),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -2198,6 +2212,7 @@ async fn attach_tag(
     responses(
         (status = 204, description = "Tag detached"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )

@@ -4,6 +4,9 @@
 //! first real screens (`orgs` submodule: org/user/membership management),
 //! sharing the `layout` submodule's maud page shell.
 
+// The console renders HTML, so axum's plain-text extractor rejections are
+// fine here; clippy.toml refuses them only for the /v1 JSON tree.
+#![allow(clippy::disallowed_types)]
 // Console handlers early-return a ready-made error page as `Err(Response)`
 // (`console::enter`, `require_found`, `csrf_token`, …). clippy 1.99 flags that
 // as a large `Err` variant (an axum `Response` is ~128 bytes). Boxing it would

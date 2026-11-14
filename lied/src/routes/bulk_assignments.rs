@@ -13,7 +13,7 @@
 //! bounded by the collection's size, like the coverage report — an exception to
 //! the list-endpoint envelope recorded in CLAUDE.md.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa_axum::router::OpenApiRouter;
@@ -32,6 +32,8 @@ use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Validation400,
 };
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
