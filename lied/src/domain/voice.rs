@@ -243,7 +243,7 @@ pub async fn find_by_id_including_deleted(
     Ok(row.map(Row::into_voice))
 }
 
-/// Sort allowlist for `GET /v1/orgs/{orgId}/arrangements/{id}/voices`.
+/// Sort allowlist for `GET /v1/orgs/{orgId}/arrangements/{arrangementId}/voices`.
 /// Default sort is `name:asc`.
 // Columns are qualified with the `v.` alias because `list_for_arrangement`
 // joins `arrangement a`, and both tables have `created_at` — an unqualified

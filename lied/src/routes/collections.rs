@@ -1,4 +1,4 @@
-//! `/v1/orgs/{orgId}/collections` and `.../collections/{id}/items` — issue #9
+//! `/v1/orgs/{orgId}/collections` and `.../collections/{collectionId}/items` — issue #9
 //! (Collections + CollectionItems: program assembly and standing repertoire).
 //!
 //! Reads require any org membership (`musician`+); writes (build/edit) require
@@ -163,7 +163,7 @@ struct CreateCollectionRequest {
     collection_type: String,
 }
 
-/// Request body for `PATCH …/collections/{id}`: a partial update; an omitted
+/// Request body for `PATCH …/collections/{collectionId}`: a partial update; an omitted
 /// field is kept.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -181,10 +181,10 @@ struct UpdateCollectionRequest {
     tag = "collections",
     summary = "List collections",
     params(
-        ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"  = Uuid,           Path,  description = "Organization ID"),
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `createdAt`."),
         ("filter[type]" = Option<String>, Query, description = "Filter by type: `program` or `standing`"),
     ),
@@ -327,8 +327,8 @@ async fn create_collection(
     tag = "collections",
     summary = "Get a collection",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("collectionId"    = Uuid, Path, description = "Collection ID"),
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -358,9 +358,9 @@ async fn get_collection(
     tag = "collections",
     summary = "Update a collection",
     params(
-        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("collectionId"       = Uuid,   Path,   description = "Collection ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+        ("orgId"        = Uuid,   Path,   description = "Organization ID"),
+        ("collectionId" = Uuid,   Path,   description = "Collection ID"),
+        ("If-Match"     = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = UpdateCollectionRequest,
@@ -451,9 +451,9 @@ async fn update_collection(
     tag = "collections",
     summary = "Soft-delete a collection",
     params(
-        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("collectionId"       = Uuid,   Path,   description = "Collection ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+        ("orgId"        = Uuid,   Path,   description = "Organization ID"),
+        ("collectionId" = Uuid,   Path,   description = "Collection ID"),
+        ("If-Match"     = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -508,8 +508,8 @@ async fn delete_collection(
     tag = "collections",
     summary = "Undelete a collection",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("collectionId"    = Uuid, Path, description = "Collection ID"),
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -569,8 +569,8 @@ struct ReorderRequest {
     tag = "collections",
     summary = "Reorder collection items",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("collectionId"    = Uuid, Path, description = "Collection ID"),
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = ReorderRequest,
@@ -626,8 +626,8 @@ async fn reorder_items(
     tag = "collections",
     summary = "List collection items",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("collectionId"    = Uuid, Path, description = "Collection ID"),
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -665,8 +665,8 @@ struct CreateItemRequest {
     tag = "collections",
     summary = "Add a collection item",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("collectionId"    = Uuid, Path, description = "Collection ID"),
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = CreateItemRequest,
