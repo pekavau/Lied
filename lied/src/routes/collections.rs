@@ -27,7 +27,8 @@ use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
-    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+    CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Precondition412,
+    Validation400,
 };
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
@@ -256,6 +257,7 @@ async fn list_collections(
         (status = 201, description = "Collection created", body = collection::Collection,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -363,6 +365,7 @@ async fn get_collection(
         (status = 200, description = "Updated collection", body = collection::Collection,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -559,6 +562,7 @@ struct ReorderRequest {
     responses(
         (status = 204, description = "Items reordered"),
         CommonErrors,
+        JsonBodyErrors,
         Validation400,
         Forbidden403,
         NotFound404,
@@ -654,6 +658,7 @@ struct AddItemRequest {
         (status = 201, description = "Item added", body = collection_item::CollectionItem,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -769,6 +774,7 @@ struct UpdateItemRequest {
         (status = 200, description = "Item moved", body = collection_item::CollectionItem,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,

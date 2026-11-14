@@ -113,28 +113,40 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestId {
 /// to a fresh id if absent/unparseable. Shared by the [`RequestId`] extractor
 /// and middleware (which has `Parts`/`Request` but can't run an extractor).
 pub fn request_id_from_parts(parts: &Parts) -> Uuid {
-    parts
-        .headers
-        .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::now_v7)
+    parse_request_id(&parts.headers).unwrap_or_else(Uuid::now_v7)
 }
 
-/// Run the rest of the request with its id in [`crate::error::REQUEST_ID`],
-/// so any `AppError` rendered while serving it carries the id as the Problem
-/// Details `instance`. Sits inside [`SetRequestIdLayer`], which has already
-/// stamped the header by the time this runs.
-async fn scope_request_id(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let id = request
-        .headers()
+/// The `x-request-id` header as a UUID, if it is one.
+fn parse_request_id(headers: &axum::http::HeaderMap) -> Option<Uuid> {
+    headers
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
-        .unwrap_or_else(Uuid::now_v7);
+}
+
+/// Settle the request's id once, then run the rest of the request with it in
+/// [`crate::error::REQUEST_ID`] so any `AppError` rendered while serving it
+/// carries the id as the Problem Details `instance`.
+///
+/// [`SetRequestIdLayer`] only stamps a header that is missing; a client may
+/// send its own `x-request-id`. One that is not a UUID is replaced here, so
+/// the trace span, the audit row ([`RequestId`]), `instance` and the echoed
+/// response header all name the same id. Sits just inside
+/// `SetRequestIdLayer` and outside everything that reads the header.
+async fn scope_request_id(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = match parse_request_id(request.headers()) {
+        Some(id) => id,
+        None => {
+            let id = Uuid::now_v7();
+            if let Ok(value) = axum::http::HeaderValue::from_str(&id.to_string()) {
+                request.headers_mut().insert(REQUEST_ID_HEADER, value);
+            }
+            id
+        }
+    };
     crate::error::REQUEST_ID.scope(id, next.run(request)).await
 }
 
@@ -157,7 +169,6 @@ pub fn build_router(state: AppState) -> Router {
         .merge(v1_router)
         .merge(webdav::router(&state))
         .with_state(state)
-        .layer(axum::middleware::from_fn(scope_request_id))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
                 let request_id = request
@@ -175,6 +186,9 @@ pub fn build_router(state: AppState) -> Router {
             }),
         )
         .layer(PropagateRequestIdLayer::new(header_name.clone()))
+        // Inside SetRequestIdLayer (which stamps a missing header), outside
+        // the propagate/trace layers that read it.
+        .layer(axum::middleware::from_fn(scope_request_id))
         .layer(SetRequestIdLayer::new(header_name, MakeRequestUuid))
 }
 

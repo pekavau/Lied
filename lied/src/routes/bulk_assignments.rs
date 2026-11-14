@@ -28,7 +28,9 @@ use crate::domain::{instrument, part_assignment, user};
 use crate::error::AppError;
 use crate::routes::collections::find_collection_scoped;
 use crate::routes::json::ApiJson;
-use crate::routes::openapi::{CommonErrors, Conflict409, Forbidden403, NotFound404, Validation400};
+use crate::routes::openapi::{
+    CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Validation400,
+};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -125,7 +127,7 @@ async fn preview_bulk_assignment(
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PairRequest {
     collection_item_id: Uuid,
     voice_id: Uuid,
@@ -189,6 +191,7 @@ struct ApplyResponse {
     responses(
         (status = 200, description = "Assignments made", body = ApplyResponse),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,

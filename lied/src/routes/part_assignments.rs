@@ -35,7 +35,8 @@ use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
-    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+    CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Precondition412,
+    Validation400,
 };
 use crate::routes::patch::present_or_null;
 use crate::routes::RequestId;
@@ -191,6 +192,7 @@ struct AssignRequest {
         (status = 201, description = "Musician added to the voice", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -318,6 +320,7 @@ struct UpdateAssignmentStateRequest {
         (status = 200, description = "Updated assignment", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,

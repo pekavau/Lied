@@ -24,7 +24,9 @@ use crate::domain::{app_password, instrument};
 use crate::error::AppError;
 use crate::pagination::{Page, PageParams};
 use crate::routes::json::ApiJson;
-use crate::routes::openapi::{CommonErrors, Conflict409, NotFound404, Validation400};
+use crate::routes::openapi::{
+    CommonErrors, Conflict409, JsonBodyErrors, NotFound404, Validation400,
+};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -129,6 +131,7 @@ struct MintTokenResponse {
         // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
         // RFC 7807 ProblemDetails bodies (API guidelines §4).
         CommonErrors,
+        JsonBodyErrors,
         Validation400,
     )
 )]
@@ -257,6 +260,7 @@ struct CreateAppPasswordResponse {
         (status = 201, description = "App password created; token shown once",
             body = CreateAppPasswordResponse),
         CommonErrors,
+        JsonBodyErrors,
         Validation400,
         Conflict409,
     )

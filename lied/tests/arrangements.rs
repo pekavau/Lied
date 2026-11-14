@@ -1378,3 +1378,44 @@ async fn rejected_bodies_are_problem_details_on_create_and_patch() {
     assert_eq!(body["title"], "Bolero");
     assert_eq!(audit_count(&db.pool, "arrangement.update").await, 0);
 }
+
+#[tokio::test]
+async fn a_non_uuid_request_id_is_replaced_once_and_used_everywhere() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let uri = format!("/v1/orgs/{org_id}/arrangements");
+
+    // A refused body: the Problem Details `instance` and the echoed header agree.
+    let request = bearer_request("POST", &uri, &token)
+        .header("x-request-id", "abc-123")
+        .body(axum::body::Body::from(r#"{"arranger":"Ravel"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    let echoed = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let id = Uuid::parse_str(&echoed).expect("the echoed id is a UUID");
+    assert_eq!(
+        body_json(response).await["instance"],
+        format!("urn:uuid:{id}")
+    );
+
+    // A write: its audit row carries the same id the response echoes.
+    let request = bearer_request("POST", &uri, &token)
+        .header("x-request-id", "abc-123")
+        .body(axum::body::Body::from(r#"{"title":"Bolero"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let echoed = Uuid::parse_str(response.headers()["x-request-id"].to_str().unwrap()).unwrap();
+    let audited: Option<Uuid> =
+        sqlx::query_scalar("SELECT request_id FROM audit_log WHERE action = 'arrangement.create'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, Some(echoed));
+}

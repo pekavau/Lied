@@ -40,9 +40,13 @@ impl<T: DeserializeOwned> FromRequest<AppState> for ApiJson<T> {
             ));
         }
         let limit = usize::try_from(state.config.max_request_bytes).unwrap_or(usize::MAX);
-        let bytes = axum::body::to_bytes(request.into_body(), limit)
+        // `Limited` is applied here, from this crate's own http-body-util, so
+        // the length error it raises is the type `read_error` looks for.
+        let body = http_body_util::Limited::new(request.into_body(), limit);
+        let bytes = http_body_util::BodyExt::collect(body)
             .await
-            .map_err(|err| read_error(err, limit))?;
+            .map_err(|err| read_error(&*err, limit))?
+            .to_bytes();
         parse(&bytes).map(ApiJson)
     }
 }
@@ -62,8 +66,8 @@ fn is_json(headers: &HeaderMap) -> bool {
 }
 
 /// A body that could not be read: too large (413), or broken off mid-stream.
-fn read_error(err: axum::Error, limit: usize) -> AppError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+fn read_error(err: &(dyn std::error::Error + Send + Sync + 'static), limit: usize) -> AppError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(cause) = source {
         if cause.is::<http_body_util::LengthLimitError>() {
             return AppError::PayloadTooLarge(format!(
@@ -91,7 +95,7 @@ fn shape_or_syntax(err: serde_path_to_error::Error<serde_json::Error>) -> AppErr
     if !inner.is_data() {
         return syntax_error(&inner);
     }
-    let message = without_position(&inner.to_string());
+    let message = without_value(&without_position(&inner.to_string()));
     // A missing or unknown field is reported against its parent; name the
     // field itself, so `errors` points at what the client has to fix.
     let field = named_field(&message)
@@ -136,6 +140,33 @@ fn join(path: &str, field: &str) -> String {
         path.to_string()
     } else {
         format!("{path}.{field}")
+    }
+}
+
+/// serde's type and value errors quote what the client sent (``invalid type:
+/// integer `123456`, expected a string``). Drop the quoted value: the client
+/// knows what it sent, and the body may be a credential (`POST /v1/tokens`)
+/// that would otherwise come back in the response and in any log of it.
+/// Field names in "missing/unknown field" messages are keys, not values, and
+/// stay.
+fn without_value(message: &str) -> String {
+    let quotes_a_value = [
+        "invalid type: ",
+        "invalid value: ",
+        "unknown variant ",
+        "invalid length ",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix));
+    if !quotes_a_value {
+        return message.to_string();
+    }
+    match message.split_once('`') {
+        Some((head, rest)) => match rest.split_once('`') {
+            Some((_value, tail)) => format!("{}{}", head.trim_end(), tail),
+            None => message.to_string(),
+        },
+        None => message.to_string(),
     }
 }
 
@@ -212,6 +243,30 @@ mod tests {
         for json in ["", "{", r#"{"title":"x",}"#, r#"{"title":"x"}{}"#] {
             assert_eq!(refusal(json), (400, None), "{json:?}");
         }
+    }
+
+    #[test]
+    fn messages_do_not_echo_the_sent_value() {
+        assert_eq!(
+            without_value("invalid type: integer `123456`, expected a string"),
+            "invalid type: integer, expected a string"
+        );
+        assert_eq!(
+            without_value("unknown variant `cut`, expected one of `tempo`, `dynamics`"),
+            "unknown variant, expected one of `tempo`, `dynamics`"
+        );
+        assert_eq!(
+            without_value("unknown field `publsher`, expected `title`"),
+            "unknown field `publsher`, expected `title`"
+        );
+        let Err(AppError::Validation(report)) = parse::<Body>(br#"{"title":12345678}"#) else {
+            panic!("expected a validation error");
+        };
+        let rendered: Vec<String> = report.iter().map(|(_, e)| e.to_string()).collect();
+        assert!(
+            !rendered.iter().any(|m| m.contains("12345678")),
+            "{rendered:?}"
+        );
     }
 
     #[test]

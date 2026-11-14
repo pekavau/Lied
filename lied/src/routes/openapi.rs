@@ -136,6 +136,20 @@ pub enum UnsupportedMedia415 {
     UnsupportedMediaType(ProblemDetails),
 }
 
+/// The ways a JSON request body is refused before the handler runs (issue
+/// #62), besides the `400` every such operation also declares: too large, or
+/// not JSON at all.
+#[derive(utoipa::IntoResponses)]
+pub enum JsonBodyErrors {
+    #[response(
+        status = 413,
+        description = "Request body exceeds LIED_MAX_REQUEST_BYTES"
+    )]
+    PayloadTooLarge(ProblemDetails),
+    #[response(status = 415, description = "Request body is not `application/json`")]
+    UnsupportedMediaType(ProblemDetails),
+}
+
 /// `416 Range Not Satisfiable` — `Range` header cannot be satisfied.
 #[derive(utoipa::IntoResponses)]
 pub enum Range416 {

@@ -32,7 +32,7 @@ use crate::pagination::Page;
 use crate::routes::arrangements::find_arrangement_scoped;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
-    CommonErrors, Forbidden403, NotFound404, Precondition412, Validation400,
+    CommonErrors, Forbidden403, JsonBodyErrors, NotFound404, Precondition412, Validation400,
 };
 use crate::routes::RequestId;
 use crate::state::AppState;
@@ -214,6 +214,7 @@ struct CreateRequest {
         (status = 201, description = "Annotation created", body = GlobalAnnotation,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -323,6 +324,7 @@ struct UpdateRequest {
         (status = 200, description = "Updated annotation", body = GlobalAnnotation,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
