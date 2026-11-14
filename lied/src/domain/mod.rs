@@ -25,3 +25,36 @@ pub mod tag;
 pub mod user;
 pub mod voice;
 pub mod work;
+
+/// What an update does to one nullable field: leave it, or replace it (with
+/// `Set(None)` clearing it). The domain-side form of a PATCH field that
+/// tells *omitted* apart from `null`; a request's `Option<Option<T>>`
+/// converts straight into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change<T> {
+    /// Leave the stored value as it is.
+    Keep,
+    /// Replace it — `None` clears it.
+    Set(Option<T>),
+}
+
+impl<T> Change<T> {
+    /// The value this change leaves behind, given the current one.
+    pub fn apply(self, current: Option<T>) -> Option<T> {
+        match self {
+            Change::Keep => current,
+            Change::Set(value) => value,
+        }
+    }
+}
+
+/// Omitted (`None`) keeps; present (`Some(v)`, where `v` may be `None` for an
+/// explicit `null`) sets.
+impl<T> From<Option<Option<T>>> for Change<T> {
+    fn from(field: Option<Option<T>>) -> Self {
+        match field {
+            None => Change::Keep,
+            Some(value) => Change::Set(value),
+        }
+    }
+}

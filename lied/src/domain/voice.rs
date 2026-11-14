@@ -63,15 +63,9 @@ pub enum NewPartNumber {
     Set(Option<i16>),
 }
 
-/// What an update does to a voice's part number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartNumberChange {
-    /// Leave it as it is. A client that does not know about part numbers must
-    /// not erase one by omitting it.
-    Keep,
-    /// Replace it — `None` clears it.
-    Set(Option<i16>),
-}
+/// What an update does to a voice's part number. `Keep` matters: a client
+/// that does not know about part numbers must not erase one by omitting it.
+pub type PartNumberChange = super::Change<i16>;
 
 /// The rule the `voice.part_number` CHECK enforces, applied up front so a bad
 /// value is a clean domain error rather than a constraint violation.

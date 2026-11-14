@@ -24,7 +24,7 @@ use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
-use crate::routes::patch::{present_or_null, reject_blank};
+use crate::routes::patch::{changed_fields, present_or_null, reject_blank};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -534,6 +534,10 @@ fn arrangement_error_to_app_error(err: arrangement::ArrangementError) -> AppErro
     }
 }
 
+fn invalid_field(err: arrangement::InvalidField) -> AppError {
+    AppError::field(err.field, &err.message)
+}
+
 /// A single-field `garde::Report`, for the filter parse errors below.
 fn field_report(field: &str, message: &str) -> garde::Report {
     let mut report = garde::Report::new();
@@ -726,43 +730,30 @@ async fn create_arrangement(
 ) -> Result<(StatusCode, Json<ArrangementResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
-    if body.title.trim().is_empty() {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("title"),
-            garde::Error::new("title must not be empty"),
-        );
-        return Err(AppError::Validation(report));
-    }
-
     let id = Uuid::now_v7();
     let slug = arrangement::slugify(&body.title);
     let status = body.status.as_deref().unwrap_or("active");
 
-    let created = arrangement::create(
-        &state.db,
-        id,
-        org_id,
-        &slug,
-        arrangement::ArrangementFields {
-            title: &body.title,
-            work_id: body.work_id,
-            instrumentation: body.instrumentation.as_deref(),
-            arranger: body.arranger.as_deref(),
-            publisher: body.publisher.as_deref(),
-            purchase_date: body.purchase_date,
-            license_notes: body.license_notes.as_deref(),
-            copy_count_allowed: body.copy_count_allowed,
-            status,
-            duration_seconds: body.duration_seconds,
-            difficulty: body.difficulty,
-            difficulty_ratings: body.difficulty_ratings.clone(),
-            difficulty_notes: body.difficulty_notes.as_deref(),
-        },
-        Some(auth.user.id),
-    )
-    .await
-    .map_err(arrangement_error_to_app_error)?;
+    let fields = arrangement::ArrangementFields {
+        title: &body.title,
+        work_id: body.work_id,
+        instrumentation: body.instrumentation.as_deref(),
+        arranger: body.arranger.as_deref(),
+        publisher: body.publisher.as_deref(),
+        purchase_date: body.purchase_date,
+        license_notes: body.license_notes.as_deref(),
+        copy_count_allowed: body.copy_count_allowed,
+        status,
+        duration_seconds: body.duration_seconds,
+        difficulty: body.difficulty,
+        difficulty_ratings: body.difficulty_ratings.clone(),
+        difficulty_notes: body.difficulty_notes.as_deref(),
+    };
+    arrangement::validate(&fields).map_err(invalid_field)?;
+
+    let created = arrangement::create(&state.db, id, org_id, &slug, fields, Some(auth.user.id))
+        .await
+        .map_err(arrangement_error_to_app_error)?;
 
     audit(
         &state.db,
@@ -878,8 +869,6 @@ async fn update_arrangement(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    reject_blank("title", body.title.as_deref())?;
-
     let title = body.title.unwrap_or_else(|| current.title.clone());
     let status = body.status.unwrap_or_else(|| current.status.clone());
     let work_id = body.work_id.unwrap_or(current.work_id);
@@ -925,28 +914,29 @@ async fn update_arrangement(
         ));
     }
 
-    let updated = arrangement::update(
-        &state.db,
-        id,
-        arrangement::ArrangementFields {
-            title: &title,
-            work_id,
-            instrumentation: instrumentation.as_deref(),
-            arranger: arranger.as_deref(),
-            publisher: publisher.as_deref(),
-            purchase_date,
-            license_notes: license_notes.as_deref(),
-            copy_count_allowed,
-            status: &status,
-            duration_seconds,
-            difficulty,
-            difficulty_ratings,
-            difficulty_notes: difficulty_notes.as_deref(),
-        },
-    )
-    .await
-    .map_err(arrangement_error_to_app_error)?
-    .ok_or(AppError::NotFound)?;
+    let fields = arrangement::ArrangementFields {
+        title: &title,
+        work_id,
+        instrumentation: instrumentation.as_deref(),
+        arranger: arranger.as_deref(),
+        publisher: publisher.as_deref(),
+        purchase_date,
+        license_notes: license_notes.as_deref(),
+        copy_count_allowed,
+        status: &status,
+        duration_seconds,
+        difficulty,
+        difficulty_ratings,
+        difficulty_notes: difficulty_notes.as_deref(),
+    };
+    // On the merged row: a field can be fine alone yet disagree with one the
+    // client did not send (a new difficulty against the stored ABRSM rating).
+    arrangement::validate(&fields).map_err(invalid_field)?;
+
+    let updated = arrangement::update(&state.db, id, fields)
+        .await
+        .map_err(arrangement_error_to_app_error)?
+        .ok_or(AppError::NotFound)?;
 
     audit(
         &state.db,
@@ -958,10 +948,9 @@ async fn update_arrangement(
         "arrangement.update",
         "arrangement",
         Some(id),
-        serde_json::json!({
-            "before": { "title": current.title, "status": current.status },
-            "after": { "title": updated.title, "status": updated.status },
-        }),
+        // Every field this write changed, so a PATCH that clears licence
+        // notes keeps the erased text in the log.
+        changed_fields(&current, &updated),
     )
     .await;
 
@@ -1461,19 +1450,10 @@ async fn update_voice(
         return Ok(etag_response(VoiceResponse::from(current), updated_at));
     }
 
-    let updated = voice::update(
-        &state.db,
-        id,
-        &name,
-        instrument_id,
-        match body.part_number {
-            None => voice::PartNumberChange::Keep,
-            Some(n) => voice::PartNumberChange::Set(n),
-        },
-    )
-    .await
-    .map_err(voice_error_to_app_error)?
-    .ok_or(AppError::NotFound)?;
+    let updated = voice::update(&state.db, id, &name, instrument_id, body.part_number.into())
+        .await
+        .map_err(voice_error_to_app_error)?
+        .ok_or(AppError::NotFound)?;
 
     audit(
         &state.db,
