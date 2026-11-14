@@ -571,7 +571,7 @@ async fn post_v1_tokens_with_bad_password_returns_401() {
 }
 
 /// Creating two app passwords with the same name for one user clashes on the
-/// `(user_id, name)` unique index. The contract (API guidelines §4.1, and the
+/// `(user_id, name)` unique index. The contract (the
 /// `#[utoipa::path]` on the handler) is `409 Conflict` with an RFC 7807 body —
 /// not `412`, which is reserved for `If-Match` preconditions this endpoint
 /// doesn't have. Regression guard for the spec-vs-behavior drift fixed here.

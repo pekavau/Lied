@@ -126,13 +126,17 @@ struct MintTokenResponse {
     summary = "Mint a bearer token",
     description = "Authenticate via an existing session cookie (common path: logged into admin UI) \
                    or via `username`+`password` in the body (programmatic path). \
+                   Hence the security list: anonymous (with credentials in the body) \
+                   or a `session` cookie; a bearer token is not accepted here. \
                    The returned token is valid for the configured lifetime (default 30 days).",
-    security(),
+    // `()` = anonymous allowed (credentials in the body); `session` = an
+    // existing admin-console cookie, which `mint_token` checks first.
+    security((), ("session" = [])),
     request_body = MintTokenRequest,
     responses(
         (status = 200, description = "Bearer JWT minted", body = MintTokenResponse),
         // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
-        // RFC 7807 ProblemDetails bodies (API guidelines §4).
+        // RFC 7807 ProblemDetails bodies.
         CommonErrors,
         JsonBodyErrors,
         Validation400,

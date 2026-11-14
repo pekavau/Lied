@@ -18,8 +18,8 @@ It is designed to be **run by the ensemble that uses it** — a single container
 Postgres, and object storage, with no mandatory cloud dependency.
 
 > **Status:** early and under active development. The core archivist → musician
-> workflow works end-to-end (see [Roadmap](#roadmap)); the desktop management
-> console and richer search are being built now. There is no dedicated musician
+> workflow works end-to-end, as do the desktop management console and archive
+> search (see [Roadmap](#roadmap)). There is no dedicated musician
 > app yet — musicians use existing WebDAV-capable readers. Expect breaking
 > changes before a 1.0.
 
@@ -84,8 +84,8 @@ swapped for any S3-compatible store without code changes.
 
 The full design rationale — data model, authorization, non-functional posture,
 and the phased delivery plan — lives in [`CLAUDE.md`](CLAUDE.md), which is the
-project's design spec. The HTTP/API conventions are in
-[`docs/api-guidelines.md`](docs/api-guidelines.md).
+project's design spec, including the HTTP/API conventions. How to add or
+change a `/v1` endpoint is in [`docs/api-guidelines.md`](docs/api-guidelines.md).
 
 ### Tech stack
 
@@ -186,7 +186,7 @@ Lied is built in phases; the data model already accommodates the later ones.
   piece, build a concert program, assign parts, and have each musician open
   their part over WebDAV. Full schema, local auth, REST API, WebDAV, and a
   minimal admin UI.
-- **Phase 2 — in progress.** A feature-complete management/curation console for
+- **Phase 2 — complete.** A feature-complete management/curation console for
   desktop personas, plus real archive search (full-text + fuzzy), the
   section-coverage check, and global-annotation authoring.
 - **Phase 3+ — planned.** A dedicated cross-platform musician/reader client;
