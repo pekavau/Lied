@@ -606,60 +606,61 @@ fn sort_and_filter_docs_match_the_allowlists() {
     };
     type Sort = &'static [(&'static str, &'static str)];
     type Filter = &'static [&'static str];
-    let lists: &[(&str, Sort, Filter, &str)] = &[
+    type Default = (&'static str, lied::listing::SortDirection);
+    let lists: &[(&str, Sort, Filter, Default)] = &[
         (
             "/v1/works",
             work::SORT_ALLOWLIST,
             work::FILTER_ALLOWLIST,
-            "title",
+            work::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/arrangements",
             arrangement::SORT_ALLOWLIST,
             arrangement::FILTER_ALLOWLIST,
-            "title",
+            arrangement::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/arrangements/{id}/voices",
             voice::SORT_ALLOWLIST,
             voice::FILTER_ALLOWLIST,
-            "name",
+            voice::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/tags",
             tag::SORT_ALLOWLIST,
             tag::FILTER_ALLOWLIST,
-            "name",
+            tag::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/collections",
             collection::SORT_ALLOWLIST,
             collection::FILTER_ALLOWLIST,
-            "name",
+            collection::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations",
             global_annotation::SORT_ALLOWLIST,
             global_annotation::FILTER_ALLOWLIST,
-            "createdAt",
+            global_annotation::DEFAULT_SORT,
         ),
         (
             "/v1/orgs",
             organization::SORT_ALLOWLIST,
             organization::FILTER_ALLOWLIST,
-            "name",
+            organization::DEFAULT_SORT,
         ),
         (
             "/v1/users",
             user::SORT_ALLOWLIST,
             user::FILTER_ALLOWLIST,
-            "username",
+            user::DEFAULT_SORT,
         ),
         (
             "/v1/orgs/{orgId}/members",
             membership::SORT_ALLOWLIST,
             membership::FILTER_ALLOWLIST,
-            "createdAt",
+            membership::DEFAULT_SORT,
         ),
     ];
 
@@ -692,7 +693,7 @@ fn sort_and_filter_docs_match_the_allowlists() {
         let description = sort.and_then(|s| s["description"].as_str()).unwrap_or("");
         let allowed_part = description
             .split_once("Allowed fields: ")
-            .map(|(_, rest)| rest.split_once('.').map_or(rest, |(list, _)| list))
+            .map(|(_, rest)| rest.split_once(". ").map_or(rest, |(list, _)| list))
             .unwrap_or("");
         let documented: std::collections::BTreeSet<String> = allowed_part
             .split('`')
@@ -709,9 +710,23 @@ fn sort_and_filter_docs_match_the_allowlists() {
                 "{path}: sort documents {documented:?}, allowlist accepts {accepted:?}"
             ));
         }
-        if !allowed_part.contains(&format!("`{default}` (default")) {
+        // The default is a SQL column; the docs name its wire field.
+        let (column, direction) = default;
+        let Some((wire, _)) = sort_allow.iter().find(|(_, c)| c == column) else {
             problems.push(format!(
-                "{path}: sort description does not name `{default}` as the default"
+                "{path}: DEFAULT_SORT column {column} is not in the allowlist"
+            ));
+            continue;
+        };
+        let word = match direction {
+            lied::listing::SortDirection::Asc => "ascending",
+            lied::listing::SortDirection::Desc => "descending",
+        };
+        if allowed_part.matches("(default").count() != 1
+            || !allowed_part.contains(&format!("`{wire}` (default, {word})"))
+        {
+            problems.push(format!(
+                "{path}: sort description must name `{wire}` (default, {word}) and no other default"
             ));
         }
 
@@ -723,11 +738,12 @@ fn sort_and_filter_docs_match_the_allowlists() {
             ));
         }
     }
-    assert_eq!(
-        documented_lists,
-        lists.len(),
-        "list operations found vs. table"
-    );
+    if documented_lists != lists.len() {
+        problems.push(format!(
+            "{documented_lists} list operations document sort/filter; the table has {}",
+            lists.len()
+        ));
+    }
     assert!(
         problems.is_empty(),
         "Sort/filter docs drift:\n{}",

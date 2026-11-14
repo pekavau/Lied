@@ -18,7 +18,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{arrangement, tag, voice, work};
 use crate::error::AppError;
-use crate::listing::{self, SortDirection};
+use crate::listing;
 use crate::listing::{etag_response, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
@@ -109,7 +109,7 @@ struct UpdateWorkRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `title` (default, ascending), `composer`, `createdAt`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `title` (default, ascending), `composer`, `createdAt`."),
         ("filter[title]"    = Option<String>, Query, description = "ILIKE filter on title"),
         ("filter[composer]" = Option<String>, Query, description = "ILIKE filter on composer"),
     ),
@@ -134,12 +134,9 @@ async fn list_works(
     }
     .resolve(state.config.default_page_size, state.config.max_page_size);
 
-    let (sort_column, sort_direction) = listing::resolve_sort(
-        q.sort.as_deref(),
-        work::SORT_ALLOWLIST,
-        ("title", SortDirection::Asc),
-    )
-    .map_err(validation_error)?;
+    let (sort_column, sort_direction) =
+        listing::resolve_sort(q.sort.as_deref(), work::SORT_ALLOWLIST, work::DEFAULT_SORT)
+            .map_err(validation_error)?;
 
     let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =
@@ -645,7 +642,7 @@ fn build_search<'a>(
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `title` (default, ascending), `createdAt`, `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` means best match first; without `q` it falls back to the default."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `title` (default, ascending), `createdAt`, `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` sorts best match first (descending); without `q` it falls back to the default."),
         ("q" = Option<String>, Query,
             description = "Search across title, composer, arranger, tag names and instrumentation \
                            (full text, accent-insensitive), plus fuzzy matching on title and \
@@ -693,7 +690,7 @@ async fn list_arrangements(
     let (sort_column, sort_direction) = arrangement::resolve_search_sort(
         q.sort.as_deref(),
         q.q.as_deref().is_some_and(|value| !value.is_empty()),
-        ("a.title", SortDirection::Asc),
+        arrangement::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
 
@@ -1214,8 +1211,8 @@ struct VoiceListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `createdAt`."),
-        ("filter[instrumentId]" = Option<String>, Query,
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `createdAt`."),
+        ("filter[instrumentId]" = Option<Uuid>, Query,
             description = "Filter by instrument UUID"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1248,7 +1245,7 @@ async fn list_voices(
     let (sort_column, sort_direction) = listing::resolve_sort(
         q.sort.as_deref(),
         voice::SORT_ALLOWLIST,
-        ("v.name", SortDirection::Asc),
+        voice::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
 
@@ -1719,7 +1716,7 @@ struct TagListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `kind`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `kind`."),
         ("filter[kind]" = Option<String>, Query,
             description = "Filter by tag kind, e.g. `theme`, `mood`, `era`"),
     ),
@@ -1747,12 +1744,9 @@ async fn list_tags(
     }
     .resolve(state.config.default_page_size, state.config.max_page_size);
 
-    let (sort_column, sort_direction) = listing::resolve_sort(
-        q.sort.as_deref(),
-        tag::SORT_ALLOWLIST,
-        ("name", SortDirection::Asc),
-    )
-    .map_err(validation_error)?;
+    let (sort_column, sort_direction) =
+        listing::resolve_sort(q.sort.as_deref(), tag::SORT_ALLOWLIST, tag::DEFAULT_SORT)
+            .map_err(validation_error)?;
 
     let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =

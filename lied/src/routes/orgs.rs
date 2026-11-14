@@ -24,7 +24,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{organization, user};
 use crate::error::AppError;
-use crate::listing::{self, etag_response, if_match_header, SortDirection};
+use crate::listing::{self, etag_response, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
@@ -138,7 +138,7 @@ async fn user_by_id(state: &AppState, id: Uuid) -> Result<user::User, AppError> 
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `slug`, `createdAt`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `slug`, `createdAt`."),
         ("filter[name]" = Option<String>, Query,
             description = "ILIKE filter on organization name"),
     ),
@@ -166,7 +166,7 @@ async fn list_orgs(
     let (sort_column, sort_direction) = listing::resolve_sort(
         q.sort.as_deref(),
         organization::SORT_ALLOWLIST,
-        ("name", SortDirection::Asc),
+        organization::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
 
@@ -465,7 +465,7 @@ struct CreateUserRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `username` (default, ascending), `displayName`, `createdAt`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `username` (default, ascending), `displayName`, `createdAt`."),
         ("filter[username]" = Option<String>, Query,
             description = "ILIKE filter on username"),
     ),
@@ -492,12 +492,9 @@ async fn list_users(
     }
     .resolve(state.config.default_page_size, state.config.max_page_size);
 
-    let (sort_column, sort_direction) = listing::resolve_sort(
-        q.sort.as_deref(),
-        user::SORT_ALLOWLIST,
-        ("username", SortDirection::Asc),
-    )
-    .map_err(validation_error)?;
+    let (sort_column, sort_direction) =
+        listing::resolve_sort(q.sort.as_deref(), user::SORT_ALLOWLIST, user::DEFAULT_SORT)
+            .map_err(validation_error)?;
 
     let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =
@@ -790,7 +787,7 @@ struct UpdateMemberRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `createdAt` (default, ascending), `role`, `isPrincipal`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `createdAt` (default, ascending), `role`, `isPrincipal`."),
         ("filter[role]" = Option<String>, Query,
             description = "Filter by role: `owner`, `archivist`, `conductor`, `musician`"),
     ),
@@ -821,7 +818,7 @@ async fn list_members(
     let (sort_column, sort_direction) = listing::resolve_sort(
         q.sort.as_deref(),
         membership::SORT_ALLOWLIST,
-        ("created_at", SortDirection::Asc),
+        membership::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
 

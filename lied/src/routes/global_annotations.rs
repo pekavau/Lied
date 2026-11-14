@@ -27,7 +27,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::global_annotation::{self, GlobalAnnotation, GlobalAnnotationError, WriteError};
 use crate::domain::membership::Role;
 use crate::error::AppError;
-use crate::listing::{self, etag_response, etag_response_status, if_match_header, SortDirection};
+use crate::listing::{self, etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::arrangements::find_arrangement_scoped;
 use crate::routes::json::ApiJson;
@@ -119,7 +119,7 @@ struct ListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `createdAt` (default, ascending), `updatedAt`, `type`."),
+            description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `createdAt` (default, ascending), `updatedAt`, `type`."),
         ("filter[type]" = Option<String>, Query,
             description = "One of `tempo`, `dynamics`, `articulation`, `structure`, `general`"),
     ),
@@ -151,7 +151,7 @@ async fn list_annotations(
     let (sort_column, sort_direction) = listing::resolve_sort(
         q.sort.as_deref(),
         global_annotation::SORT_ALLOWLIST,
-        ("createdAt", SortDirection::Asc),
+        global_annotation::DEFAULT_SORT,
     )
     .map_err(AppError::Validation)?;
     let sort = global_annotation::SortField::from_key(sort_column)
