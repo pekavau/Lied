@@ -593,3 +593,144 @@ fn every_path_parameter_is_a_uuid() {
         violations.join("\n")
     );
 }
+
+/// Issue #71: a list operation documents exactly the sort and filter fields
+/// its allowlist accepts, and names the default sort. The descriptions are
+/// prose, so without this they drifted (`created_at` documented, only
+/// `createdAt` accepted).
+#[test]
+fn sort_and_filter_docs_match_the_allowlists() {
+    use lied::domain::{
+        arrangement, collection, global_annotation, membership, organization, tag, user, voice,
+        work,
+    };
+    type Sort = &'static [(&'static str, &'static str)];
+    type Filter = &'static [&'static str];
+    let lists: &[(&str, Sort, Filter, &str)] = &[
+        (
+            "/v1/works",
+            work::SORT_ALLOWLIST,
+            work::FILTER_ALLOWLIST,
+            "title",
+        ),
+        (
+            "/v1/orgs/{orgId}/arrangements",
+            arrangement::SORT_ALLOWLIST,
+            arrangement::FILTER_ALLOWLIST,
+            "title",
+        ),
+        (
+            "/v1/orgs/{orgId}/arrangements/{id}/voices",
+            voice::SORT_ALLOWLIST,
+            voice::FILTER_ALLOWLIST,
+            "name",
+        ),
+        (
+            "/v1/orgs/{orgId}/tags",
+            tag::SORT_ALLOWLIST,
+            tag::FILTER_ALLOWLIST,
+            "name",
+        ),
+        (
+            "/v1/orgs/{orgId}/collections",
+            collection::SORT_ALLOWLIST,
+            collection::FILTER_ALLOWLIST,
+            "name",
+        ),
+        (
+            "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations",
+            global_annotation::SORT_ALLOWLIST,
+            global_annotation::FILTER_ALLOWLIST,
+            "createdAt",
+        ),
+        (
+            "/v1/orgs",
+            organization::SORT_ALLOWLIST,
+            organization::FILTER_ALLOWLIST,
+            "name",
+        ),
+        (
+            "/v1/users",
+            user::SORT_ALLOWLIST,
+            user::FILTER_ALLOWLIST,
+            "username",
+        ),
+        (
+            "/v1/orgs/{orgId}/members",
+            membership::SORT_ALLOWLIST,
+            membership::FILTER_ALLOWLIST,
+            "createdAt",
+        ),
+    ];
+
+    let json = build_openapi_json();
+    let mut problems = Vec::new();
+    let mut documented_lists = 0;
+    for (path, item) in json["paths"].as_object().expect("paths object") {
+        let Some(params) = item["get"]["parameters"].as_array() else {
+            continue;
+        };
+        let sort = params.iter().find(|p| p["name"] == "sort");
+        let filters: std::collections::BTreeSet<String> = params
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .filter_map(|n| n.strip_prefix("filter[")?.strip_suffix(']'))
+            .map(str::to_string)
+            .collect();
+        if sort.is_none() && filters.is_empty() {
+            continue;
+        }
+        documented_lists += 1;
+        let Some((_, sort_allow, filter_allow, default)) = lists.iter().find(|(p, ..)| p == path)
+        else {
+            problems.push(format!(
+                "{path}: sorts or filters, but is not in this test's table"
+            ));
+            continue;
+        };
+
+        let description = sort.and_then(|s| s["description"].as_str()).unwrap_or("");
+        let allowed_part = description
+            .split_once("Allowed fields: ")
+            .map(|(_, rest)| rest.split_once('.').map_or(rest, |(list, _)| list))
+            .unwrap_or("");
+        let documented: std::collections::BTreeSet<String> = allowed_part
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        let accepted: std::collections::BTreeSet<String> = sort_allow
+            .iter()
+            .map(|(wire, _)| wire.to_string())
+            .collect();
+        if documented != accepted {
+            problems.push(format!(
+                "{path}: sort documents {documented:?}, allowlist accepts {accepted:?}"
+            ));
+        }
+        if !allowed_part.contains(&format!("`{default}` (default")) {
+            problems.push(format!(
+                "{path}: sort description does not name `{default}` as the default"
+            ));
+        }
+
+        let allowed_filters: std::collections::BTreeSet<String> =
+            filter_allow.iter().map(|f| f.to_string()).collect();
+        if filters != allowed_filters {
+            problems.push(format!(
+                "{path}: filters documented {filters:?}, allowlist accepts {allowed_filters:?}"
+            ));
+        }
+    }
+    assert_eq!(
+        documented_lists,
+        lists.len(),
+        "list operations found vs. table"
+    );
+    assert!(
+        problems.is_empty(),
+        "Sort/filter docs drift:\n{}",
+        problems.join("\n")
+    );
+}

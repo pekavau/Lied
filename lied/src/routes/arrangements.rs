@@ -109,7 +109,7 @@ struct UpdateWorkRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `title` (default asc), `created_at`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `title` (default, ascending), `composer`, `createdAt`."),
         ("filter[title]"    = Option<String>, Query, description = "ILIKE filter on title"),
         ("filter[composer]" = Option<String>, Query, description = "ILIKE filter on composer"),
     ),
@@ -645,9 +645,7 @@ fn build_search<'a>(
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `title` (default asc), `createdAt`, \
-                           `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` means \
-                           best-match first; without `q` it falls back to `title:asc`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `title` (default, ascending), `createdAt`, `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` means best match first; without `q` it falls back to the default."),
         ("q" = Option<String>, Query,
             description = "Search across title, composer, arranger, tag names and instrumentation \
                            (full text, accent-insensitive), plus fuzzy matching on title and \
@@ -1216,7 +1214,7 @@ struct VoiceListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `name` (default asc), `created_at`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `createdAt`."),
         ("filter[instrumentId]" = Option<String>, Query,
             description = "Filter by instrument UUID"),
     ),
@@ -1721,7 +1719,7 @@ struct TagListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `name` (default asc), `kind`, `created_at`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `kind`."),
         ("filter[kind]" = Option<String>, Query,
             description = "Filter by tag kind, e.g. `theme`, `mood`, `era`"),
     ),
