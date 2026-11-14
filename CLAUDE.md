@@ -121,7 +121,7 @@ Lied app (Rust + axum)         ← serves both interfaces
 
 **Authentication:**
 - Local accounts (username/password, argon2id hashing) are the baseline — required for self-hostable deployments without external dependencies.
-- OIDC is an optional, configurable second auth method for orgs that want SSO. When OIDC is configured, **local login stays available as a fallback by default** — the break-glass path if the IdP is misconfigured or down. Account linking is by matching verified `email`. A per-org "disable local auth" (SSO-only) policy is a phase-2 toggle; phase 1 keeps both paths to avoid lockout on self-hosted instances.
+- OIDC is an optional, configurable second auth method for orgs that want SSO. When OIDC is configured, **local login stays available as a fallback by default** — the break-glass path if the IdP is misconfigured or down. Account linking is by matching verified `email`. OIDC itself is deferred (see Phase cuts); a per-org "disable local auth" (SSO-only) policy is a later toggle on top of it, and until then both paths stay to avoid lockout on self-hosted instances.
 - WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
 - REST API uses session cookies (web client) or bearer tokens (programmatic).
 
@@ -134,7 +134,7 @@ Lied app (Rust + axum)         ← serves both interfaces
 
 These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fragments and is exempt where noted.
 
-- **Pagination.** List endpoints (arrangements, voices, files, members, audit log, …) use **offset/limit**: `GET /v1/arrangements?limit=50&offset=0`. Response is an envelope: `{ "items": [...], "total": N, "limit": L, "offset": O }`. Default `limit` = 50, max = 200 (configurable via `LIED_MAX_PAGE_SIZE`). Cursor pagination was rejected for phase 1: offset gives a cheap `total` for "page 3 of 7" UIs and the concurrent-insert inconsistency window is irrelevant at our scale. Switching to an optional cursor later is additive, not breaking. **Exception — per-collection reports** (the coverage report, the bulk-assignment preview) return every piece unpaginated: they are bounded by one collection's size, and a report split across pages cannot be read as a whole.
+- **Pagination.** List endpoints (arrangements, voices, files, members, …) use **offset/limit**: `GET /v1/arrangements?limit=50&offset=0`. Response is an envelope: `{ "items": [...], "total": N, "limit": L, "offset": O }`. Default `limit` = 50, max = 200 (configurable via `LIED_MAX_PAGE_SIZE`). Cursor pagination was rejected for phase 1: offset gives a cheap `total` for "page 3 of 7" UIs and the concurrent-insert inconsistency window is irrelevant at our scale. Switching to an optional cursor later is additive, not breaking. **Exception — per-collection reports** (the coverage report, the bulk-assignment preview) return every piece unpaginated: they are bounded by one collection's size, and a report split across pages cannot be read as a whole.
 - **Optimistic concurrency.** Mutating requests use **ETags derived from `updated_at`** (millisecond epoch). GET returns `ETag: "<ms>"`; `PATCH`/`PUT`/`DELETE` MUST send `If-Match`; a stale value → **`412 Precondition Failed`**. Applies to every mutable entity carrying `updated_at` (Arrangement, Voice, Collection, CollectionItem, GlobalAnnotation, and Work, Tag, Organization, User, Membership, PartAssignment). **Files take no `If-Match`:** a `File` row is never edited in place (replace inserts a new row and soft-deletes the old), so its id is its version, and a second replace or delete of the same id finds it gone (404). HTMX forms carry the ETag in a hidden field. **The check is enforced inside the write itself** (issue #64): every domain update/delete takes the caller's version and adds `floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` to its `WHERE` (a cascade locks the row at that version first, `SELECT … FOR UPDATE`), so two writers holding one ETag cannot both pass a read-time check and both write; the loser gets 412 (or 404 if the row went away), the console its "changed by someone else" page. Console **buttons** (delete, restore, mark notified/acknowledged) carry no version and stay unconditional — only the edit forms send one. A dedicated `version` column was rejected as redundant — `updated_at` already exists everywhere and ms precision catches concurrent edits.
 - **PATCH is a partial update** (issue #23). Every `PATCH` body is its own DTO, distinct from the create body: an **omitted field is kept**; on a nullable field an explicit **`null` clears** it, while on a field the model requires `null` is the same as omitting it (a required text field may be changed but not blanked). Unknown fields are refused, as on every `/v1` body (see Error response shape). Validation runs on the **merged row** the write would leave behind, not on the patch alone — a field fine on its own can disagree with one the client did not send (a new `difficulty` against the stored ABRSM rating); likewise, narrowing a member's `instrumentIds` without restating `principalInstrumentIds` drops the instruments no longer played from the principal list. A `PATCH` that changes nothing **writes nothing** — no `updated_at` bump (the ETag stays), no audit row — and every `PATCH` response carries the new `ETag`. The OpenAPI spec declares no required property on any `PATCH` body, and a test pins that. Full-replace bodies were rejected because a client changing one field had to resend the rest, and omitting a nullable field (an arrangement's publisher, licence notes, …) erased it.
 - **Error response shape.** All `/v1` errors use **RFC 7807 Problem Details** (`application/problem+json`): `{ "type", "title", "status", "detail", "instance" }`, where `type` is a stable URI (e.g. `https://lied/errors/precondition-failed`) and `instance` carries the request-ID for log correlation (`urn:uuid:<id>`, the same id as the `x-request-id` response header, the trace span and the audit row's `request_id`; a client-sent id that is not a UUID is replaced once, up front; a task-local set by router middleware lets any `AppError` read it). The single top-level `AppError` (see Error handling) emits this. **Request bodies** go through one extractor, `ApiJson` (issue #62), never axum's `Json`, whose rejections are plain text: a non-JSON `Content-Type` → 415, a body over `LIED_MAX_REQUEST_BYTES` → 413, unparseable JSON → 400 `bad-request`, and valid JSON of the wrong shape (missing, unknown or wrong-typed field) → 400 `validation-failed` with the field's wire path in `errors`. Messages never echo the value the client sent (it may be a password). **Path and query parameters** likewise go through `ApiPath` / `ApiQuery` (issue #66): a malformed one is a 400 `validation-failed` naming it — the route's `{orgId}` or the query key — and a malformed path id is deliberately a 400, not a 404 (the request is malformed; nothing was addressed). `clippy.toml` refuses axum's own `Path`/`Query` outside the console (`disallowed-types`), so no `/v1` handler can fall back to the plain-text rejections. **Every `/v1` request body refuses unknown fields** (`deny_unknown_fields`), create bodies included, so a misspelled key is an error rather than a silently dropped value. HTMX error responses are HTML fragments, not Problem Details.
@@ -181,7 +181,7 @@ Canonical directory tree (also the public contract for external tools mounting t
     library/                                ← personal/private files (solo practice)
 ```
 
-- All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. Renaming a slug is a separate, explicit REST operation (admin-gated: requires `Membership.role = owner` for org-scoped entities, or `is_system_admin` for User and Instrument), audited, and reserved for fixing typos. It performs an atomic move of all affected MinIO objects to the new prefix and updates the entity's `slug` field in one transaction; cached WebDAV mounts pointing at the old slug will break.
+- All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. Renaming a slug *(not yet built)* is a separate, explicit REST operation (admin-gated: requires `Membership.role = owner` for org-scoped entities, or `is_system_admin` for User and Instrument), audited, and reserved for fixing typos. It performs an atomic move of all affected MinIO objects to the new prefix and updates the entity's `slug` field in one transaction; cached WebDAV mounts pointing at the old slug will break.
 - Soft-deleted rows (`deleted_at != NULL`) are hidden from WebDAV listings.
 - The `/orgs/<org>/collections/` subtree is a read-only computed view. Writes go through `/orgs/<org>/arrangements/`.
 - **Collections subtree visibility (auth-filtered):**
@@ -200,9 +200,9 @@ Musicians can use existing apps against the WebDAV interface:
 
 A purpose-built display/reader app is a future consideration, not an initial requirement.
 
-### MCP server (deferred — phase 2)
+### MCP server (deferred — see Phase cuts)
 
-An optional **Model Context Protocol server** is planned for phase 2, exposing the
+An optional **Model Context Protocol server** is planned, exposing the
 archive to LLM clients (Claude Desktop, Claude Code, etc.) as a fifth route tree
 (`/mcp`) alongside `/admin`, `/v1`, WebDAV, and infra. It is **not** a new domain
 layer — it is a thin adapter over the existing `/v1` surface and the
@@ -213,9 +213,8 @@ domain/service functions, surfacing:
 - **Resources** — score / voice files exposed as fetchable MCP resources
   (aligns with the "open protocols, music accessible without the app" principle).
 
-**What it needs (and why phase 1 doesn't have to change):** nothing in the
-phase-1 plan forecloses it, because its three prerequisites are already phase-1
-commitments —
+**What it needs (and why nothing built so far has to change):** nothing in the
+plan forecloses it, because its three prerequisites are already in place —
 1. a **complete, accurate OpenAPI spec** as the source MCP tool schemas are
    derived/generated from (see `docs/api-guidelines.md`; this is exactly why API
    completeness is enforced);
@@ -224,8 +223,8 @@ commitments —
 3. **bearer-JWT auth with `org`-scoped claims** (issue #4), reused directly.
 
 Deferred on maturity grounds too: MCP's auth/transport story is still settling,
-and it adds nothing to the phase-1 archivist→musician payoff. Build it once `/v1`
-is finished and the spec is complete.
+and it adds nothing to the archivist→musician loop. Build it on top of the
+finished `/v1` surface and its complete spec.
 
 ---
 
@@ -266,7 +265,7 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 - **`testcontainers`** for ephemeral Postgres + MinIO in integration tests; no fixture pollution between tests.
 - **`insta`** for snapshot tests of REST response shapes.
 
-### Deferred (phase 2+)
+### Deferred (see Phase cuts)
 - **Audiveris** (Java, separate container) — OMR for PDF/image → MusicXML.
 - **`openidconnect`** — OIDC client when SSO becomes a need.
 
@@ -303,7 +302,7 @@ Anything that stands in for "external system that could be swapped" (session sto
   - **OK to lose on restore:** in-memory rate-limit state (acceptable), session cookies (users re-login).
   - A `just backup` target wraps the two commands against the docker-compose volumes.
 
-  **Not promised in phase 1:** point-in-time recovery, continuous WAL streaming, cross-region replication, automated restore verification, a backup-orchestration tool. Those are phase-2 runbook items.
+  **Not promised in phase 1:** point-in-time recovery, continuous WAL streaming, cross-region replication, automated restore verification, a backup-orchestration tool. Those are later runbook items (deferred).
 
 ### Default limits (all configurable)
 
@@ -343,18 +342,18 @@ Anything that stands in for "external system that could be swapped" (session sto
   - **Authorization events:** Membership create/update/delete, role change, principal-flag change, instrument-assignment change.
   - **Content writes:** create / update / soft-delete / hard-delete / undelete on Arrangement, Work, Voice, File, Collection, CollectionItem, PartAssignment (including `notified_at`/`acknowledged_at`), Tag, ArrangementTag, GlobalAnnotation, Instrument.
   - **Admin events:** org create/delete, user create/delete, system-admin grants, slug renames, secret rotation events.
-  - **Reads are NOT logged** in phase 1 — too noisy, low signal. Reserved for phase 2 if compliance requires.
+  - **Reads are NOT logged** in phase 1 — too noisy, low signal. Reserved for a later phase if compliance requires.
 
   Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span). For writes to instance-wide entities (`Work`, `Instrument`), `org_id` is `NULL` regardless of which org the actor was operating from — instance-wide events are not attributed to an org.
 
   **Redaction policy.** Before any `payload` is written, a single redaction pass in the `audit()` helper replaces a static deny-list of field names with the sentinel `"[redacted]"` (key retained so the diff still shows the field changed): `User.password_hash`, `AppPassword.hash`, `AppPassword` plaintext token, JWT/session signing keys, OIDC client secret, and any value sourced via the `cmd:` / `file:` secret resolvers. This is the second line of defense — secret reads already route through the config layer, which redacts at that boundary (see Secrets management). A deny-list (not allow-list) is used because payloads are arbitrary jsonb; the config-layer redaction backstops anything a new secret field misses.
 
-  Append-only by convention; the only mutation is an admin-only redact that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a phase-2 retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
+  Listing the audit log *(not yet built)*: there is no endpoint or console screen; the table is read with SQL. Append-only by convention; the only mutation is an admin-only redact *(not yet built)* that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a later retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
 - **Secrets management:**
   - All secrets are read from environment variables. Every secret env var `X` also accepts `X_FILE` pointing at a path — the Docker secrets convention, which works with Docker Compose/Swarm secrets, Kubernetes secrets, and systemd `LoadCredential=`.
   - The config layer abstracts secret sources so each secret can declare `env:`, `file:`, or `cmd:` (shells out to a helper like `pass`, `op read`, `vault kv get`). Vault / Infisical / 1Password / Bitwarden plug in later without coupling the app to any of them.
   - Secret values are redacted from logs and error responses at the config-layer boundary, not at every call site.
-  - Session/JWT signing keys support hot rotation via an admin REST endpoint (new key written, old key honored for a grace window). DB/MinIO credentials tolerate restart for rotation.
+  - Session/JWT signing keys support hot rotation via an admin REST endpoint (new key written, old key honored for a grace window) *(not yet built: the verifier keyring and `kid` selection exist, the endpoint does not)*. DB/MinIO credentials tolerate restart for rotation.
   - **Anti-patterns:** no mandatory Vault dependency, no secrets committed to the repo (provide `.env.example` only), no custom encrypted-secrets-file format.
 
 ---
@@ -406,7 +405,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 Structural choices locked before coding so issues don't bake in conflicting decisions.
 
 - **Primary keys: `uuid` v7.** All entity PKs are UUIDv7 (time-ordered → good B-tree insert locality and rough creation ordering for free). Generated app-side via the `uuid` crate. No `bigserial`.
-- **REST resource identifier: UUID in `/v1` paths.** Endpoints address entities by UUID (`/v1/arrangements/{uuid}`), never by slug. Slugs are *scoped* (per-org / per-arrangement) and *renameable* (admin slug-rename op), so they're unsuitable as stable REST URLs; they remain the human-readable keys in the WebDAV tree only. A future slug lookup, if needed, is a `?slug=` resolver, not the canonical path.
+- **REST resource identifier: UUID in `/v1` paths.** Endpoints address entities by UUID (`/v1/arrangements/{uuid}`), never by slug. Slugs are *scoped* (per-org / per-arrangement) and *renameable* (by an admin slug-rename op *(not yet built)*), so they're unsuitable as stable REST URLs; they remain the human-readable keys in the WebDAV tree only. A future slug lookup, if needed, is a `?slug=` resolver, not the canonical path.
 - **JSON field casing: `camelCase`.** Wire JSON uses `camelCase`; Rust structs stay `snake_case` with `#[serde(rename_all = "camelCase")]` applied consistently. The `utoipa` schema reflects the same casing so the OpenAPI contract matches the wire.
 - **Crate layout: workspace with a `lib` target.** The app is a workspace whose core is a library crate (`lied`) with a thin binary (`lied-server`) on top. Integration tests under `tests/` link the lib and may exercise internals directly, not only black-box HTTP — this is what the fixture builders (Testing posture) depend on.
 - **Enums: `text` + `CHECK`, not Postgres native enum types.** All status/type/kind columns (`Membership.role`, `Arrangement.status`, `Collection.type`, `File.format`, `File.conversion_quality`, …) are stored as `text` with a `CHECK (col IN (...))` constraint, mapped to Rust enums via sqlx. Native PG enum types were rejected: `ALTER TYPE ... ADD VALUE` is awkward (can't run in a transaction, can't remove values), and adding a variant should be a plain migration. `Tag.kind` stays free-text by design (no CHECK).
@@ -517,10 +516,10 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
   **Permissions:** *creating* a Work is open to any authenticated user with at least one Membership in any org (an archivist adding a new piece's abstract entry); *editing* a Work is restricted to its original creator (`created_by`) or any `is_system_admin`. This stops "alice fixes a typo and rewrites a shared title for everyone"; for legitimate edits in someone else's Work, escalate to a system admin.
 - **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
-- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
+- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument *(not yet built)* requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
 
 #### Lifecycle, existence, audit
-- **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints but never surfaced via WebDAV.
+- **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) *(not yet built)* removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints *(not yet built)* but never surfaced via WebDAV. File undelete is *(console only)*; the other soft-deleted entities have a `/v1` `…/undelete`.
 - **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem, Tag.
 - **Soft-delete cascade: hide-with-references.** A soft-delete sets `deleted_at` on the targeted entity only — never on its descendants. Queries that join parent → child filter `WHERE parent.deleted_at IS NULL AND child.deleted_at IS NULL`, so a soft-deleted parent makes its subtree invisible *through it* without changing the children's own state. Undelete just clears the parent's `deleted_at` and the subtree reappears automatically. CollectionItems / PartAssignments that reference a soft-deleted target remain in the collection but render as "[removed]" with the slug shown — broken references are surfaced, not silently dropped. Soft-cascade and block-on-references were both rejected: soft-cascade makes undelete ambiguous (was the child already deleted before, or only by cascade?); block-on-references creates bad UX ("can't delete until you remove from 7 collections").
 - **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
@@ -546,7 +545,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
   | `PartAssignment` | `(collection_item_id, voice_id, user_id)` — a part is played by as many musicians as the section has; the same person twice on one part is the mistake |
   | `Tag` | `(organization_id, name, kind)` |
   | `ArrangementTag` | `(arrangement_id, tag_id)` |
-  | `Work`, `GlobalAnnotation` | none — duplicates allowed (Work duplicates resolved via phase-2 merge tooling; multiple GlobalAnnotations per arrangement is the norm) |
+  | `Work`, `GlobalAnnotation` | none — duplicates allowed (Work duplicates resolved via later merge tooling; multiple GlobalAnnotations per arrangement is the norm) |
 
   **Several musicians may hold one part** (issue #53): a second violin part is read by every desk of the section, so assigning adds a player rather than replacing one. No `role` discriminator — nobody has needed to distinguish principal from cover yet. One person holding *two* voices of the same piece is permitted (sections get juggled by who turns up) and reported as a conflict, since nobody plays two parts at once.
 
@@ -612,9 +611,9 @@ The abstract musical work (e.g. "Beethoven: Symphony No. 5"). Lightweight, used 
 Fields: title, `composer` (text, nullable).
 
 **Instrument**
-An instance-wide controlled vocabulary entry. Seeded on first migration with the standard repertoire of ~150 orchestral/band/chamber instruments; admins can add more without a code change.
+An instance-wide controlled vocabulary entry. Seeded on first migration with the standard repertoire of ~150 orchestral/band/chamber instruments; admins can add more without a code change *(not yet built)* — today only `GET /v1/instruments` exists.
 Fields: `key` (text, unique, machine-readable, stable — e.g. `trumpet_bb`), `display_name` (text, English default), `aliases` (text[], for search and import normalization), `family` (text — `brass`, `woodwind`, `strings`, `percussion`, `keyboard`, `voice`, `other`; drives UI grouping), `transposition` (text, nullable — e.g. `Bb`, `F`, `Eb`; null for non-transposing instruments), audit fields.
-No `deleted_at` in phase 1: instruments referenced by Voice/Membership can't be hard-deleted; archival is a phase-2 concern.
+No `deleted_at` in phase 1: instruments referenced by Voice/Membership can't be hard-deleted; archival is deferred.
 
 **Arrangement**
 A specific arrangement for specific instrumentation — what an organization licenses and owns. Also the unit of edition/variant: multiple editions of one work are multiple `Arrangement` rows under the same `Work`.
@@ -638,7 +637,8 @@ No `deleted_at`: deleting an org is admin-gated hard delete because the cascade 
 **User**
 A person using the system. No system-wide application role — authorization is per-org via `Membership.role`. Optional `is_system_admin` boolean for instance-level operations (org provisioning, user management).
 Fields: `slug` (text, immutable, unique globally), `username` (citext, unique) — login identifier; renameable, distinct from `slug` so the personal WebDAV path stays stable across renames. `email` (citext, unique, nullable) — used for password reset and notifications; nullable so admins can create users without one (shared kiosk accounts, youth orchestra members). `password_hash` (text, nullable) — argon2id; nullable because OIDC users have no local password. `display_name` (text). `is_system_admin` (bool, default false). Audit fields.
-No `deleted_at` initially — user deletion is admin-gated hard delete with explicit reassignment-or-anonymization of PartAssignments, GlobalAnnotations, and audit log entries. Phase 2 concern.
+Updating a user (username, password, display name) is *(not yet built)*: `/v1/users` and the console create, read and delete users only.
+No `deleted_at` initially — user deletion is admin-gated hard delete with explicit reassignment-or-anonymization of PartAssignments, GlobalAnnotations, and audit log entries. That reassignment flow is deferred; until it exists, deleting a user who still holds a Membership, PartAssignment or GlobalAnnotation is refused by the foreign keys.
 
 **AppPassword**
 A revocable, WebDAV-scoped credential issued per device (the per-user app passwords from the Auth section).
@@ -655,7 +655,7 @@ This keeps WebDAV auth fast despite argon2's intentional slowness — without th
 A user's membership in an organization.
 Fields: user FK, organization FK, `role` (enum: `owner`, `archivist`, `conductor`, `musician` — see Decisions for the permission matrix), `instrument_ids` (int[] FK to Instrument), `is_principal` (bool, orthogonal to role), `principal_instrument_ids` (int[] FK to Instrument, subset of `instrument_ids` — array because principals may cover doublings, e.g. trumpet + flugelhorn).
 Coverage check (UC-13): for an arrangement in a collection, every `Voice` whose `instrument_id ∈ principal_instrument_ids` must have a `PartAssignment`.
-**FK integrity on the `int[]` columns:** Postgres can't enforce element-level FKs on an array, so `instrument_ids` / `principal_instrument_ids` are validated against the live `Instrument` set in the service layer on write. This is safe in phase 1 because `Instrument` has no soft-delete and rows are never hard-deleted while referenced — dangling IDs can only come from a bug, not normal flow. Flag for phase 2: if `Instrument` ever gains soft-delete, revisit (DB trigger, or normalize to a `membership_instruments` join table).
+**FK integrity on the `int[]` columns:** Postgres can't enforce element-level FKs on an array, so `instrument_ids` / `principal_instrument_ids` are validated against the live `Instrument` set in the service layer on write. This is safe in phase 1 because `Instrument` has no soft-delete and rows are never hard-deleted while referenced — dangling IDs can only come from a bug, not normal flow. Flag for later: if `Instrument` ever gains soft-delete, revisit (DB trigger, or normalize to a `membership_instruments` join table).
 Invariant: every org has at least one Membership with `role = owner`; demoting the last owner is rejected.
 
 **Collection**
@@ -716,7 +716,7 @@ Organization
 
 ## Out of scope (product boundary)
 
-This is the product's outer boundary — distinct from the phase-2 *deferral* list below (those features are planned and the data model already accommodates them). The items here are things Lied deliberately does **not** try to be, possibly ever. Each has a mature tool that does it better; Lied integrates via open formats rather than competing.
+This is the product's outer boundary — distinct from the *deferral* lists in the Phase cuts below (those features are planned and the data model already accommodates them). The items here are things Lied deliberately does **not** try to be, possibly ever. Each has a mature tool that does it better; Lied integrates via open formats rather than competing.
 
 **Notation & content creation**
 - **Notation editing / engraving** — entering or editing the notes themselves. Use MuseScore, Frescobaldi (LilyPond), Sibelius, Finale, Dorico; Lied stores and serves their output.
@@ -741,7 +741,7 @@ This is the product's outer boundary — distinct from the phase-2 *deferral* li
 
 **Infrastructure Lied relies on but does not provide**
 - **A bundled display/reader app** — deferred indefinitely; musicians use forScore, MobileSheets, Xodo, or an OS file manager against WebDAV.
-- **Identity provider** — Lied is an OIDC *client* (phase 2), never an IdP for other systems.
+- **Identity provider** — Lied is an OIDC *client* (deferred), never an IdP for other systems.
 - **General cloud file sync** (Dropbox/Drive-style) — the WebDAV surface is scoped to the music tree, not arbitrary file storage. `/users/<user>/library/` is a convenience, not a sync product.
 - **Email/SMS delivery infrastructure** — the deferred notification flow hands off to an external SMTP/provider; Lied runs no mail server.
 
@@ -749,6 +749,8 @@ This is the product's outer boundary — distinct from the phase-2 *deferral* li
 - **Strict multi-tenant SaaS isolation (topology 3)** — explicitly out for phase 1; requires a tenant-isolation pass. Phase 1 assumes every org in an instance trusts the others.
 
 ## Phase 1 cut
+
+**Status: complete.** Phase status lives here and in the Phase 2 cut; elsewhere in this spec, "deferred" points here. Operations marked *(not yet built)* or *(console only)* are designed but not (or not yet) exposed under `/v1`.
 
 Smallest version that closes the **archivist → musician loop** end-to-end: an archivist uploads a piece, builds a concert program, assigns parts; each musician opens their part on an iPad via WebDAV. Later phases plug in cleanly because the data model already accommodates them.
 
@@ -799,6 +801,8 @@ Model supports these; phase 1 has no implementation. Items marked **(→ phase 2
 Phase 1 is unglamorous from the conductor's perspective (title ILIKE only, no tags, no fancy program planning aids) and from the format-conversion angle (you upload what you upload). It delivers the actual base value — getting parts from archivist to musician — and every later phase plugs in cleanly because the data model already accommodates it.
 
 ## Phase 2 cut
+
+**Status: complete** — every phase-2 issue is closed. Anything below under "Deferred to phase 3+" is still open.
 
 Make the **management/curation console feature-complete** for the personas who work at a PC — the archivist, owner, and conductor-as-planner — and land the "medium" backend features the data model already anticipated (real archive search, coverage, global-annotation authoring). Musicians and guests stay on WebDAV + existing readers; **no consumer client is built in phase 2**.
 
