@@ -17,8 +17,18 @@ use utoipa::Modify;
 /// cookies.
 ///
 /// - `bearer`: HTTP Bearer (JWT minted by `POST /v1/tokens`)
-/// - `session`: ApiKey cookie `id` (set by `/admin/login`)
+/// - `session`: ApiKey cookie `lied_session` (set by `/admin/login`); writes
+///   made with it must also send the `HX-CSRF` header (issue #72)
 pub struct SecurityAddon;
+
+/// The `session` scheme's description: the CSRF rule a cookie client must
+/// follow is part of how the scheme is used, so it lives on the scheme.
+const SESSION_SCHEME_DESCRIPTION: &str = "Session cookie set by `/admin/login`. \
+    State-changing requests (anything but GET/HEAD/OPTIONS) authenticated by this cookie \
+    must also send the session's CSRF token, read from the `lied_csrf` cookie, in the \
+    `HX-CSRF` request header; without it they are refused with 403 \
+    (`https://lied/errors/csrf-token-invalid`). Bearer-authenticated requests need no \
+    header, and a request carrying a bearer token is authenticated by it alone.";
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
@@ -34,7 +44,10 @@ impl Modify for SecurityAddon {
         );
         c.add_security_scheme(
             "session",
-            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("id"))),
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                crate::auth::session::SESSION_COOKIE_NAME,
+                SESSION_SCHEME_DESCRIPTION,
+            ))),
         );
     }
 }

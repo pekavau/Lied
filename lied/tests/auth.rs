@@ -974,3 +974,298 @@ async fn safe_request_sets_the_readable_csrf_cookie() {
         "a GET through the admin CSRF middleware must set the readable lied_csrf cookie"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #72: cookie-authenticated `/v1` writes need the CSRF token.
+// ---------------------------------------------------------------------------
+
+/// Read a `Set-Cookie` value by name from a response.
+fn set_cookie_value(response: &axum::response::Response, name: &str) -> Option<String> {
+    let needle = format!("{name}=");
+    response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|raw| {
+            raw.split(';')
+                .next()
+                .and_then(|first| first.trim().strip_prefix(&needle))
+                .map(str::to_string)
+        })
+}
+
+/// Log in through the real `/admin/login` flow, as a browser would, and
+/// return `(cookie_header, csrf_token)`.
+async fn browser_login(app: &axum::Router, username: &str, password: &str) -> (String, String) {
+    let get = axum::http::Request::builder()
+        .method("GET")
+        .uri("/admin/login")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(get).await.expect("login page");
+    let anon = set_cookie_value(&resp, "lied_session").expect("anon session cookie");
+    let csrf = set_cookie_value(&resp, "lied_csrf").expect("csrf cookie");
+
+    let post = axum::http::Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header(
+            axum::http::header::COOKIE,
+            format!("lied_session={anon}; lied_csrf={csrf}"),
+        )
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from(format!(
+            "username={username}&password={password}"
+        )))
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(with_peer_ip(post))
+        .await
+        .expect("login submit");
+    assert!(resp.status().is_redirection(), "login should succeed");
+    let session = set_cookie_value(&resp, "lied_session").unwrap_or(anon);
+    (format!("lied_session={session}; lied_csrf={csrf}"), csrf)
+}
+
+/// A JSON request to `/v1`, optionally with cookie / CSRF header / bearer.
+fn v1_request(
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    bearer: Option<&str>,
+    body: &str,
+) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = cookie {
+        builder = builder.header(axum::http::header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("HX-CSRF", csrf);
+    }
+    if let Some(token) = bearer {
+        builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    with_peer_ip(
+        builder
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap(),
+    )
+}
+
+/// Assert `response` is the CSRF 403 Problem Details.
+async fn assert_csrf_rejection(response: axum::response::Response) {
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], 403);
+    assert_eq!(json["type"], "https://lied/errors/csrf-token-invalid");
+}
+
+async fn app_password_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM app_password")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cookie_write_to_v1_requires_the_csrf_header() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "kim", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, csrf) = browser_login(&app, "kim", "hunter2hunter2").await;
+
+    // No header: refused, and nothing is written.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&cookie),
+            None,
+            None,
+            r#"{"name":"forged"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_csrf_rejection(response).await;
+
+    // A wrong token is no better than none.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&cookie),
+            Some("not-the-token"),
+            None,
+            r#"{"name":"forged"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_csrf_rejection(response).await;
+    assert_eq!(app_password_count(&db.pool).await, 0);
+
+    // With the session's token: the write goes through.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&cookie),
+            Some(&csrf),
+            None,
+            r#"{"name":"ipad"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    assert_eq!(app_password_count(&db.pool).await, 1);
+}
+
+#[tokio::test]
+async fn cookie_reads_from_v1_need_no_csrf_header() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "lou", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, _csrf) = browser_login(&app, "lou", "hunter2hunter2").await;
+
+    for uri in ["/v1/app-passwords", "/v1/instruments"] {
+        let response = app
+            .clone()
+            .oneshot(v1_request("GET", uri, Some(&cookie), None, None, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "GET {uri}");
+    }
+}
+
+#[tokio::test]
+async fn bearer_writes_to_v1_need_no_csrf_header() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "max", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, _csrf) = browser_login(&app, "max", "hunter2hunter2").await;
+
+    let config = test_config();
+    let keyring = auth::jwt::Keyring::from_single_key(
+        config.jwt_signing_key.expose(),
+        config.jwt_lifetime_days,
+    );
+    let (token, _claims) = keyring.mint(admin.id, None).expect("mint token");
+
+    // Bearer alone.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            None,
+            None,
+            Some(&token),
+            r#"{"name":"script"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    // Bearer plus a session cookie: the bearer authenticates the request, so
+    // it is judged as a bearer request and needs no header.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&cookie),
+            None,
+            Some(&token),
+            r#"{"name":"script-with-cookie"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    // A bad bearer never falls back to the cookie: it is unauthenticated.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&cookie),
+            None,
+            Some("garbage"),
+            r#"{"name":"nope"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn minting_a_token_from_the_cookie_requires_the_csrf_header() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "nia", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, csrf) = browser_login(&app, "nia", "hunter2hunter2").await;
+
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/tokens",
+            Some(&cookie),
+            None,
+            None,
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_csrf_rejection(response).await;
+
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/tokens",
+            Some(&cookie),
+            Some(&csrf),
+            None,
+            "{}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    // The username/password path has no session to protect: no header.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/tokens",
+            None,
+            None,
+            None,
+            r#"{"username":"nia","password":"hunter2hunter2"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+}

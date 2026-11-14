@@ -68,7 +68,8 @@ let (v1_router, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
     .nest("/v1", v1::router())
     .split_for_parts();
 // `api` is handed to the infra tree to serve at /openapi.json; `v1_router`
-// gets the existing middleware stack (session layer, rate-limit, CSRF-exempt).
+// gets the existing middleware stack (session layer, rate-limit). No CSRF
+// middleware: cookie-authenticated writes are checked in `BearerOrSession`.
 ```
 
 `routes!(a, b, …)` groups handlers that **share a URL path** (the path comes

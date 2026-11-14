@@ -54,6 +54,13 @@ pub enum AppError {
     #[error("forbidden")]
     Forbidden,
 
+    /// A cookie-authenticated `/v1` write without the session's CSRF token in
+    /// the `HX-CSRF` header (issue #72). A 403 like [`AppError::Forbidden`],
+    /// but with its own type URI so a client can tell "send the token" apart
+    /// from "your role may not do this".
+    #[error("the HX-CSRF header is missing or does not match the session's CSRF token")]
+    CsrfTokenInvalid,
+
     #[error("too many requests")]
     TooManyRequests,
 
@@ -121,6 +128,7 @@ impl AppError {
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden => StatusCode::FORBIDDEN,
+            AppError::CsrfTokenInvalid => StatusCode::FORBIDDEN,
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -139,6 +147,7 @@ impl AppError {
             AppError::Internal(_) => "https://lied/errors/internal",
             AppError::Unauthorized => "https://lied/errors/unauthorized",
             AppError::Forbidden => "https://lied/errors/forbidden",
+            AppError::CsrfTokenInvalid => "https://lied/errors/csrf-token-invalid",
             AppError::TooManyRequests => "https://lied/errors/too-many-requests",
             AppError::Conflict(_) => "https://lied/errors/conflict",
             AppError::PayloadTooLarge(_) => "https://lied/errors/payload-too-large",
@@ -157,6 +166,7 @@ impl AppError {
             AppError::Internal(_) => "Internal Server Error",
             AppError::Unauthorized => "Unauthorized",
             AppError::Forbidden => "Forbidden",
+            AppError::CsrfTokenInvalid => "Forbidden",
             AppError::TooManyRequests => "Too Many Requests",
             AppError::Conflict(_) => "Conflict",
             AppError::PayloadTooLarge(_) => "Payload Too Large",
