@@ -323,12 +323,12 @@ async fn create_collection(
 /// Fetch one collection (requires org membership).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/collections/{id}",
+    path = "/orgs/{orgId}/collections/{collectionId}",
     tag = "collections",
     summary = "Get a collection",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Collection ID"),
+        ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -354,12 +354,12 @@ async fn get_collection(
 /// Update a collection's name/type (owner/archivist/conductor; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/collections/{id}",
+    path = "/orgs/{orgId}/collections/{collectionId}",
     tag = "collections",
     summary = "Update a collection",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Collection ID"),
+        ("collectionId"       = Uuid,   Path,   description = "Collection ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -447,12 +447,12 @@ async fn update_collection(
 /// Soft-delete a collection (owner/archivist/conductor; requires `If-Match`).
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/collections/{id}",
+    path = "/orgs/{orgId}/collections/{collectionId}",
     tag = "collections",
     summary = "Soft-delete a collection",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Collection ID"),
+        ("collectionId"       = Uuid,   Path,   description = "Collection ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -504,12 +504,12 @@ async fn delete_collection(
 /// Restore a soft-deleted collection (owner/archivist/conductor).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/collections/{id}/undelete",
+    path = "/orgs/{orgId}/collections/{collectionId}/undelete",
     tag = "collections",
     summary = "Undelete a collection",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Collection ID"),
+        ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -565,12 +565,12 @@ struct ReorderRequest {
 /// Reorder a collection's items (owner/archivist/conductor).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/collections/{id}/reorder",
+    path = "/orgs/{orgId}/collections/{collectionId}/reorder",
     tag = "collections",
     summary = "Reorder collection items",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Collection ID"),
+        ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = ReorderRequest,
@@ -622,12 +622,12 @@ async fn reorder_items(
 /// slug, not dropped (hide-with-references).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/collections/{id}/items",
+    path = "/orgs/{orgId}/collections/{collectionId}/items",
     tag = "collections",
     summary = "List collection items",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Collection ID"),
+        ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -661,12 +661,12 @@ struct AddItemRequest {
 /// Add an arrangement to a collection at an index (owner/archivist/conductor).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/collections/{id}/items",
+    path = "/orgs/{orgId}/collections/{collectionId}/items",
     tag = "collections",
     summary = "Add a collection item",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Collection ID"),
+        ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = AddItemRequest,
