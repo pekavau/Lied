@@ -262,11 +262,11 @@ async fn create_org(
 /// Fetch one organization by ID.
 #[utoipa::path(
     get,
-    path = "/orgs/{id}",
+    path = "/orgs/{orgId}",
     tag = "organizations",
     summary = "Get an organization",
     params(
-        ("id" = Uuid, Path, description = "Organization ID"),
+        ("orgId" = Uuid, Path, description = "Organization ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -300,11 +300,11 @@ async fn get_org(
 /// Rename an organization (system-admin only; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{id}",
+    path = "/orgs/{orgId}",
     tag = "organizations",
     summary = "Update an organization",
     params(
-        ("id"       = Uuid,   Path,   description = "Organization ID"),
+        ("orgId"       = Uuid,   Path,   description = "Organization ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -382,11 +382,11 @@ async fn update_org(
 /// Hard-delete an organization and all its data (system-admin only; requires `If-Match`).
 #[utoipa::path(
     delete,
-    path = "/orgs/{id}",
+    path = "/orgs/{orgId}",
     tag = "organizations",
     summary = "Delete an organization",
     params(
-        ("id"       = Uuid,   Path,   description = "Organization ID"),
+        ("orgId"       = Uuid,   Path,   description = "Organization ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -609,11 +609,11 @@ async fn create_user(
 /// Fetch one user by ID (system-admin only).
 #[utoipa::path(
     get,
-    path = "/users/{id}",
+    path = "/users/{userId}",
     tag = "users",
     summary = "Get a user",
     params(
-        ("id" = Uuid, Path, description = "User ID"),
+        ("userId" = Uuid, Path, description = "User ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -652,11 +652,11 @@ async fn get_user(
 /// assignment, or annotation — reassign or remove those first.
 #[utoipa::path(
     delete,
-    path = "/users/{id}",
+    path = "/users/{userId}",
     tag = "users",
     summary = "Delete a user",
     params(
-        ("id"       = Uuid,   Path,   description = "User ID"),
+        ("userId"       = Uuid,   Path,   description = "User ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -985,12 +985,12 @@ async fn find_member_scoped(
 /// Fetch one membership by ID (requires `musician` role or system-admin).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/members/{id}",
+    path = "/orgs/{orgId}/members/{memberId}",
     tag = "members",
     summary = "Get a member",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Membership ID"),
+        ("memberId"    = Uuid, Path, description = "Membership ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1023,12 +1023,12 @@ async fn get_member(
 /// Update a member's role or instruments (owner only; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/members/{id}",
+    path = "/orgs/{orgId}/members/{memberId}",
     tag = "members",
     summary = "Update a member",
     params(
         ("orgId"   = Uuid,   Path,   description = "Organization ID"),
-        ("id"      = Uuid,   Path,   description = "Membership ID"),
+        ("memberId"      = Uuid,   Path,   description = "Membership ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1151,12 +1151,12 @@ async fn update_member(
 /// Fails with `409` if this is the org's last owner.
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/members/{id}",
+    path = "/orgs/{orgId}/members/{memberId}",
     tag = "members",
     summary = "Remove a member",
     params(
         ("orgId"   = Uuid,   Path,   description = "Organization ID"),
-        ("id"      = Uuid,   Path,   description = "Membership ID"),
+        ("memberId"      = Uuid,   Path,   description = "Membership ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),

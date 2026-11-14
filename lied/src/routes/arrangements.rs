@@ -237,11 +237,11 @@ async fn create_work(
 /// Fetch one work by ID.
 #[utoipa::path(
     get,
-    path = "/works/{id}",
+    path = "/works/{workId}",
     tag = "works",
     summary = "Get a work",
     params(
-        ("id" = Uuid, Path, description = "Work ID"),
+        ("workId" = Uuid, Path, description = "Work ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -267,11 +267,11 @@ async fn get_work(
 /// Update a work's title or composer (creator or system-admin only; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/works/{id}",
+    path = "/works/{workId}",
     tag = "works",
     summary = "Update a work",
     params(
-        ("id"       = Uuid,   Path,   description = "Work ID"),
+        ("workId"       = Uuid,   Path,   description = "Work ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -350,11 +350,11 @@ async fn update_work(
 /// Fails with `409` if the work is still referenced by a live arrangement.
 #[utoipa::path(
     delete,
-    path = "/works/{id}",
+    path = "/works/{workId}",
     tag = "works",
     summary = "Delete a work",
     params(
-        ("id"       = Uuid,   Path,   description = "Work ID"),
+        ("workId"       = Uuid,   Path,   description = "Work ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -822,12 +822,12 @@ async fn find_arrangement_scoped_including_deleted(
 /// Fetch one arrangement by ID (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}",
     tag = "arrangements",
     summary = "Get an arrangement",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -853,12 +853,12 @@ async fn get_arrangement(
 /// Update arrangement metadata (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/arrangements/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}",
     tag = "arrangements",
     summary = "Update an arrangement",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"       = Uuid,   Path,   description = "Arrangement ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -992,12 +992,12 @@ async fn update_arrangement(
 /// Soft-delete an arrangement (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/arrangements/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}",
     tag = "arrangements",
     summary = "Soft-delete an arrangement",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"       = Uuid,   Path,   description = "Arrangement ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1050,12 +1050,12 @@ async fn delete_arrangement(
 /// Restore a soft-deleted arrangement (owner/archivist only).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{id}/undelete",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/undelete",
     tag = "arrangements",
     summary = "Undelete an arrangement",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1202,12 +1202,12 @@ struct VoiceListQuery {
 /// List voices in an arrangement (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{id}/voices",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices",
     tag = "voices",
     summary = "List voices",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
@@ -1286,12 +1286,12 @@ async fn list_voices(
 /// Add a voice (instrument part) to an arrangement (owner/archivist only).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{id}/voices",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices",
     tag = "voices",
     summary = "Create a voice",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = VoiceRequest,
@@ -1403,13 +1403,13 @@ async fn find_voice_scoped_including_deleted(
 /// Fetch one voice by ID (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
     tag = "voices",
     summary = "Get a voice",
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("id"            = Uuid, Path, description = "Voice ID"),
+        ("voiceId"            = Uuid, Path, description = "Voice ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1435,13 +1435,13 @@ async fn get_voice(
 /// Update a voice's name or instrument (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
     tag = "voices",
     summary = "Update a voice",
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("id"            = Uuid,   Path,   description = "Voice ID"),
+        ("voiceId"            = Uuid,   Path,   description = "Voice ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1532,13 +1532,13 @@ async fn update_voice(
 /// Soft-delete a voice (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
     tag = "voices",
     summary = "Soft-delete a voice",
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("id"            = Uuid,   Path,   description = "Voice ID"),
+        ("voiceId"            = Uuid,   Path,   description = "Voice ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1591,13 +1591,13 @@ async fn delete_voice(
 /// Restore a soft-deleted voice (owner/archivist only).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}/undelete",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/undelete",
     tag = "voices",
     summary = "Undelete a voice",
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("id"            = Uuid, Path, description = "Voice ID"),
+        ("voiceId"            = Uuid, Path, description = "Voice ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1856,12 +1856,12 @@ async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag
 /// Fetch one tag by ID (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/tags/{id}",
+    path = "/orgs/{orgId}/tags/{tagId}",
     tag = "tags",
     summary = "Get a tag",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Tag ID"),
+        ("tagId"    = Uuid, Path, description = "Tag ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1887,12 +1887,12 @@ async fn get_tag(
 /// Update a tag's name or kind (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/tags/{id}",
+    path = "/orgs/{orgId}/tags/{tagId}",
     tag = "tags",
     summary = "Update a tag",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Tag ID"),
+        ("tagId"       = Uuid,   Path,   description = "Tag ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1969,12 +1969,12 @@ async fn update_tag(
 /// Soft-delete a tag (owner/archivist; requires `If-Match`).
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/tags/{id}",
+    path = "/orgs/{orgId}/tags/{tagId}",
     tag = "tags",
     summary = "Soft-delete a tag",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("id"       = Uuid,   Path,   description = "Tag ID"),
+        ("tagId"       = Uuid,   Path,   description = "Tag ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -2025,12 +2025,12 @@ async fn delete_tag(
 /// Restore a soft-deleted tag (owner/archivist only).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/tags/{id}/undelete",
+    path = "/orgs/{orgId}/tags/{tagId}/undelete",
     tag = "tags",
     summary = "Undelete a tag",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Tag ID"),
+        ("tagId"    = Uuid, Path, description = "Tag ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -2092,12 +2092,12 @@ async fn undelete_tag(
 /// List tags attached to a specific arrangement (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{id}/tags",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/tags",
     tag = "tags",
     summary = "List arrangement tags",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -2131,12 +2131,12 @@ struct AttachTagRequest {
 /// Attach an existing tag to an arrangement (owner/archivist only).
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{id}/tags",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/tags",
     tag = "tags",
     summary = "Attach a tag to an arrangement",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("id"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = AttachTagRequest,
