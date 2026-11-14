@@ -202,6 +202,12 @@ pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
     ("createdAt", "created_at"),
 ];
 
+/// The sort a list uses when the request names none: (SQL column from
+/// [`SORT_ALLOWLIST`], direction). The OpenAPI description must name it;
+/// `sort_and_filter_docs_match_the_allowlists` checks that it does.
+pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
+    ("username", crate::listing::SortDirection::Asc);
+
 /// Filter allowlist for `GET /v1/users`: `?filter[username]=` is a
 /// case-insensitive substring match (the column is `citext`, so a plain
 /// `LIKE` is already case-insensitive; `ILIKE` is used for parity with the
