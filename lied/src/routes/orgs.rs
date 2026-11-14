@@ -648,8 +648,9 @@ async fn get_user(
 
 /// Hard-delete a user (system-admin only; requires `If-Match`).
 ///
-/// Fails with `409` if the user is still referenced by a membership, part
-/// assignment, or annotation — reassign or remove those first.
+/// Fails with `409` if the user is still referenced (memberships, part
+/// assignments, annotations, app passwords, or content they created) —
+/// reassign or remove those first.
 #[utoipa::path(
     delete,
     path = "/users/{userId}",
@@ -691,7 +692,7 @@ async fn delete_user(
         if let sqlx::Error::Database(ref db_err) = err {
             if db_err.is_foreign_key_violation() {
                 return AppError::Conflict(
-                    "this user is still referenced by a membership, part assignment, or annotation; reassign or remove those first".to_string(),
+                    "this user is still referenced (memberships, part assignments, annotations, app passwords, or content they created); reassign or remove those first".to_string(),
                 );
             }
         }

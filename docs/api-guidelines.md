@@ -37,9 +37,10 @@ one `routes!(…)`; the module's router is merged into `v1::api_router`.
   `Uuid` (`every_path_parameter_is_a_uuid`). Mutations guarded by `If-Match`
   declare it as a `Header` parameter.
 - **Security.** Authenticated operations declare
-  `security(("bearer" = []), ("session" = []))`. Only the operations listed in
-  `security_requirements_declare_bearer_or_session_or_none` may also allow
-  anonymous callers; an empty `()` entry is what marks that.
+  `security(("bearer" = []), ("session" = []))`. An operation that also
+  admits anonymous callers says so with an empty `()` entry (or `security()`
+  for no auth at all), and must be listed in `ANONYMOUS_OPERATIONS`
+  (`only_allowlisted_operations_admit_anonymous_callers`).
 - **Success responses.** At least one `2xx`
   (`every_operation_has_at_least_one_2xx_response`). Lists return
   `body = inline(Page<T>)`; single-entity reads and writes declare the `ETag`

@@ -467,8 +467,8 @@ async fn create_user_submit(
 }
 
 /// `POST /admin/users/{id}/delete` — hard-delete a user (system-admin-only).
-/// A user still referenced by a `NOT NULL` FK (membership, part assignment,
-/// annotation authorship) surfaces as a `409`, matching the `/v1` behavior
+/// A user still referenced by a foreign key (see [`user::delete`]) surfaces
+/// as a `409`, matching the `/v1` behavior
 /// (see [`user::delete`] doc comment).
 async fn delete_user_submit(
     AuthSession(actor): AuthSession,
@@ -512,7 +512,7 @@ async fn delete_user_submit(
                 if db_err.is_foreign_key_violation() {
                     return error_fragment(
                         StatusCode::CONFLICT,
-                        "This user is still referenced by a membership, part assignment, or annotation.",
+                        "This user is still referenced by memberships, part assignments, annotations, app passwords, or content they created.",
                     );
                 }
             }

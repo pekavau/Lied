@@ -252,9 +252,9 @@ pub async fn update_name(
 /// against currently-empty tables today.
 ///
 /// Runs in a single transaction: either the whole cascade commits or none of
-/// it does. MinIO objects are not touched here — file/object cleanup for a
-/// hard-deleted org is a phase-2 concern once the File domain module (and its
-/// S3 key derivation) exists; flagged here rather than silently doing nothing.
+/// it does. MinIO objects are not touched here: object cleanup for a
+/// hard-deleted org is not yet built, so the org's objects stay in the bucket.
+/// Flagged here rather than silently doing nothing.
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(

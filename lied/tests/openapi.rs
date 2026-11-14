@@ -11,7 +11,8 @@
 //! - **Documentation.** Every operation has a non-empty summary and at
 //!   least one `2xx` response.
 //! - **Auth.** Every operation declares a `bearer`-or-`session` security
-//!   requirement, or explicitly declares none (the unauthenticated endpoints).
+//!   requirement, or explicitly declares none; only `ANONYMOUS_OPERATIONS`
+//!   may admit a caller with no credentials.
 //! - **Error model.** Every *authenticated* operation carries the
 //!   `CommonErrors` triple (401/429/500); every `PATCH` carries `412`; every
 //!   `4xx`/`5xx` response body is the shared RFC 7807 `ProblemDetails` schema.
@@ -282,15 +283,54 @@ fn operation_is_authenticated(op: &Operation) -> bool {
     })
 }
 
+/// Does an operation admit anonymous callers? Either it declares no
+/// requirement at all (`security()`, or none), or one of its alternatives is
+/// the empty requirement `{}` (`security((), …)`: "or no auth").
+fn operation_allows_anonymous(op: &Operation) -> bool {
+    match op.security.as_deref() {
+        None | Some([]) => true,
+        Some(reqs) => reqs.iter().any(|req| {
+            serde_json::to_value(req)
+                .ok()
+                .and_then(|v| v.as_object().map(serde_json::Map::is_empty))
+                .unwrap_or(false)
+        }),
+    }
+}
+
+/// The operations a caller may reach without a session or bearer token: the
+/// API root, and token minting (which also takes credentials in the body).
+const ANONYMOUS_OPERATIONS: &[(&str, &str)] = &[("GET", "/v1"), ("POST", "/v1/tokens")];
+
+#[test]
+fn only_allowlisted_operations_admit_anonymous_callers() {
+    let api = build_openapi();
+
+    let mut violations = Vec::new();
+    for (path, item) in &api.paths.paths {
+        for (method, op) in path_item_ops(item) {
+            if operation_allows_anonymous(op)
+                && !ANONYMOUS_OPERATIONS.contains(&(method, path.as_str()))
+            {
+                violations.push(format!("{method} {path}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Operations admitting anonymous callers but not in ANONYMOUS_OPERATIONS:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[test]
 fn security_requirements_declare_bearer_or_session_or_none() {
     let api = build_openapi();
 
-    // Endpoints that mint or precede auth are intentionally public. Everything
-    // else must require bearer/session.
-    let public: std::collections::BTreeSet<(&str, &str)> = [("GET", "/v1"), ("POST", "/v1/tokens")]
-        .into_iter()
-        .collect();
+    // Only the API root declares no scheme at all; everything else (token
+    // minting included, which also accepts a session) names bearer/session.
+    let public: std::collections::BTreeSet<(&str, &str)> = [("GET", "/v1")].into_iter().collect();
 
     let mut violations = Vec::new();
     for (path, item) in &api.paths.paths {
