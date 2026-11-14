@@ -119,7 +119,7 @@ struct ListQuery {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Allowed: `createdAt` (default asc), `updatedAt`, `type`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `createdAt` (default, ascending), `updatedAt`, `type`."),
         ("filter[type]" = Option<String>, Query,
             description = "One of `tempo`, `dynamics`, `articulation`, `structure`, `general`"),
     ),

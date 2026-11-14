@@ -185,7 +185,7 @@ struct UpdateCollectionRequest {
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
         ("sort"   = Option<String>, Query,
-            description = "Sort field and direction. Allowed: `name` (default asc), `createdAt`."),
+            description = "Sort as `field:asc` or `field:desc`. Allowed fields: `name` (default, ascending), `createdAt`."),
         ("filter[type]" = Option<String>, Query, description = "Filter by type: `program` or `standing`"),
     ),
     security(("bearer" = []), ("session" = [])),
