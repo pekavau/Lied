@@ -728,3 +728,88 @@ async fn make_collection_in(ctx: &Ctx, tok: &str, org: Uuid, name: &str, kind: &
     .await;
     coll["id"].as_str().unwrap().to_string()
 }
+
+/// PATCH `url` with its current ETag; returns status, response ETag and body.
+async fn patch_current(
+    ctx: &Ctx,
+    tok: &str,
+    url: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, String, serde_json::Value) {
+    let get = ctx
+        .app
+        .clone()
+        .oneshot(req("GET", url, tok, None))
+        .await
+        .unwrap();
+    let etag = get.headers()["etag"].to_str().unwrap().to_string();
+    let request = axum::http::Request::builder()
+        .method("PATCH")
+        .uri(url)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {tok}"))
+        .header(axum::http::header::IF_MATCH, &etag)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let new_etag = resp
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, new_etag, json)
+}
+
+#[tokio::test]
+async fn collection_and_item_patches_are_partial() {
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let coll = make_collection(&ctx, &tok, "Spring", "program").await;
+    let url = format!("/v1/orgs/{}/collections/{coll}", ctx.org);
+
+    let (status, _, body) = patch_current(
+        &ctx,
+        &tok,
+        &url,
+        serde_json::json!({ "name": "Spring Gala" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Spring Gala");
+    assert_eq!(body["type"], "program");
+
+    let (status, _, body) =
+        patch_current(&ctx, &tok, &url, serde_json::json!({ "type": "standing" })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Spring Gala");
+    assert_eq!(body["type"], "standing");
+
+    let (status, _, _) =
+        patch_current(&ctx, &tok, &url, serde_json::json!({ "type": "concert" })).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    // An item PATCH that does not move it writes nothing.
+    let arr = create_arrangement(&ctx.pool, ctx.org, "bolero").await;
+    let (status, item) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("{url}/items"),
+            &tok,
+            Some(serde_json::json!({ "arrangementId": arr, "index": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let item_url = format!("{url}/items/{}", item["id"].as_str().unwrap());
+    let (_, first, _) = patch_current(&ctx, &tok, &item_url, serde_json::json!({})).await;
+    let (status, second, body) =
+        patch_current(&ctx, &tok, &item_url, serde_json::json!({ "index": 1 })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["index"], 1);
+    assert_eq!(first, second, "an unchanged item keeps its ETag");
+}

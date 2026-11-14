@@ -1567,14 +1567,14 @@ async fn mark_state(
         return response;
     }
 
-    // Stamping is "now", not a chosen time: `update_state` treats `None` as
-    // "leave unchanged", so there is no way to clear or backdate one of these
-    // without new domain semantics. Distribution *delivery* stays phase 3; this
-    // is the archivist recording what they did out of band.
-    let now = chrono::Utc::now();
+    // Stamping is "now", not a chosen time; the other timestamp is kept.
+    // Distribution *delivery* stays phase 3; this is the archivist recording
+    // what they did out of band.
+    let now = part_assignment::StampChange::Set(Some(chrono::Utc::now()));
+    let keep = part_assignment::StampChange::Keep;
     let (notified, acknowledged) = match stamp {
-        StateStamp::Notified => (Some(now), None),
-        StateStamp::Acknowledged => (None, Some(now)),
+        StateStamp::Notified => (now, keep),
+        StateStamp::Acknowledged => (keep, now),
     };
     match part_assignment::update_state(&state.db, assignment_id, notified, acknowledged).await {
         Ok(_) => {
@@ -1584,9 +1584,10 @@ async fn mark_state(
                 "part_assignment.update_state",
                 "part_assignment",
                 Some(assignment_id),
+                // The stamped value, or null for the one left as it was.
                 serde_json::json!({
-                    "notifiedAt": notified,
-                    "acknowledgedAt": acknowledged,
+                    "notifiedAt": notified.apply(None),
+                    "acknowledgedAt": acknowledged.apply(None),
                 }),
             )
             .await;

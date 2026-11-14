@@ -24,6 +24,7 @@ use crate::pagination::Page;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
+use crate::routes::patch::{present_or_null, reject_blank};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -76,12 +77,15 @@ struct CreateWorkRequest {
     composer: Option<String>,
 }
 
-/// Request body for `PATCH /v1/works/{id}`.
+/// Request body for `PATCH /v1/works/{id}`: a partial update. An omitted
+/// field is kept; `composer: null` clears the composer.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateWorkRequest {
-    title: String,
-    composer: Option<String>,
+    title: Option<String>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    composer: Option<Option<String>>,
 }
 
 /// List abstract musical works (any authenticated identity).
@@ -279,7 +283,7 @@ async fn update_work(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateWorkRequest>,
-) -> Result<Json<work::Work>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let current = work::find_by_id(&state.db, id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -291,16 +295,15 @@ async fn update_work(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if body.title.trim().is_empty() {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("title"),
-            garde::Error::new("title must not be empty"),
-        );
-        return Err(AppError::Validation(report));
+    reject_blank("title", body.title.as_deref())?;
+    let title = body.title.unwrap_or_else(|| current.title.clone());
+    let composer = body.composer.unwrap_or_else(|| current.composer.clone());
+    if title == current.title && composer == current.composer {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(current, updated_at));
     }
 
-    let updated = work::update(&state.db, id, &body.title, body.composer.as_deref())
+    let updated = work::update(&state.db, id, &title, composer.as_deref())
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -321,7 +324,8 @@ async fn update_work(
     )
     .await;
 
-    Ok(Json(updated))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(updated, updated_at))
 }
 
 /// Hard-delete a work (creator or system-admin; requires `If-Match`).
@@ -450,7 +454,7 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
     }
 }
 
-/// Request body for creating or updating an arrangement.
+/// Request body for creating an arrangement.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ArrangementRequest {
@@ -467,6 +471,49 @@ struct ArrangementRequest {
     difficulty: Option<i16>,
     difficulty_ratings: Option<serde_json::Value>,
     difficulty_notes: Option<String>,
+}
+
+/// Request body for `PATCH …/arrangements/{id}`: a partial update. An
+/// omitted field is kept; `null` clears a nullable field. `title` and
+/// `status` are required by the model, so they can be changed but not cleared.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateArrangementRequest {
+    title: Option<String>,
+    status: Option<String>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<Uuid>, nullable)]
+    work_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    instrumentation: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    arranger: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    publisher: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<chrono::NaiveDate>, nullable)]
+    purchase_date: Option<Option<chrono::NaiveDate>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    license_notes: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<i32>, nullable)]
+    copy_count_allowed: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<i32>, nullable)]
+    duration_seconds: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<i16>, nullable)]
+    difficulty: Option<Option<i16>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<serde_json::Value>, nullable)]
+    difficulty_ratings: Option<Option<serde_json::Value>>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    difficulty_notes: Option<Option<String>>,
 }
 
 fn arrangement_error_to_app_error(err: arrangement::ArrangementError) -> AppError {
@@ -804,7 +851,7 @@ async fn get_arrangement(
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = ArrangementRequest,
+    request_body = UpdateArrangementRequest,
     responses(
         (status = 200, description = "Updated arrangement", body = ArrangementResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -822,8 +869,8 @@ async fn update_arrangement(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<ArrangementRequest>,
-) -> Result<Json<ArrangementResponse>, AppError> {
+    Json(body): Json<UpdateArrangementRequest>,
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     let current = find_arrangement_scoped(&state, org_id, id).await?;
@@ -831,34 +878,70 @@ async fn update_arrangement(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if body.title.trim().is_empty() {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("title"),
-            garde::Error::new("title must not be empty"),
-        );
-        return Err(AppError::Validation(report));
-    }
+    reject_blank("title", body.title.as_deref())?;
 
-    let status = body.status.as_deref().unwrap_or(&current.status);
+    let title = body.title.unwrap_or_else(|| current.title.clone());
+    let status = body.status.unwrap_or_else(|| current.status.clone());
+    let work_id = body.work_id.unwrap_or(current.work_id);
+    let instrumentation = body
+        .instrumentation
+        .unwrap_or_else(|| current.instrumentation.clone());
+    let arranger = body.arranger.unwrap_or_else(|| current.arranger.clone());
+    let publisher = body.publisher.unwrap_or_else(|| current.publisher.clone());
+    let purchase_date = body.purchase_date.unwrap_or(current.purchase_date);
+    let license_notes = body
+        .license_notes
+        .unwrap_or_else(|| current.license_notes.clone());
+    let copy_count_allowed = body
+        .copy_count_allowed
+        .unwrap_or(current.copy_count_allowed);
+    let duration_seconds = body.duration_seconds.unwrap_or(current.duration_seconds);
+    let difficulty = body.difficulty.unwrap_or(current.difficulty);
+    let difficulty_ratings = body
+        .difficulty_ratings
+        .unwrap_or_else(|| current.difficulty_ratings.clone());
+    let difficulty_notes = body
+        .difficulty_notes
+        .unwrap_or_else(|| current.difficulty_notes.clone());
+
+    let unchanged = title == current.title
+        && status == current.status
+        && work_id == current.work_id
+        && instrumentation == current.instrumentation
+        && arranger == current.arranger
+        && publisher == current.publisher
+        && purchase_date == current.purchase_date
+        && license_notes == current.license_notes
+        && copy_count_allowed == current.copy_count_allowed
+        && duration_seconds == current.duration_seconds
+        && difficulty == current.difficulty
+        && difficulty_ratings == current.difficulty_ratings
+        && difficulty_notes == current.difficulty_notes;
+    if unchanged {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(
+            ArrangementResponse::from(current),
+            updated_at,
+        ));
+    }
 
     let updated = arrangement::update(
         &state.db,
         id,
         arrangement::ArrangementFields {
-            title: &body.title,
-            work_id: body.work_id,
-            instrumentation: body.instrumentation.as_deref(),
-            arranger: body.arranger.as_deref(),
-            publisher: body.publisher.as_deref(),
-            purchase_date: body.purchase_date,
-            license_notes: body.license_notes.as_deref(),
-            copy_count_allowed: body.copy_count_allowed,
-            status,
-            duration_seconds: body.duration_seconds,
-            difficulty: body.difficulty,
-            difficulty_ratings: body.difficulty_ratings.clone(),
-            difficulty_notes: body.difficulty_notes.as_deref(),
+            title: &title,
+            work_id,
+            instrumentation: instrumentation.as_deref(),
+            arranger: arranger.as_deref(),
+            publisher: publisher.as_deref(),
+            purchase_date,
+            license_notes: license_notes.as_deref(),
+            copy_count_allowed,
+            status: &status,
+            duration_seconds,
+            difficulty,
+            difficulty_ratings,
+            difficulty_notes: difficulty_notes.as_deref(),
         },
     )
     .await
@@ -882,7 +965,11 @@ async fn update_arrangement(
     )
     .await;
 
-    Ok(Json(updated.into()))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(
+        ArrangementResponse::from(updated),
+        updated_at,
+    ))
 }
 
 /// Soft-delete an arrangement (owner/archivist; requires `If-Match`).
@@ -1028,7 +1115,7 @@ impl From<voice::Voice> for VoiceResponse {
     }
 }
 
-/// Request body for creating or updating a voice.
+/// Request body for creating a voice.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct VoiceRequest {
@@ -1037,24 +1124,26 @@ struct VoiceRequest {
     /// Which part of its instrument this is: at least 1, or `null` for a part
     /// with no number (Timpani, Harp).
     ///
-    /// **Omitting it is not the same as `null`.** On create, an omitted
-    /// `partNumber` is guessed from the name ("Trumpet in Bb 1" → 1; combined
-    /// parts such as "Horn 1 & 3" get none). On update, an omitted
-    /// `partNumber` keeps the current value, so a client that predates the
-    /// field cannot erase it; send `null` to clear it.
+    /// **Omitting it is not the same as `null`.** An omitted `partNumber` is
+    /// guessed from the name ("Trumpet in Bb 1" → 1; combined parts such as
+    /// "Horn 1 & 3" get none).
     #[serde(default, deserialize_with = "present_or_null")]
     #[schema(value_type = Option<i16>, nullable)]
     part_number: Option<Option<i16>>,
 }
 
-/// Deserialize a field that distinguishes *absent* (outer `None`, via
-/// `#[serde(default)]`) from *explicitly `null`* (`Some(None)`).
-fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
+/// Request body for `PATCH …/voices/{id}`: a partial update. An omitted
+/// field is kept — in particular an omitted `partNumber` is never re-guessed
+/// from a new name, and a client that predates the field cannot erase it.
+/// Send `partNumber: null` to clear it.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateVoiceRequest {
+    name: Option<String>,
+    instrument_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<i16>, nullable)]
+    part_number: Option<Option<i16>>,
 }
 
 fn voice_error_to_app_error(err: voice::VoiceError) -> AppError {
@@ -1334,7 +1423,7 @@ async fn get_voice(
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = VoiceRequest,
+    request_body = UpdateVoiceRequest,
     responses(
         (status = 200, description = "Updated voice", body = VoiceResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -1352,8 +1441,8 @@ async fn update_voice(
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id, id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<VoiceRequest>,
-) -> Result<Json<VoiceResponse>, AppError> {
+    Json(body): Json<UpdateVoiceRequest>,
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     let current = find_voice_scoped(&state, org_id, arrangement_id, id).await?;
@@ -1361,20 +1450,22 @@ async fn update_voice(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if body.name.trim().is_empty() {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("name"),
-            garde::Error::new("name must not be empty"),
-        );
-        return Err(AppError::Validation(report));
+    reject_blank("name", body.name.as_deref())?;
+    let name = body.name.unwrap_or_else(|| current.name.clone());
+    let instrument_id = body.instrument_id.unwrap_or(current.instrument_id);
+    if name == current.name
+        && instrument_id == current.instrument_id
+        && body.part_number.is_none_or(|n| n == current.part_number)
+    {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(VoiceResponse::from(current), updated_at));
     }
 
     let updated = voice::update(
         &state.db,
         id,
-        &body.name,
-        body.instrument_id,
+        &name,
+        instrument_id,
         match body.part_number {
             None => voice::PartNumberChange::Keep,
             Some(n) => voice::PartNumberChange::Set(n),
@@ -1409,7 +1500,8 @@ async fn update_voice(
     )
     .await;
 
-    Ok(Json(updated.into()))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(VoiceResponse::from(updated), updated_at))
 }
 
 /// Soft-delete a voice (owner/archivist; requires `If-Match`).
@@ -1550,12 +1642,23 @@ impl From<tag::Tag> for TagResponse {
     }
 }
 
-/// Request body for creating or updating a tag.
+/// Request body for creating a tag.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct TagRequest {
     name: String,
     kind: Option<String>,
+}
+
+/// Request body for `PATCH …/tags/{id}`: a partial update. An omitted field
+/// is kept; `kind: null` clears the kind.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateTagRequest {
+    name: Option<String>,
+    #[serde(default, deserialize_with = "present_or_null")]
+    #[schema(value_type = Option<String>, nullable)]
+    kind: Option<Option<String>>,
 }
 
 fn tag_error_to_app_error(err: tag::TagError) -> AppError {
@@ -1766,7 +1869,7 @@ async fn get_tag(
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = TagRequest,
+    request_body = UpdateTagRequest,
     responses(
         (status = 200, description = "Updated tag", body = TagResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -1784,8 +1887,8 @@ async fn update_tag(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<TagRequest>,
-) -> Result<Json<TagResponse>, AppError> {
+    Json(body): Json<UpdateTagRequest>,
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     let current = find_tag_scoped(&state, org_id, id).await?;
@@ -1793,16 +1896,15 @@ async fn update_tag(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if body.name.trim().is_empty() {
-        let mut report = garde::Report::new();
-        report.append(
-            garde::Path::new("name"),
-            garde::Error::new("name must not be empty"),
-        );
-        return Err(AppError::Validation(report));
+    reject_blank("name", body.name.as_deref())?;
+    let name = body.name.unwrap_or_else(|| current.name.clone());
+    let kind = body.kind.unwrap_or_else(|| current.kind.clone());
+    if name == current.name && kind == current.kind {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(TagResponse::from(current), updated_at));
     }
 
-    let updated = tag::update(&state.db, id, &body.name, body.kind.as_deref())
+    let updated = tag::update(&state.db, id, &name, kind.as_deref())
         .await
         .map_err(tag_error_to_app_error)?
         .ok_or(AppError::NotFound)?;
@@ -1824,7 +1926,8 @@ async fn update_tag(
     )
     .await;
 
-    Ok(Json(updated.into()))
+    let updated_at = updated.updated_at;
+    Ok(etag_response(TagResponse::from(updated), updated_at))
 }
 
 /// Soft-delete a tag (owner/archivist; requires `If-Match`).

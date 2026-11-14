@@ -901,3 +901,271 @@ async fn an_invalid_instrument_id_filter_returns_400() {
     let response = app.oneshot(req).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------------------
+// PATCH is a partial update (issue #23).
+// ---------------------------------------------------------------------------
+
+/// GET `uri` and return its ETag.
+async fn etag_of(app: &axum::Router, token: &str, uri: &str) -> String {
+    let request = bearer_request("GET", uri, token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK, "GET {uri}");
+    response.headers()[axum::http::header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// PATCH `uri` with its current ETag; returns status, response ETag and body.
+async fn patch_json(
+    app: &axum::Router,
+    token: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
+    let etag = etag_of(app, token, uri).await;
+    let request = bearer_request("PATCH", uri, token)
+        .header(axum::http::header::IF_MATCH, etag)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    // Body-shape rejections come from axum's extractor as plain text.
+    let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, etag, body)
+}
+
+#[tokio::test]
+async fn arrangement_patch_changes_only_the_fields_it_sends() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_id}/arrangements"), &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "title": "Carmen Suite",
+                "arranger": "Hoffmann",
+                "publisher": "Schott",
+                "licenseNotes": "Purchased 2019",
+                "difficulty": 5,
+                "durationSeconds": 900,
+                "status": "archived",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/orgs/{org_id}/arrangements/{id}");
+
+    // A title-only PATCH keeps every provenance field (it used to null them).
+    let (status, etag, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "title": "Carmen Suite No. 2" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(etag.is_some(), "a PATCH response carries the new ETag");
+    assert_eq!(body["title"], "Carmen Suite No. 2");
+    assert_eq!(body["arranger"], "Hoffmann");
+    assert_eq!(body["publisher"], "Schott");
+    assert_eq!(body["licenseNotes"], "Purchased 2019");
+    assert_eq!(body["difficulty"], 5);
+    assert_eq!(body["durationSeconds"], 900);
+    assert_eq!(body["status"], "archived");
+
+    // `null` clears a nullable field and leaves the rest alone.
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "publisher": null })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body["publisher"].is_null());
+    assert_eq!(body["arranger"], "Hoffmann");
+    assert_eq!(body["title"], "Carmen Suite No. 2");
+
+    // A required field may be omitted but not blanked; `null` on it keeps it.
+    let (status, _, _) = patch_json(&app, &token, &uri, serde_json::json!({ "title": " " })).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "title": null })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["title"], "Carmen Suite No. 2");
+
+    // A misspelled field is refused, not silently ignored.
+    let (status, _, _) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "publsher": "Bärenreiter" }),
+    )
+    .await;
+    assert!(status.is_client_error(), "got {status}");
+    let (_, _, body) = patch_json(&app, &token, &uri, serde_json::json!({})).await;
+    assert!(
+        body["publisher"].is_null(),
+        "the refused PATCH wrote nothing"
+    );
+
+    // A PATCH that changes nothing writes nothing: same ETag, no audit row.
+    let before = etag_of(&app, &token, &uri).await;
+    let audits = audit_count(&db.pool, "arrangement.update").await;
+    let (status, etag, _) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "arranger": "Hoffmann" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(etag.as_deref(), Some(before.as_str()));
+    let (status, etag, _) = patch_json(&app, &token, &uri, serde_json::json!({})).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(etag.as_deref(), Some(before.as_str()));
+    assert_eq!(audit_count(&db.pool, "arrangement.update").await, audits);
+}
+
+#[tokio::test]
+async fn work_patch_keeps_the_composer_unless_it_is_sent() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (_org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let request = bearer_request("POST", "/v1/works", &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({ "title": "The Planets", "composer": "Holst" }).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/works/{id}");
+
+    let (status, _, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "title": "The Planets, Op. 32" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["title"], "The Planets, Op. 32");
+    assert_eq!(body["composer"], "Holst");
+
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "composer": null })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body["composer"].is_null());
+    assert_eq!(body["title"], "The Planets, Op. 32");
+}
+
+#[tokio::test]
+async fn voice_patch_changes_only_the_fields_it_sends() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let instruments: Vec<Uuid> =
+        sqlx::query_scalar!(r#"SELECT id FROM instrument ORDER BY key LIMIT 2"#)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+
+    let arr = create_arrangement_json(&app, &token, org_id, "Bolero").await;
+    let arr_id = arr["id"].as_str().unwrap();
+    let request = bearer_request(
+        "POST",
+        &format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices"),
+        &token,
+    )
+    .body(axum::body::Body::from(
+        serde_json::json!({ "name": "Flute 2", "instrumentId": instruments[0] }).to_string(),
+    ))
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let voice_id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}");
+
+    // Instrument only: the name and the guessed part number stay.
+    let (status, _, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "instrumentId": instruments[1] }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Flute 2");
+    assert_eq!(body["instrumentId"], instruments[1].to_string());
+    assert_eq!(body["partNumber"], 2);
+
+    // Name only: the instrument stays, and the part number is not re-guessed.
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "name": "Piccolo" })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Piccolo");
+    assert_eq!(body["instrumentId"], instruments[1].to_string());
+    assert_eq!(body["partNumber"], 2);
+}
+
+#[tokio::test]
+async fn tag_patch_keeps_the_kind_unless_it_is_sent() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_id}/tags"), &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({ "name": "Festive", "kind": "occasion" }).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let tag_id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/orgs/{org_id}/tags/{tag_id}");
+
+    let (status, _, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "name": "Celebration" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["name"], "Celebration");
+    assert_eq!(body["kind"], "occasion");
+
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "kind": null })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body["kind"].is_null());
+    assert_eq!(body["name"], "Celebration");
+}

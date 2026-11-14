@@ -470,3 +470,41 @@ fn openapi_document_has_expected_resource_tags() {
         );
     }
 }
+
+/// Issue #23: every `PATCH` is a partial update, so no `PATCH` request body
+/// may declare a required property — a client must be able to send one field.
+#[test]
+fn patch_request_bodies_have_no_required_fields() {
+    let json = build_openapi_json();
+    let schemas = &json["components"]["schemas"];
+    let mut patch_bodies = 0;
+    let mut violations = Vec::new();
+    for (path, item) in json["paths"].as_object().expect("paths object") {
+        let Some(schema) = item
+            .get("patch")
+            .and_then(|op| op.pointer("/requestBody/content/application~1json/schema"))
+        else {
+            continue;
+        };
+        patch_bodies += 1;
+        let resolved = match schema.get("$ref").and_then(Value::as_str) {
+            Some(reference) => {
+                let name = reference.rsplit('/').next().unwrap_or_default();
+                &schemas[name]
+            }
+            None => schema,
+        };
+        if let Some(required) = resolved.get("required").and_then(Value::as_array) {
+            if !required.is_empty() {
+                violations.push(format!("PATCH {path} requires {required:?}"));
+            }
+        }
+    }
+
+    assert!(patch_bodies >= 10, "found only {patch_bodies} PATCH bodies");
+    assert!(
+        violations.is_empty(),
+        "PATCH bodies with required fields:\n{}",
+        violations.join("\n")
+    );
+}
