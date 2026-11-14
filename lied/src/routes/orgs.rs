@@ -1,5 +1,5 @@
-//! `/v1/orgs`, `/v1/orgs/{id}`, `/v1/orgs/{orgId}/members`,
-//! `/v1/orgs/{orgId}/members/{id}`, `/v1/users`, `/v1/users/{id}` — issue #5
+//! `/v1/orgs`, `/v1/orgs/{orgId}`, `/v1/orgs/{orgId}/members`,
+//! `/v1/orgs/{orgId}/members/{memberId}`, `/v1/users`, `/v1/users/{userId}` — issue #5
 //! (Org/User/Membership management).
 //!
 //! This module is the first to apply the full REST convention set from
@@ -105,7 +105,7 @@ struct CreateOrgRequest {
     name: String,
 }
 
-/// Request body for `PATCH /v1/orgs/{id}`: a partial update; an omitted
+/// Request body for `PATCH /v1/orgs/{orgId}`: a partial update; an omitted
 /// `name` is kept. The slug never changes here (slug rename is its own,
 /// admin-gated operation).
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -135,11 +135,11 @@ async fn user_by_id(state: &AppState, id: Uuid) -> Result<user::User, AppError> 
     tag = "organizations",
     summary = "List organizations",
     params(
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `slug`, `createdAt`."),
-        ("filter[name]" = Option<String>, Query,
+        ("filter[name]" = Option<String>, Query, 
             description = "ILIKE filter on organization name"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -304,7 +304,7 @@ async fn get_org(
     tag = "organizations",
     summary = "Update an organization",
     params(
-        ("orgId"       = Uuid,   Path,   description = "Organization ID"),
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -386,7 +386,7 @@ async fn update_org(
     tag = "organizations",
     summary = "Delete an organization",
     params(
-        ("orgId"       = Uuid,   Path,   description = "Organization ID"),
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -462,11 +462,11 @@ struct CreateUserRequest {
     tag = "users",
     summary = "List users",
     params(
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `username` (default, ascending), `displayName`, `createdAt`."),
-        ("filter[username]" = Option<String>, Query,
+        ("filter[username]" = Option<String>, Query, 
             description = "ILIKE filter on username"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -656,7 +656,7 @@ async fn get_user(
     tag = "users",
     summary = "Delete a user",
     params(
-        ("userId"       = Uuid,   Path,   description = "User ID"),
+        ("userId"   = Uuid,   Path,   description = "User ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -764,7 +764,7 @@ struct CreateMemberRequest {
     principal_instrument_ids: Option<Vec<Uuid>>,
 }
 
-/// Request body for `PATCH /v1/orgs/{orgId}/members/{id}`: a partial
+/// Request body for `PATCH /v1/orgs/{orgId}/members/{memberId}`: a partial
 /// update. An omitted field is kept; none of these fields is nullable, so
 /// `null` is the same as omitting it (send `[]` to empty an instrument list).
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -783,12 +783,12 @@ struct UpdateMemberRequest {
     tag = "members",
     summary = "List members",
     params(
-        ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"  = Uuid,           Path,  description = "Organization ID"),
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `createdAt` (default, ascending), `role`, `isPrincipal`."),
-        ("filter[role]" = Option<String>, Query,
+        ("filter[role]" = Option<String>, Query, 
             description = "Filter by role: `owner`, `archivist`, `conductor`, `musician`"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -989,8 +989,8 @@ async fn find_member_scoped(
     tag = "members",
     summary = "Get a member",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("memberId"    = Uuid, Path, description = "Membership ID"),
+        ("orgId"    = Uuid, Path, description = "Organization ID"),
+        ("memberId" = Uuid, Path, description = "Membership ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1027,8 +1027,8 @@ async fn get_member(
     tag = "members",
     summary = "Update a member",
     params(
-        ("orgId"   = Uuid,   Path,   description = "Organization ID"),
-        ("memberId"      = Uuid,   Path,   description = "Membership ID"),
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("memberId" = Uuid,   Path,   description = "Membership ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1155,8 +1155,8 @@ async fn update_member(
     tag = "members",
     summary = "Remove a member",
     params(
-        ("orgId"   = Uuid,   Path,   description = "Organization ID"),
-        ("memberId"      = Uuid,   Path,   description = "Membership ID"),
+        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
+        ("memberId" = Uuid,   Path,   description = "Membership ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),

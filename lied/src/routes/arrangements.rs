@@ -1,6 +1,6 @@
 //! `/v1/works`, `/v1/orgs/{orgId}/arrangements`,
-//! `/v1/orgs/{orgId}/arrangements/{id}/voices`,
-//! `/v1/orgs/{orgId}/arrangements/{id}/tags`, `/v1/orgs/{orgId}/tags` —
+//! `/v1/orgs/{orgId}/arrangements/{arrangementId}/voices`,
+//! `/v1/orgs/{orgId}/arrangements/{arrangementId}/tags`, `/v1/orgs/{orgId}/tags` —
 //! issue #6 (Arrangement metadata management: Works, Arrangements, Voices,
 //! Tags — the catalog backbone).
 
@@ -88,7 +88,7 @@ struct CreateWorkRequest {
     composer: Option<String>,
 }
 
-/// Request body for `PATCH /v1/works/{id}`: a partial update. An omitted
+/// Request body for `PATCH /v1/works/{workId}`: a partial update. An omitted
 /// field is kept; `composer: null` clears the composer.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,9 +106,9 @@ struct UpdateWorkRequest {
     tag = "works",
     summary = "List works",
     params(
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `title` (default, ascending), `composer`, `createdAt`."),
         ("filter[title]"    = Option<String>, Query, description = "ILIKE filter on title"),
         ("filter[composer]" = Option<String>, Query, description = "ILIKE filter on composer"),
@@ -271,7 +271,7 @@ async fn get_work(
     tag = "works",
     summary = "Update a work",
     params(
-        ("workId"       = Uuid,   Path,   description = "Work ID"),
+        ("workId"   = Uuid,   Path,   description = "Work ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -354,7 +354,7 @@ async fn update_work(
     tag = "works",
     summary = "Delete a work",
     params(
-        ("workId"       = Uuid,   Path,   description = "Work ID"),
+        ("workId"   = Uuid,   Path,   description = "Work ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -493,7 +493,7 @@ struct CreateArrangementRequest {
     difficulty_notes: Option<String>,
 }
 
-/// Request body for `PATCH …/arrangements/{id}`: a partial update. An
+/// Request body for `PATCH …/arrangements/{arrangementId}`: a partial update. An
 /// omitted field is kept; `null` clears a nullable field. `title` and
 /// `status` are required by the model, so they can be changed but not cleared.
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -638,29 +638,29 @@ fn build_search<'a>(
     tag = "arrangements",
     summary = "List arrangements",
     params(
-        ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"  = Uuid,           Path,  description = "Organization ID"),
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `title` (default, ascending), `createdAt`, `difficulty`, `durationSeconds`, `relevance`. Bare `relevance` sorts best match first (descending); without `q` it falls back to the default."),
-        ("q" = Option<String>, Query,
+        ("q" = Option<String>, Query, 
             description = "Search across title, composer, arranger, tag names and instrumentation \
                            (full text, accent-insensitive), plus fuzzy matching on title and \
                            composer so a misspelling still finds the piece. Supports quoted \
                            phrases and `-exclusion`."),
-        ("filter[status]" = Option<String>, Query,
+        ("filter[status]" = Option<String>, Query, 
             description = "Filter by status: `active` or `archived`"),
-        ("filter[difficultyMin]" = Option<i16>, Query,
+        ("filter[difficultyMin]" = Option<i16>, Query, 
             description = "Lowest ABRSM difficulty to include"),
-        ("filter[difficultyMax]" = Option<i16>, Query,
+        ("filter[difficultyMax]" = Option<i16>, Query, 
             description = "Highest ABRSM difficulty to include"),
-        ("filter[durationMinSeconds]" = Option<i32>, Query,
+        ("filter[durationMinSeconds]" = Option<i32>, Query, 
             description = "Shortest duration to include, in seconds"),
-        ("filter[durationMaxSeconds]" = Option<i32>, Query,
+        ("filter[durationMaxSeconds]" = Option<i32>, Query, 
             description = "Longest duration to include, in seconds"),
-        ("filter[tag]" = Option<String>, Query,
+        ("filter[tag]" = Option<String>, Query, 
             description = "Comma-separated tag IDs; an arrangement must carry ALL of them"),
-        ("filter[instrumentId]" = Option<Uuid>, Query,
+        ("filter[instrumentId]" = Option<Uuid>, Query, 
             description = "Only arrangements having a live voice for this instrument"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -826,8 +826,8 @@ async fn find_arrangement_scoped_including_deleted(
     tag = "arrangements",
     summary = "Get an arrangement",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -857,9 +857,9 @@ async fn get_arrangement(
     tag = "arrangements",
     summary = "Update an arrangement",
     params(
-        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrangementId"       = Uuid,   Path,   description = "Arrangement ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+        ("orgId"         = Uuid,   Path,   description = "Organization ID"),
+        ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
+        ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = UpdateArrangementRequest,
@@ -996,9 +996,9 @@ async fn update_arrangement(
     tag = "arrangements",
     summary = "Soft-delete an arrangement",
     params(
-        ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrangementId"       = Uuid,   Path,   description = "Arrangement ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
+        ("orgId"         = Uuid,   Path,   description = "Organization ID"),
+        ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
+        ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1054,8 +1054,8 @@ async fn delete_arrangement(
     tag = "arrangements",
     summary = "Undelete an arrangement",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1152,7 +1152,7 @@ struct CreateVoiceRequest {
     part_number: Option<Option<i16>>,
 }
 
-/// Request body for `PATCH …/voices/{id}`: a partial update. An omitted
+/// Request body for `PATCH …/voices/{voiceId}`: a partial update. An omitted
 /// field is kept — in particular an omitted `partNumber` is never re-guessed
 /// from a new name, and a client that predates the field cannot erase it.
 /// Send `partNumber: null` to clear it.
@@ -1206,13 +1206,13 @@ struct VoiceListQuery {
     tag = "voices",
     summary = "List voices",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"         = Uuid,           Path,  description = "Organization ID"),
+        ("arrangementId" = Uuid,           Path,  description = "Arrangement ID"),
+        ("limit"         = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset"        = Option<u32>,    Query, description = "Page offset"),
+        ("sort"          = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `createdAt`."),
-        ("filter[instrumentId]" = Option<Uuid>, Query,
+        ("filter[instrumentId]" = Option<Uuid>, Query, 
             description = "Filter by instrument UUID"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1290,8 +1290,8 @@ async fn list_voices(
     tag = "voices",
     summary = "Create a voice",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = CreateVoiceRequest,
@@ -1409,7 +1409,7 @@ async fn find_voice_scoped_including_deleted(
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("voiceId"            = Uuid, Path, description = "Voice ID"),
+        ("voiceId"       = Uuid, Path, description = "Voice ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1441,7 +1441,7 @@ async fn get_voice(
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("voiceId"            = Uuid,   Path,   description = "Voice ID"),
+        ("voiceId"       = Uuid,   Path,   description = "Voice ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1538,7 +1538,7 @@ async fn update_voice(
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("voiceId"            = Uuid,   Path,   description = "Voice ID"),
+        ("voiceId"       = Uuid,   Path,   description = "Voice ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1597,7 +1597,7 @@ async fn delete_voice(
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("voiceId"            = Uuid, Path, description = "Voice ID"),
+        ("voiceId"       = Uuid, Path, description = "Voice ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1678,7 +1678,7 @@ struct CreateTagRequest {
     kind: Option<String>,
 }
 
-/// Request body for `PATCH …/tags/{id}`: a partial update. An omitted field
+/// Request body for `PATCH …/tags/{tagId}`: a partial update. An omitted field
 /// is kept; `kind: null` clears the kind.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1712,12 +1712,12 @@ struct TagListQuery {
     tag = "tags",
     summary = "List tags",
     params(
-        ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"  = Uuid,           Path,  description = "Organization ID"),
+        ("limit"  = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset" = Option<u32>,    Query, description = "Page offset"),
+        ("sort"   = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `name` (default, ascending), `kind`."),
-        ("filter[kind]" = Option<String>, Query,
+        ("filter[kind]" = Option<String>, Query, 
             description = "Filter by tag kind, e.g. `theme`, `mood`, `era`"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1861,7 +1861,7 @@ async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag
     summary = "Get a tag",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("tagId"    = Uuid, Path, description = "Tag ID"),
+        ("tagId" = Uuid, Path, description = "Tag ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -1892,7 +1892,7 @@ async fn get_tag(
     summary = "Update a tag",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("tagId"       = Uuid,   Path,   description = "Tag ID"),
+        ("tagId"    = Uuid,   Path,   description = "Tag ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -1974,7 +1974,7 @@ async fn update_tag(
     summary = "Soft-delete a tag",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("tagId"       = Uuid,   Path,   description = "Tag ID"),
+        ("tagId"    = Uuid,   Path,   description = "Tag ID"),
         ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -2030,7 +2030,7 @@ async fn delete_tag(
     summary = "Undelete a tag",
     params(
         ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("tagId"    = Uuid, Path, description = "Tag ID"),
+        ("tagId" = Uuid, Path, description = "Tag ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -2096,8 +2096,8 @@ async fn undelete_tag(
     tag = "tags",
     summary = "List arrangement tags",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -2135,8 +2135,8 @@ struct AttachTagRequest {
     tag = "tags",
     summary = "Attach a tag to an arrangement",
     params(
-        ("orgId" = Uuid, Path, description = "Organization ID"),
-        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
+        ("orgId"         = Uuid, Path, description = "Organization ID"),
+        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body = AttachTagRequest,

@@ -751,25 +751,63 @@ fn sort_and_filter_docs_match_the_allowlists() {
     );
 }
 
+/// The resource a collection path segment names, in PascalCase and
+/// singular: `orgs` → `Org`, `app-passwords` → `AppPassword`,
+/// `categories` → `Category`. Shared by the #74 naming tests.
+fn resource_of(segment: &str) -> String {
+    let singular = if let Some(stem) = segment.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if segment.ends_with("sses") || segment.ends_with("ches") || segment.ends_with("shes") {
+        segment[..segment.len() - 2].to_string()
+    } else {
+        segment.strip_suffix('s').unwrap_or(segment).to_string()
+    };
+    singular
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// `resource_of` with a lowercase first letter, plus `Id`: the path
+/// parameter a collection segment is followed by.
+fn parameter_of(segment: &str) -> String {
+    let resource = resource_of(segment);
+    let mut chars = resource.chars();
+    chars
+        .next()
+        .map(|c| c.to_lowercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+        + "Id"
+}
+
+/// A schema, following a `$ref` into `components.schemas` when it is one.
+fn resolve<'a>(json: &'a Value, schema: &'a Value) -> &'a Value {
+    match schema["$ref"].as_str().and_then(|r| r.rsplit('/').next()) {
+        Some(name) => &json["components"]["schemas"][name],
+        None => schema,
+    }
+}
+
+#[test]
+fn resource_naming_handles_plurals() {
+    assert_eq!(parameter_of("orgs"), "orgId");
+    assert_eq!(parameter_of("app-passwords"), "appPasswordId");
+    assert_eq!(resource_of("categories"), "Category");
+    assert_eq!(resource_of("addresses"), "Address");
+}
+
 /// Issue #74: a path parameter is named after the collection segment before
 /// it, singular, plus `Id` (`orgs/{orgId}`, `members/{memberId}`,
 /// `app-passwords/{appPasswordId}`). Since #66 these names are what a bad
 /// parameter's Problem Details reports in `errors`, so they are contract.
 #[test]
 fn path_parameters_are_named_after_their_collection() {
-    fn expected(segment: &str) -> String {
-        let singular = segment.strip_suffix('s').unwrap_or(segment);
-        let mut parts = singular.split('-');
-        let mut name = parts.next().unwrap_or_default().to_string();
-        for part in parts {
-            let mut chars = part.chars();
-            if let Some(first) = chars.next() {
-                name.extend(first.to_uppercase());
-                name.push_str(chars.as_str());
-            }
-        }
-        name + "Id"
-    }
     let json = build_openapi_json();
     let mut violations = Vec::new();
     for path in json["paths"].as_object().expect("paths object").keys() {
@@ -778,7 +816,14 @@ fn path_parameters_are_named_after_their_collection() {
             let Some(name) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
                 continue;
             };
-            let want = expected(segments[i - 1]);
+            let before = segments[i - 1];
+            if before.starts_with('{') {
+                violations.push(format!(
+                    "{path}: {{{name}}} follows another parameter; put a collection segment between them"
+                ));
+                continue;
+            }
+            let want = parameter_of(before);
             if name != want {
                 violations.push(format!("{path}: {{{name}}} should be {{{want}}}"));
             }
@@ -796,10 +841,10 @@ fn path_parameters_are_named_after_their_collection() {
 /// is `Create<Resource>Request`, `<Resource>` being the singular of the last
 /// collection segment — so a generated client never meets a bare
 /// `CreateRequest`. Bodies of other actions (reorder, apply, mint) keep
-/// their verb names.
+/// their verb names. Every request body is a named schema.
 #[test]
 fn request_schemas_are_named_after_their_resource() {
-    /// Creates that are not named after the last segment, with the reason.
+    /// Creates not named after the last segment, with the reason.
     const EXCEPTIONS: &[(&str, &str)] = &[
         (
             "AttachTagRequest",
@@ -807,42 +852,37 @@ fn request_schemas_are_named_after_their_resource() {
         ),
         ("UploadForm", "multipart marker schema for file uploads"),
     ];
-    fn resource(path: &str) -> String {
-        let segment = path
-            .rsplit('/')
-            .find(|s| !s.starts_with('{'))
-            .unwrap_or_default();
-        let singular = segment.strip_suffix('s').unwrap_or(segment);
-        singular
-            .split('-')
-            .map(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            })
-            .collect()
-    }
     let json = build_openapi_json();
     let mut violations = Vec::new();
+    let mut used_exceptions = std::collections::BTreeSet::new();
     for (path, item) in json["paths"].as_object().expect("paths object") {
         for (method, op) in item.as_object().expect("path item") {
-            let Some(reference) = op["requestBody"]["content"]
+            let Some(media) = op["requestBody"]["content"]
                 .as_object()
                 .and_then(|content| content.values().next())
-                .and_then(|media| media["schema"]["$ref"].as_str())
             else {
+                continue;
+            };
+            let Some(reference) = media["schema"]["$ref"].as_str() else {
+                violations.push(format!(
+                    "{} {path}: the request body is an inline schema; give it a named type",
+                    method.to_uppercase()
+                ));
                 continue;
             };
             let name = reference.rsplit('/').next().unwrap_or_default();
             if EXCEPTIONS.iter().any(|(n, _)| *n == name) {
+                used_exceptions.insert(name.to_string());
                 continue;
             }
+            let last = path
+                .rsplit('/')
+                .find(|s| !s.starts_with('{'))
+                .unwrap_or_default();
             let expected = match method.as_str() {
-                "patch" => format!("Update{}Request", resource(path)),
+                "patch" => format!("Update{}Request", resource_of(last)),
                 "post" if op["responses"].get("201").is_some() => {
-                    format!("Create{}Request", resource(path))
+                    format!("Create{}Request", resource_of(last))
                 }
                 _ => continue,
             };
@@ -854,6 +894,13 @@ fn request_schemas_are_named_after_their_resource() {
             }
         }
     }
+    for (name, _) in EXCEPTIONS {
+        if !used_exceptions.contains(*name) {
+            violations.push(format!(
+                "{name}: listed as an exception but no longer used (remove it)"
+            ));
+        }
+    }
     assert!(
         violations.is_empty(),
         "Request schema names:\n{}",
@@ -862,8 +909,9 @@ fn request_schemas_are_named_after_their_resource() {
 }
 
 /// Issue #74: list endpoints return the `{ items, total, limit, offset }`
-/// envelope. An operation answering a bare array must be listed here with
-/// the reason; CLAUDE.md names the same exceptions.
+/// envelope. An operation answering a bare array (inline or through a named
+/// schema) must be listed here with the reason; CLAUDE.md names the same
+/// exceptions.
 #[test]
 fn unpaginated_lists_are_named_exceptions() {
     const UNPAGINATED: &[(&str, &str)] = &[
@@ -877,11 +925,18 @@ fn unpaginated_lists_are_named_exceptions() {
         ),
         ("/v1/app-passwords", "the caller's own devices"),
     ];
+    fn is_array(schema: &Value) -> bool {
+        match &schema["type"] {
+            Value::String(t) => t == "array",
+            Value::Array(types) => types.iter().any(|t| t == "array"),
+            _ => false,
+        }
+    }
     let json = build_openapi_json();
     let mut found = Vec::new();
     for (path, item) in json["paths"].as_object().expect("paths object") {
         let schema = &item["get"]["responses"]["200"]["content"]["application/json"]["schema"];
-        if schema["type"] == "array" {
+        if is_array(resolve(&json, schema)) {
             found.push(path.clone());
         }
     }

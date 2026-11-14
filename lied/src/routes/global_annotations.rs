@@ -114,13 +114,13 @@ struct ListQuery {
     tag = "global-annotations",
     summary = "List global annotations",
     params(
-        ("orgId"         = Uuid, Path, description = "Organization ID"),
-        ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
-        ("offset" = Option<u32>, Query, description = "Page offset"),
-        ("sort"   = Option<String>, Query,
+        ("orgId"         = Uuid,           Path,  description = "Organization ID"),
+        ("arrangementId" = Uuid,           Path,  description = "Arrangement ID"),
+        ("limit"         = Option<u32>,    Query, description = "Page size (default 50, max 200)"),
+        ("offset"        = Option<u32>,    Query, description = "Page offset"),
+        ("sort"          = Option<String>, Query, 
             description = "Sort as `field`, `field:asc` or `field:desc` (a bare field sorts ascending). Allowed fields: `createdAt` (default, ascending), `updatedAt`, `type`."),
-        ("filter[type]" = Option<String>, Query,
+        ("filter[type]" = Option<String>, Query, 
             description = "One of `tempo`, `dynamics`, `articulation`, `structure`, `general`"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -274,7 +274,7 @@ async fn create_annotation(
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("annotationId"            = Uuid, Path, description = "Annotation ID"),
+        ("annotationId"  = Uuid, Path, description = "Annotation ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -297,7 +297,7 @@ async fn get_annotation(
     Ok(etag_response(found, updated_at))
 }
 
-/// Request body for `PATCH …/annotations/{id}`: every field optional, and an
+/// Request body for `PATCH …/annotations/{annotationId}`: every field optional, and an
 /// omitted one is left unchanged. Unknown fields are refused, so a misspelled
 /// key is a 400 rather than a silent no-op.
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -318,7 +318,7 @@ struct UpdateAnnotationRequest {
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("annotationId"            = Uuid,   Path,   description = "Annotation ID"),
+        ("annotationId"  = Uuid,   Path,   description = "Annotation ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -409,7 +409,7 @@ async fn update_annotation(
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("annotationId"            = Uuid,   Path,   description = "Annotation ID"),
+        ("annotationId"  = Uuid,   Path,   description = "Annotation ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
