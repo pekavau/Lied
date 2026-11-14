@@ -11,6 +11,7 @@ use axum::http::request::Parts;
 use tower_sessions::Session;
 use uuid::Uuid;
 
+use crate::auth::csrf;
 use crate::auth::session::current_user_id;
 use crate::domain::user::{self, User};
 use crate::error::AppError;
@@ -46,12 +47,28 @@ impl FromRequestParts<AppState> for AuthSession {
     }
 }
 
-/// An authenticated user resolved from *either* the session cookie or an
-/// `Authorization: Bearer <jwt>` header, for the `/v1` tree (CLAUDE.md:
-/// "session cookie or bearer token"). Session is checked first since it's
-/// cheaper (no JWT decode) and is the common case for the HTMX-adjacent
-/// `/v1` calls the admin UI itself might make; bearer is checked second for
-/// programmatic clients.
+/// An authenticated user resolved from *either* an `Authorization: Bearer
+/// <jwt>` header or the session cookie, for the `/v1` tree (CLAUDE.md:
+/// "session cookie or bearer token").
+///
+/// **Bearer wins.** A request presenting a bearer token is authenticated by
+/// that token alone — an invalid one is a 401, never a fall-through to the
+/// cookie — and is exempt from CSRF: a cross-site page cannot attach an
+/// `Authorization` header (that needs a CORS preflight `/v1` never grants),
+/// so a bearer request is not forgeable the way a cookie request is.
+///
+/// **Cookie writes need the CSRF token** (issue #72). Without a bearer
+/// header the session cookie is tried, and a state-changing method (anything
+/// but `GET`/`HEAD`/`OPTIONS`) must then carry the session's token in
+/// `HX-CSRF`, or the request is a 403 Problem Details. The check lives here,
+/// rather than in a `/v1` middleware, because this is where the request is
+/// known to have authenticated by cookie: a middleware would have to
+/// re-derive which path the extractor takes, and a request carrying both a
+/// cookie and a bearer would be judged by a different rule than the one that
+/// authenticates it. Every authenticated `/v1` handler takes this extractor,
+/// so no cookie-authenticated write can reach a handler without the check;
+/// `POST /v1/tokens`, the one handler that reads the session directly,
+/// applies the same [`csrf::verify_header`] itself.
 pub struct BearerOrSession {
     pub user: User,
     pub org: Option<Uuid>,
@@ -65,42 +82,50 @@ impl FromRequestParts<AppState> for BearerOrSession {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Try the session cookie first.
-        if let Ok(session) = Session::from_request_parts(parts, state).await {
-            if let Ok(Some(user_id)) = current_user_id(&session).await {
-                if let Ok(Some(found)) = user::find_by_id(&state.db, user_id).await {
-                    return Ok(BearerOrSession {
-                        user: found,
-                        org: None,
-                    });
-                }
-            }
-        }
-
-        // Fall back to a bearer token.
-        let auth_header = parts
+        let bearer = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .ok_or(AppError::Unauthorized)?;
+            .and_then(|v| v.strip_prefix("Bearer "));
 
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or(AppError::Unauthorized)?;
+        if let Some(token) = bearer {
+            let claims = state
+                .jwt_keyring
+                .verify(token)
+                .map_err(|_| AppError::Unauthorized)?;
 
-        let claims = state
-            .jwt_keyring
-            .verify(token)
+            let found = user::find_by_id(&state.db, claims.sub)
+                .await
+                .map_err(AppError::from)?
+                .ok_or(AppError::Unauthorized)?;
+
+            return Ok(BearerOrSession {
+                user: found,
+                org: claims.org,
+            });
+        }
+
+        let session = Session::from_request_parts(parts, state)
+            .await
             .map_err(|_| AppError::Unauthorized)?;
-
-        let found = user::find_by_id(&state.db, claims.sub)
+        let user_id = current_user_id(&session)
+            .await
+            .map_err(|_| AppError::Unauthorized)?
+            .ok_or(AppError::Unauthorized)?;
+        let found = user::find_by_id(&state.db, user_id)
             .await
             .map_err(AppError::from)?
             .ok_or(AppError::Unauthorized)?;
 
+        // Authenticated by cookie: a write must prove it came from a page
+        // that could read the session's CSRF token.
+        if csrf::is_state_changing(&parts.method) {
+            csrf::verify_header(&session, &parts.headers).await?;
+        }
+
         Ok(BearerOrSession {
             user: found,
-            org: claims.org,
+            org: None,
         })
     }
 }
