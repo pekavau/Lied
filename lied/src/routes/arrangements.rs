@@ -23,7 +23,8 @@ use crate::listing::{etag_response, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
-    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+    CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Precondition412,
+    Validation400,
 };
 use crate::routes::patch::{changed_fields, present_or_null, reject_blank};
 use crate::routes::RequestId;
@@ -174,6 +175,7 @@ async fn list_works(
         (status = 201, description = "Work created", body = work::Work,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
     )
@@ -271,6 +273,7 @@ async fn get_work(
         (status = 200, description = "Updated work", body = work::Work,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -716,6 +719,7 @@ async fn list_arrangements(
         (status = 201, description = "Arrangement created", body = ArrangementResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -848,6 +852,7 @@ async fn get_arrangement(
         (status = 200, description = "Updated arrangement", body = ArrangementResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -1269,6 +1274,7 @@ async fn list_voices(
         (status = 201, description = "Voice created", body = VoiceResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -1418,6 +1424,7 @@ async fn get_voice(
         (status = 200, description = "Updated voice", body = VoiceResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -1746,6 +1753,7 @@ async fn list_tags(
         (status = 201, description = "Tag created", body = TagResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -1855,6 +1863,7 @@ async fn get_tag(
         (status = 200, description = "Updated tag", body = TagResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -2086,6 +2095,7 @@ struct AttachTagRequest {
     responses(
         (status = 201, description = "Tag attached"),
         CommonErrors,
+        JsonBodyErrors,
         Validation400,
         Forbidden403,
         NotFound404,

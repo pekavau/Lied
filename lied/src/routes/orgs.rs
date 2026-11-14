@@ -28,7 +28,8 @@ use crate::listing::{self, etag_response, if_match_header, SortDirection};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
-    CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
+    CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Precondition412,
+    Validation400,
 };
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
@@ -192,6 +193,7 @@ async fn list_orgs(
         (status = 201, description = "Organization created", body = OrganizationResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -295,6 +297,7 @@ async fn get_org(
         (status = 200, description = "Updated organization", body = OrganizationResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,
@@ -514,6 +517,7 @@ async fn list_users(
         (status = 201, description = "User created", body = user::User,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -843,6 +847,7 @@ async fn list_members(
         (status = 201, description = "Membership created", body = MembershipResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         Validation400,
         Conflict409,
@@ -1014,6 +1019,7 @@ async fn get_member(
         (status = 200, description = "Updated membership", body = MembershipResponse,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        JsonBodyErrors,
         Forbidden403,
         NotFound404,
         Validation400,

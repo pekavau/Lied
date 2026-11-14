@@ -509,11 +509,11 @@ fn patch_request_bodies_have_no_required_fields() {
     );
 }
 
-/// Issue #62: a JSON body can be refused (malformed, wrong shape, missing
-/// field) with a 400 Problem Details, so every operation that takes one must
-/// declare a 400.
+/// Issue #62: a JSON body can be refused before the handler runs — 400
+/// (malformed, wrong shape), 413 (too large), 415 (not JSON) — so every
+/// operation that takes one must declare all three.
 #[test]
-fn operations_with_a_json_body_declare_400() {
+fn operations_with_a_json_body_declare_its_rejections() {
     let json = build_openapi_json();
     let mut violations = Vec::new();
     for (path, item) in json["paths"].as_object().expect("paths object") {
@@ -524,14 +524,16 @@ fn operations_with_a_json_body_declare_400() {
             {
                 continue;
             }
-            if op.pointer("/responses/400").is_none() {
-                violations.push(format!("{} {path}", method.to_uppercase()));
+            for status in ["400", "413", "415"] {
+                if op.pointer(&format!("/responses/{status}")).is_none() {
+                    violations.push(format!("{} {path} lacks {status}", method.to_uppercase()));
+                }
             }
         }
     }
     assert!(
         violations.is_empty(),
-        "Operations taking a JSON body without a declared 400:\n{}",
+        "Operations taking a JSON body that miss a rejection status:\n{}",
         violations.join("\n")
     );
 }
