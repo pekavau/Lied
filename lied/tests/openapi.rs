@@ -790,3 +790,115 @@ fn path_parameters_are_named_after_their_collection() {
         violations.join("\n")
     );
 }
+
+/// Issue #74: request schemas say what they do and to which resource. A
+/// PATCH body is `Update<Resource>Request` and a create (POST answering 201)
+/// is `Create<Resource>Request`, `<Resource>` being the singular of the last
+/// collection segment — so a generated client never meets a bare
+/// `CreateRequest`. Bodies of other actions (reorder, apply, mint) keep
+/// their verb names.
+#[test]
+fn request_schemas_are_named_after_their_resource() {
+    /// Creates that are not named after the last segment, with the reason.
+    const EXCEPTIONS: &[(&str, &str)] = &[
+        (
+            "AttachTagRequest",
+            "links an existing tag; it creates no tag",
+        ),
+        ("UploadForm", "multipart marker schema for file uploads"),
+    ];
+    fn resource(path: &str) -> String {
+        let segment = path
+            .rsplit('/')
+            .find(|s| !s.starts_with('{'))
+            .unwrap_or_default();
+        let singular = segment.strip_suffix('s').unwrap_or(segment);
+        singular
+            .split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+    let json = build_openapi_json();
+    let mut violations = Vec::new();
+    for (path, item) in json["paths"].as_object().expect("paths object") {
+        for (method, op) in item.as_object().expect("path item") {
+            let Some(reference) = op["requestBody"]["content"]
+                .as_object()
+                .and_then(|content| content.values().next())
+                .and_then(|media| media["schema"]["$ref"].as_str())
+            else {
+                continue;
+            };
+            let name = reference.rsplit('/').next().unwrap_or_default();
+            if EXCEPTIONS.iter().any(|(n, _)| *n == name) {
+                continue;
+            }
+            let expected = match method.as_str() {
+                "patch" => format!("Update{}Request", resource(path)),
+                "post" if op["responses"].get("201").is_some() => {
+                    format!("Create{}Request", resource(path))
+                }
+                _ => continue,
+            };
+            if name != expected {
+                violations.push(format!(
+                    "{} {path}: {name} should be {expected}",
+                    method.to_uppercase()
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Request schema names:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Issue #74: list endpoints return the `{ items, total, limit, offset }`
+/// envelope. An operation answering a bare array must be listed here with
+/// the reason; CLAUDE.md names the same exceptions.
+#[test]
+fn unpaginated_lists_are_named_exceptions() {
+    const UNPAGINATED: &[(&str, &str)] = &[
+        (
+            "/v1/orgs/{orgId}/collections/{collectionId}/items",
+            "a collection's running order, read as a whole",
+        ),
+        (
+            "/v1/orgs/{orgId}/arrangements/{arrangementId}/tags",
+            "the tags on one arrangement",
+        ),
+        ("/v1/app-passwords", "the caller's own devices"),
+    ];
+    let json = build_openapi_json();
+    let mut found = Vec::new();
+    for (path, item) in json["paths"].as_object().expect("paths object") {
+        let schema = &item["get"]["responses"]["200"]["content"]["application/json"]["schema"];
+        if schema["type"] == "array" {
+            found.push(path.clone());
+        }
+    }
+    let mut violations: Vec<String> = found
+        .iter()
+        .filter(|p| !UNPAGINATED.iter().any(|(u, _)| u == *p))
+        .map(|p| format!("{p}: returns a bare array; paginate it or add it here with a reason"))
+        .collect();
+    violations.extend(
+        UNPAGINATED
+            .iter()
+            .filter(|(u, _)| !found.iter().any(|p| p == u))
+            .map(|(u, _)| format!("{u}: listed as unpaginated but is not (remove it)")),
+    );
+    assert!(
+        violations.is_empty(),
+        "Pagination:\n{}",
+        violations.join("\n")
+    );
+}

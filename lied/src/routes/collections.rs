@@ -156,7 +156,7 @@ async fn find_item_scoped(
 /// Request body for creating a collection.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CollectionRequest {
+struct CreateCollectionRequest {
     name: String,
     /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
     #[serde(rename = "type")]
@@ -254,7 +254,7 @@ async fn list_collections(
     summary = "Create a collection",
     params(("orgId" = Uuid, Path, description = "Organization ID")),
     security(("bearer" = []), ("session" = [])),
-    request_body = CollectionRequest,
+    request_body = CreateCollectionRequest,
     responses(
         (status = 201, description = "Collection created", body = collection::Collection,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -270,7 +270,7 @@ async fn create_collection(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    ApiJson(body): ApiJson<CollectionRequest>,
+    ApiJson(body): ApiJson<CreateCollectionRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
@@ -653,7 +653,7 @@ async fn list_items(
 /// Request body for adding an item to a collection.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AddItemRequest {
+struct CreateItemRequest {
     arrangement_id: Uuid,
     index: i32,
 }
@@ -669,7 +669,7 @@ struct AddItemRequest {
         ("collectionId"    = Uuid, Path, description = "Collection ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = AddItemRequest,
+    request_body = CreateItemRequest,
     responses(
         (status = 201, description = "Item added", body = collection_item::CollectionItem,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -686,7 +686,7 @@ async fn add_item(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
-    ApiJson(body): ApiJson<AddItemRequest>,
+    ApiJson(body): ApiJson<CreateItemRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, id).await?;
