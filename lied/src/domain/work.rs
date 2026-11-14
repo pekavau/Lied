@@ -185,9 +185,17 @@ pub async fn list(
 /// Update a Work's mutable fields (`title`, `composer`). Caller is
 /// responsible for the [`Work::is_editable_by`] check before calling this.
 /// Returns `None` if no row matched `id`.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     title: &str,
     composer: Option<&str>,
 ) -> Result<Option<Work>, sqlx::Error> {
@@ -195,7 +203,7 @@ pub async fn update(
         r#"
         UPDATE work
         SET title = $2, composer = $3, updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND ($4::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $4)
         RETURNING
             id, title, composer, created_by,
             created_at as "created_at: DateTime<Utc>",
@@ -204,6 +212,7 @@ pub async fn update(
         id,
         title,
         composer,
+        expected_version,
     )
     .fetch_optional(pool)
     .await?;
@@ -224,8 +233,23 @@ pub async fn update(
 /// Arrangement fails the FK constraint — callers should map that to a `409`
 /// rather than a raw `500` (see [`user::delete`](super::user::delete) for the
 /// same pattern).
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query!(r#"DELETE FROM work WHERE id = $1"#, id)
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
+pub async fn delete(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query!(
+        r#"DELETE FROM work WHERE id = $1 AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2)"#,
+        id,
+        expected_version,
+    )
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)

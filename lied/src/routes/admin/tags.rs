@@ -21,7 +21,7 @@ use uuid::Uuid;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::tag;
-use crate::listing::{check_if_match, SortDirection};
+use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, error_page, require_found, scoped_arrangement,
 };
@@ -260,8 +260,22 @@ async fn update_tag(
         return error_page(&ctx, StatusCode::BAD_REQUEST, "Tag name must not be empty.");
     };
     let kind = blank_to_none(form.kind);
-    match tag::update(&state.db, tag_id, &name, kind.as_deref()).await {
-        Ok(_) => {
+    match tag::update(
+        &state.db,
+        tag_id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+        kind.as_deref(),
+    )
+    .await
+    {
+        Ok(None) => console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "tag",
+            &format!("/admin/orgs/{org_id}/tags"),
+        ),
+        Ok(Some(_)) => {
             audit(
                 &state.db,
                 &audit_ctx(&ctx, request_id),
@@ -310,7 +324,7 @@ async fn delete_tag(
     ) {
         return response;
     }
-    match tag::soft_delete(&state.db, tag_id).await {
+    match tag::soft_delete(&state.db, tag_id, None).await {
         Ok(true) => {
             audit(
                 &state.db,

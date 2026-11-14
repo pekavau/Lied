@@ -204,7 +204,7 @@ async fn delete_org_submit(
         }
     };
 
-    match organization::delete(&state.db, id).await {
+    match organization::delete(&state.db, id, None).await {
         Ok(true) => {
             audit(
                 &state.db,
@@ -489,7 +489,7 @@ async fn delete_user_submit(
         }
     };
 
-    match user::delete(&state.db, id).await {
+    match user::delete(&state.db, id, None).await {
         Ok(true) => {
             audit(
                 &state.db,

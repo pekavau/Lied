@@ -454,6 +454,7 @@ async fn the_dashboard_summarises_every_collection_and_links_through() {
     lied::domain::part_assignment::update_state(
         &ctx.state.db,
         assignment.id,
+        None,
         StampChange::Keep,
         StampChange::Set(Some(chrono::Utc::now())),
     )
@@ -516,6 +517,7 @@ async fn the_detail_screen_names_each_voices_state() {
     lied::domain::part_assignment::update_state(
         &ctx.state.db,
         assignment.id,
+        None,
         StampChange::Set(Some(chrono::Utc::now())),
         StampChange::Keep,
     )

@@ -31,7 +31,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
 use crate::domain::{collection_item, part_assignment};
 use crate::error::AppError;
-use crate::listing::{etag_response, etag_response_status, if_match_header};
+use crate::listing::{self, etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
@@ -359,10 +359,24 @@ async fn update_assignment(
         return Ok(etag_response(current, updated_at));
     }
 
-    let updated =
-        part_assignment::update_state(&state.db, assignment_id, notified_at, acknowledged_at)
-            .await?
-            .ok_or(AppError::NotFound)?;
+    let Some(updated) = part_assignment::update_state(
+        &state.db,
+        assignment_id,
+        Some(listing::version_of(current.updated_at)),
+        notified_at,
+        acknowledged_at,
+    )
+    .await?
+    else {
+        return Err(listing::stale_or_gone(find_assignment_scoped(
+            &state,
+            org_id,
+            collection_id,
+            item_id,
+            assignment_id,
+        ))
+        .await);
+    };
 
     audit(
         &state.db,
@@ -421,8 +435,21 @@ async fn delete_assignment(
     crate::listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if !part_assignment::delete(&state.db, assignment_id).await? {
-        return Err(AppError::NotFound);
+    if !part_assignment::delete(
+        &state.db,
+        assignment_id,
+        Some(listing::version_of(current.updated_at)),
+    )
+    .await?
+    {
+        return Err(listing::stale_or_gone(find_assignment_scoped(
+            &state,
+            org_id,
+            collection_id,
+            item_id,
+            assignment_id,
+        ))
+        .await);
     }
 
     audit(

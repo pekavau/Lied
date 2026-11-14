@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE part_assignment\n        SET notified_at = CASE WHEN $4 THEN notified_at\n                               ELSE to_timestamp($2::double precision / 1000.0) END,\n            acknowledged_at = CASE WHEN $5 THEN acknowledged_at\n                                   ELSE to_timestamp($3::double precision / 1000.0) END,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        ",
+  "query": "\n        UPDATE part_assignment\n        SET notified_at = CASE WHEN $4 THEN notified_at\n                               ELSE to_timestamp($2::double precision / 1000.0) END,\n            acknowledged_at = CASE WHEN $5 THEN acknowledged_at\n                                   ELSE to_timestamp($3::double precision / 1000.0) END,\n            updated_at = now()\n        WHERE id = $1 AND ($6::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $6)\n        RETURNING\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        ",
   "describe": {
     "columns": [
       {
@@ -55,7 +55,8 @@
         "Float8",
         "Float8",
         "Bool",
-        "Bool"
+        "Bool",
+        "Int8"
       ]
     },
     "nullable": [
@@ -70,5 +71,5 @@
       true
     ]
   },
-  "hash": "628e2e06b74496eb9d51675ecdbebcabe1de62b701e18df68b3a49c3389d49f2"
+  "hash": "6005db080ec4d3d78140ad6b21e6ff54689d715766fbc75af3f3e9e37889008f"
 }

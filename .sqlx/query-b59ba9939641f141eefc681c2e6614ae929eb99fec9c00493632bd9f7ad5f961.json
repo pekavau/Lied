@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE membership\n        SET role = $2, instrument_ids = $3, is_principal = $4, principal_instrument_ids = $5, updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, user_id, organization_id, role,\n            instrument_ids, is_principal, principal_instrument_ids,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\"\n        ",
+  "query": "\n        UPDATE membership\n        SET role = $2, instrument_ids = $3, is_principal = $4, principal_instrument_ids = $5, updated_at = now()\n        WHERE id = $1 AND ($6::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $6)\n        RETURNING\n            id, user_id, organization_id, role,\n            instrument_ids, is_principal, principal_instrument_ids,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\"\n        ",
   "describe": {
     "columns": [
       {
@@ -55,7 +55,8 @@
         "Text",
         "UuidArray",
         "Bool",
-        "UuidArray"
+        "UuidArray",
+        "Int8"
       ]
     },
     "nullable": [
@@ -70,5 +71,5 @@
       false
     ]
   },
-  "hash": "1bcb3b326b67ce5a86588ee51c017a108999bbf09d69ecd9f0b7694a01dee8b7"
+  "hash": "b59ba9939641f141eefc681c2e6614ae929eb99fec9c00493632bd9f7ad5f961"
 }

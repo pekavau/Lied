@@ -71,6 +71,13 @@ fn validation_error(report: garde::Report) -> AppError {
 // Work — instance-wide.
 // ---------------------------------------------------------------------------
 
+/// A work by id, or `404`.
+async fn work_by_id(state: &AppState, id: Uuid) -> Result<work::Work, AppError> {
+    work::find_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
 /// Request/response body for works.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -307,9 +314,17 @@ async fn update_work(
         return Ok(etag_response(current, updated_at));
     }
 
-    let updated = work::update(&state.db, id, &title, composer.as_deref())
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = work::update(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        &title,
+        composer.as_deref(),
+    )
+    .await?
+    else {
+        return Err(listing::stale_or_gone(work_by_id(&state, id)).await);
+    };
 
     audit(
         &state.db,
@@ -386,19 +401,21 @@ async fn delete_work(
     )
     .await;
 
-    let deleted = work::delete(&state.db, id).await.map_err(|err| {
-        if let sqlx::Error::Database(ref db_err) = err {
-            if db_err.is_foreign_key_violation() {
-                return AppError::Conflict(
+    let deleted = work::delete(&state.db, id, Some(listing::version_of(current.updated_at)))
+        .await
+        .map_err(|err| {
+            if let sqlx::Error::Database(ref db_err) = err {
+                if db_err.is_foreign_key_violation() {
+                    return AppError::Conflict(
                     "this work is still referenced by an arrangement; remove or reassign it first"
                         .to_string(),
                 );
+                }
             }
-        }
-        AppError::Database(err)
-    })?;
+            AppError::Database(err)
+        })?;
     if !deleted {
-        return Err(AppError::NotFound);
+        return Err(listing::stale_or_gone(work_by_id(&state, id)).await);
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -939,10 +956,17 @@ async fn update_arrangement(
     // client did not send (a new difficulty against the stored ABRSM rating).
     arrangement::validate(&fields).map_err(invalid_field)?;
 
-    let updated = arrangement::update(&state.db, id, fields)
-        .await
-        .map_err(arrangement_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = arrangement::update(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        fields,
+    )
+    .await
+    .map_err(arrangement_error_to_app_error)?
+    else {
+        return Err(listing::stale_or_gone(find_arrangement_scoped(&state, org_id, id)).await);
+    };
 
     audit(
         &state.db,
@@ -1001,9 +1025,10 @@ async fn delete_arrangement(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let deleted = arrangement::soft_delete(&state.db, id).await?;
-    if !deleted {
-        return Err(AppError::NotFound);
+    if !arrangement::soft_delete(&state.db, id, Some(listing::version_of(current.updated_at)))
+        .await?
+    {
+        return Err(listing::stale_or_gone(find_arrangement_scoped(&state, org_id, id)).await);
     }
 
     audit(
@@ -1458,10 +1483,21 @@ async fn update_voice(
         return Ok(etag_response(VoiceResponse::from(current), updated_at));
     }
 
-    let updated = voice::update(&state.db, id, &name, instrument_id, body.part_number.into())
-        .await
-        .map_err(voice_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = voice::update(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+        instrument_id,
+        body.part_number.into(),
+    )
+    .await
+    .map_err(voice_error_to_app_error)?
+    else {
+        return Err(
+            listing::stale_or_gone(find_voice_scoped(&state, org_id, arrangement_id, id)).await,
+        );
+    };
 
     audit(
         &state.db,
@@ -1527,9 +1563,10 @@ async fn delete_voice(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let deleted = voice::soft_delete(&state.db, id).await?;
-    if !deleted {
-        return Err(AppError::NotFound);
+    if !voice::soft_delete(&state.db, id, Some(listing::version_of(current.updated_at))).await? {
+        return Err(
+            listing::stale_or_gone(find_voice_scoped(&state, org_id, arrangement_id, id)).await,
+        );
     }
 
     audit(
@@ -1894,10 +1931,18 @@ async fn update_tag(
         return Ok(etag_response(TagResponse::from(current), updated_at));
     }
 
-    let updated = tag::update(&state.db, id, &name, kind.as_deref())
-        .await
-        .map_err(tag_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = tag::update(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+        kind.as_deref(),
+    )
+    .await
+    .map_err(tag_error_to_app_error)?
+    else {
+        return Err(listing::stale_or_gone(find_tag_scoped(&state, org_id, id)).await);
+    };
 
     audit(
         &state.db,
@@ -1954,9 +1999,8 @@ async fn delete_tag(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let deleted = tag::soft_delete(&state.db, id).await?;
-    if !deleted {
-        return Err(AppError::NotFound);
+    if !tag::soft_delete(&state.db, id, Some(listing::version_of(current.updated_at))).await? {
+        return Err(listing::stale_or_gone(find_tag_scoped(&state, org_id, id)).await);
     }
 
     audit(

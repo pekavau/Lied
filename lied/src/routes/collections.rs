@@ -407,10 +407,18 @@ async fn update_collection(
         return Ok(etag_response(current, updated_at));
     }
 
-    let updated = collection::update(&state.db, id, &name, &collection_type)
-        .await
-        .map_err(collection_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = collection::update(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+        &collection_type,
+    )
+    .await
+    .map_err(collection_error_to_app_error)?
+    else {
+        return Err(listing::stale_or_gone(find_collection_scoped(&state, org_id, id)).await);
+    };
 
     audit(
         &state.db,
@@ -466,8 +474,10 @@ async fn delete_collection(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if !collection::soft_delete(&state.db, id).await? {
-        return Err(AppError::NotFound);
+    if !collection::soft_delete(&state.db, id, Some(listing::version_of(current.updated_at)))
+        .await?
+    {
+        return Err(listing::stale_or_gone(find_collection_scoped(&state, org_id, id)).await);
     }
 
     audit(
@@ -803,10 +813,24 @@ async fn update_item(
     };
     validate_index(index)?;
 
-    let updated = collection_item::update_index(&state.db, item_id, index)
-        .await
-        .map_err(item_error_to_app_error)?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = collection_item::update_index(
+        &state.db,
+        item_id,
+        Some(listing::version_of(current.updated_at)),
+        index,
+    )
+    .await
+    .map_err(item_error_to_app_error)?
+    else {
+        return Err(listing::stale_or_gone(find_item_scoped(
+            &state,
+            org_id,
+            collection_id,
+            item_id,
+            false,
+        ))
+        .await);
+    };
 
     audit(
         &state.db,
@@ -859,11 +883,23 @@ async fn delete_item(
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    if !collection_item::remove(&state.db, collection_id, item_id)
-        .await
-        .map_err(item_error_to_app_error)?
+    if !collection_item::remove(
+        &state.db,
+        collection_id,
+        item_id,
+        Some(listing::version_of(current.updated_at)),
+    )
+    .await
+    .map_err(item_error_to_app_error)?
     {
-        return Err(AppError::NotFound);
+        return Err(listing::stale_or_gone(find_item_scoped(
+            &state,
+            org_id,
+            collection_id,
+            item_id,
+            false,
+        ))
+        .await);
     }
 
     audit(

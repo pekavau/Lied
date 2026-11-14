@@ -24,7 +24,7 @@ use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::membership::{self, Membership, Role};
 use crate::domain::{instrument, user};
-use crate::listing::{check_if_match, SortDirection};
+use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, instrument_name, load_instruments, ordered_families,
     require_found,
@@ -442,8 +442,21 @@ async fn update_member(
         is_principal,
         principal_instrument_ids: &principal_instrument_ids,
     };
-    match membership::update(&state.db, membership_id, fields).await {
-        Ok(_) => {
+    match membership::update(
+        &state.db,
+        membership_id,
+        Some(listing::version_of(current.updated_at)),
+        fields,
+    )
+    .await
+    {
+        Ok(None) => console::precondition_page(
+            &ctx,
+            Section::Members,
+            "member",
+            &format!("/admin/orgs/{org_id}/members/{membership_id}"),
+        ),
+        Ok(Some(_)) => {
             // Distinguish the security-relevant transitions (CLAUDE.md audit
             // events: "role change, principal-flag change"), matching the /v1
             // membership handler — a plain field edit stays `membership.update`.
@@ -517,7 +530,7 @@ async fn remove_member(
     ) {
         return response;
     }
-    match membership::delete(&state.db, membership_id).await {
+    match membership::delete(&state.db, membership_id, None).await {
         Ok(true) => {
             audit(
                 &state.db,

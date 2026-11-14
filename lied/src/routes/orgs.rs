@@ -112,6 +112,20 @@ struct UpdateOrgRequest {
     name: Option<String>,
 }
 
+/// An organization by id, or `404`.
+async fn org_by_id(state: &AppState, id: Uuid) -> Result<organization::Organization, AppError> {
+    organization::find_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+/// A user by id, or `404`.
+async fn user_by_id(state: &AppState, id: Uuid) -> Result<user::User, AppError> {
+    user::find_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
 /// List organizations (any authenticated identity; federation trust model).
 #[utoipa::path(
     get,
@@ -333,9 +347,16 @@ async fn update_org(
         }
     };
 
-    let updated = organization::update_name(&state.db, id, &name)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let Some(updated) = organization::update_name(
+        &state.db,
+        id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+    )
+    .await?
+    else {
+        return Err(listing::stale_or_gone(org_by_id(&state, id)).await);
+    };
 
     audit(
         &state.db,
@@ -396,6 +417,12 @@ async fn delete_org(
     listing::check_if_match(if_match, current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
+    if !organization::delete(&state.db, id, Some(listing::version_of(current.updated_at))).await? {
+        return Err(listing::stale_or_gone(org_by_id(&state, id)).await);
+    }
+
+    // After the delete, so a stale or failed one leaves no audit row (the
+    // audit log keeps `org_id` without a foreign key, migration 0020).
     audit(
         &state.db,
         &AuditContext {
@@ -409,11 +436,6 @@ async fn delete_org(
         serde_json::json!({ "name": current.name, "slug": current.slug }),
     )
     .await;
-
-    let deleted = organization::delete(&state.db, id).await?;
-    if !deleted {
-        return Err(AppError::NotFound);
-    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -670,7 +692,7 @@ async fn delete_user(
     listing::check_if_match(if_match, current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let deleted = user::delete(&state.db, id).await.map_err(|err| {
+    let deleted = user::delete(&state.db, id, Some(listing::version_of(current.updated_at))).await.map_err(|err| {
         if let sqlx::Error::Database(ref db_err) = err {
             if db_err.is_foreign_key_violation() {
                 return AppError::Conflict(
@@ -681,7 +703,7 @@ async fn delete_user(
         AppError::Database(err)
     })?;
     if !deleted {
-        return Err(AppError::NotFound);
+        return Err(listing::stale_or_gone(user_by_id(&state, id)).await);
     }
 
     audit(
@@ -1072,9 +1094,10 @@ async fn update_member(
         return Ok(etag_response(MembershipResponse::from(current), updated_at));
     }
 
-    let updated = membership::update(
+    let Some(updated) = membership::update(
         &state.db,
         id,
+        Some(listing::version_of(current.updated_at)),
         membership::MembershipFields {
             role,
             instrument_ids: &instrument_ids,
@@ -1084,7 +1107,9 @@ async fn update_member(
     )
     .await
     .map_err(membership_error_to_app_error)?
-    .ok_or(AppError::NotFound)?;
+    else {
+        return Err(listing::stale_or_gone(find_member_scoped(&state, org_id, id)).await);
+    };
 
     let action = if current.role != updated.role {
         "membership.role_change"
@@ -1165,9 +1190,12 @@ async fn delete_member(
     listing::check_if_match(if_match, current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    membership::delete(&state.db, id)
+    if !membership::delete(&state.db, id, Some(listing::version_of(current.updated_at)))
         .await
-        .map_err(membership_error_to_app_error)?;
+        .map_err(membership_error_to_app_error)?
+    {
+        return Err(listing::stale_or_gone(find_member_scoped(&state, org_id, id)).await);
+    }
 
     audit(
         &state.db,

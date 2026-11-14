@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE collection\n        SET name = $2, type = $3, updated_at = now()\n        WHERE id = $1 AND deleted_at IS NULL\n        RETURNING\n            id, organization_id, name, slug,\n            type as \"collection_type!\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "query": "\n        UPDATE tag\n        SET name = $2, kind = $3, updated_at = now()\n        WHERE id = $1 AND deleted_at IS NULL\n          AND ($4::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $4)\n        RETURNING\n            id, organization_id, name, kind,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
   "describe": {
     "columns": [
       {
@@ -20,31 +20,26 @@
       },
       {
         "ordinal": 3,
-        "name": "slug",
+        "name": "kind",
         "type_info": "Text"
       },
       {
         "ordinal": 4,
-        "name": "collection_type!",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 5,
         "name": "created_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "updated_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "created_by",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "deleted_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       }
@@ -53,20 +48,20 @@
       "Left": [
         "Uuid",
         "Text",
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false,
-      false,
+      true,
       false,
       false,
       true,
       true
     ]
   },
-  "hash": "d27c99b8326753c1a3401c5c1e5082aef0d61de298e6b2d57ebed1bd8a56710e"
+  "hash": "3b6a84166af7abfe6a2f3ef13da717561d1a0f81f42e353649adaac43bb914eb"
 }

@@ -445,7 +445,7 @@ async fn a_soft_deleted_arrangement_never_matches() {
         1
     );
 
-    arrangement::soft_delete(&db.pool, id).await.unwrap();
+    arrangement::soft_delete(&db.pool, id, None).await.unwrap();
     assert!(
         search_titles(&app, &token, org_id, "q=bolero")
             .await
@@ -490,9 +490,15 @@ async fn renaming_a_works_composer_reindexes_its_arrangements() {
 
     // Fix the composer's spelling *after* the arrangement was indexed: the
     // vector lives on `arrangement`, so nothing but a trigger keeps it true.
-    work::update(&db.pool, work, "Symphony No. 9", Some("Antonín Dvořák"))
-        .await
-        .expect("update work");
+    work::update(
+        &db.pool,
+        work,
+        None,
+        "Symphony No. 9",
+        Some("Antonín Dvořák"),
+    )
+    .await
+    .expect("update work");
 
     assert_eq!(
         search_titles(&app, &token, org_id, "q=dvorak").await,
@@ -540,7 +546,7 @@ async fn renaming_or_detaching_a_tag_reindexes_its_arrangements() {
     );
 
     // Rename the tag: the old word must stop matching, the new one start.
-    tag::update(&db.pool, tag_id, "Festive", Some("occasion"))
+    tag::update(&db.pool, tag_id, None, "Festive", Some("occasion"))
         .await
         .expect("rename tag");
     assert!(
@@ -753,7 +759,7 @@ async fn instrumentation_filters_by_a_live_voice() {
     );
 
     // A soft-deleted voice does not keep the arrangement in the result.
-    voice::soft_delete(&db.pool, voice_id).await.unwrap();
+    voice::soft_delete(&db.pool, voice_id, None).await.unwrap();
     assert!(search_titles(
         &app,
         &token,

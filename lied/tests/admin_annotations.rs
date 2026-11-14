@@ -602,7 +602,9 @@ async fn the_annotations_section_lists_the_orgs_notes_for_their_authors_only() {
         .await;
     }
     // A removed arrangement's notes drop out of the overview with it.
-    assert!(arrangement::soft_delete(&ctx.pool, egmont).await.unwrap());
+    assert!(arrangement::soft_delete(&ctx.pool, egmont, None)
+        .await
+        .unwrap());
 
     let overview = format!("/admin/orgs/{}/annotations", fx.org_id);
     let (status, html) = load_page(&ctx.app, &conductor, &overview).await;

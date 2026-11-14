@@ -1419,3 +1419,407 @@ async fn a_non_uuid_request_id_is_replaced_once_and_used_everywhere() {
             .unwrap();
     assert_eq!(audited, Some(echoed));
 }
+
+// ---------------------------------------------------------------------------
+// Guarded writes: the version check sits inside the statement (issue #64).
+// ---------------------------------------------------------------------------
+
+fn version(at: chrono::DateTime<chrono::Utc>) -> i64 {
+    lied::listing::version_of(at)
+}
+
+/// Every guarded domain write refuses a stale version without writing, and
+/// goes through at the current one.
+#[tokio::test]
+async fn every_guarded_write_refuses_a_stale_version() {
+    use lied::domain::{collection, collection_item, part_assignment, tag, voice, Change};
+    let db = TestDb::create_and_migrate().await;
+    let pool = &db.pool;
+    let org = create_org(pool, "Guarded").await;
+    let player = create_plain_user(pool, "player").await;
+    let instrument = first_instrument_id(pool).await;
+
+    let fields = |title: &'static str| arrangement::ArrangementFields {
+        title,
+        work_id: None,
+        instrumentation: None,
+        arranger: None,
+        publisher: None,
+        purchase_date: None,
+        license_notes: None,
+        copy_count_allowed: None,
+        status: "active",
+        duration_seconds: None,
+        difficulty: None,
+        difficulty_ratings: None,
+        difficulty_notes: None,
+    };
+    let arr = arrangement::create(
+        pool,
+        Uuid::now_v7(),
+        org.id,
+        "bolero",
+        fields("Bolero"),
+        None,
+    )
+    .await
+    .unwrap();
+    let stale = |at| Some(version(at) - 1);
+
+    // Updates: stale → nothing written; current → written.
+    assert!(
+        arrangement::update(pool, arr.id, stale(arr.updated_at), fields("X"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let arr = arrangement::update(
+        pool,
+        arr.id,
+        Some(version(arr.updated_at)),
+        fields("Boléro"),
+    )
+    .await
+    .unwrap()
+    .expect("current version writes");
+    assert_eq!(arr.title, "Boléro");
+
+    let w = work::create(pool, Uuid::now_v7(), "Egmont", None, None)
+        .await
+        .unwrap();
+    assert!(work::update(pool, w.id, stale(w.updated_at), "X", None)
+        .await
+        .unwrap()
+        .is_none());
+    let w = work::update(
+        pool,
+        w.id,
+        Some(version(w.updated_at)),
+        "Egmont, Op. 84",
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let v = voice::create(
+        pool,
+        Uuid::now_v7(),
+        arr.id,
+        "Flute 1",
+        "flute-1",
+        instrument,
+        voice::NewPartNumber::FromName,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(voice::update(
+        pool,
+        v.id,
+        stale(v.updated_at),
+        "X",
+        instrument,
+        Change::Keep
+    )
+    .await
+    .unwrap()
+    .is_none());
+    let v = voice::update(
+        pool,
+        v.id,
+        Some(version(v.updated_at)),
+        "Flute I",
+        instrument,
+        Change::Keep,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let t = tag::create(pool, Uuid::now_v7(), org.id, "Festive", None, None)
+        .await
+        .unwrap();
+    assert!(tag::update(pool, t.id, stale(t.updated_at), "X", None)
+        .await
+        .unwrap()
+        .is_none());
+    let t = tag::update(pool, t.id, Some(version(t.updated_at)), "Feast", None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let c = collection::create(
+        pool,
+        Uuid::now_v7(),
+        org.id,
+        "Spring",
+        "spring",
+        "program",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        collection::update(pool, c.id, stale(c.updated_at), "X", "program")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let c = collection::update(
+        pool,
+        c.id,
+        Some(version(c.updated_at)),
+        "Spring Gala",
+        "program",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let item = collection_item::create(pool, Uuid::now_v7(), c.id, arr.id, 1, None)
+        .await
+        .unwrap();
+    assert!(
+        collection_item::update_index(pool, item.id, stale(item.updated_at), 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let item = collection_item::update_index(pool, item.id, Some(version(item.updated_at)), 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let pa = part_assignment::assign(pool, Uuid::now_v7(), item.id, v.id, player.id, None)
+        .await
+        .unwrap();
+    let now = Change::Set(Some(chrono::Utc::now()));
+    assert!(
+        part_assignment::update_state(pool, pa.id, stale(pa.updated_at), now, Change::Keep)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pa =
+        part_assignment::update_state(pool, pa.id, Some(version(pa.updated_at)), now, Change::Keep)
+            .await
+            .unwrap()
+            .unwrap();
+
+    let m = membership::create(
+        pool,
+        Uuid::now_v7(),
+        player.id,
+        org.id,
+        membership::MembershipFields {
+            role: membership::Role::Musician,
+            instrument_ids: &[],
+            is_principal: false,
+            principal_instrument_ids: &[],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let conductor = membership::MembershipFields {
+        role: membership::Role::Conductor,
+        instrument_ids: &[],
+        is_principal: false,
+        principal_instrument_ids: &[],
+    };
+    assert!(
+        membership::update(pool, m.id, stale(m.updated_at), conductor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let conductor = membership::MembershipFields {
+        role: membership::Role::Conductor,
+        instrument_ids: &[],
+        is_principal: false,
+        principal_instrument_ids: &[],
+    };
+    let m = membership::update(pool, m.id, Some(version(m.updated_at)), conductor)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        organization::update_name(pool, org.id, stale(org.updated_at), "X")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let org = organization::update_name(pool, org.id, Some(version(org.updated_at)), "Guarded Org")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Deletes, leaves first: stale → still there; current → gone.
+    assert!(!part_assignment::delete(pool, pa.id, stale(pa.updated_at))
+        .await
+        .unwrap());
+    assert!(
+        part_assignment::delete(pool, pa.id, Some(version(pa.updated_at)))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !collection_item::remove(pool, c.id, item.id, stale(item.updated_at))
+            .await
+            .unwrap()
+    );
+    assert!(
+        collection_item::remove(pool, c.id, item.id, Some(version(item.updated_at)))
+            .await
+            .unwrap()
+    );
+    assert!(!collection::soft_delete(pool, c.id, stale(c.updated_at))
+        .await
+        .unwrap());
+    assert!(
+        collection::soft_delete(pool, c.id, Some(version(c.updated_at)))
+            .await
+            .unwrap()
+    );
+    assert!(!voice::soft_delete(pool, v.id, stale(v.updated_at))
+        .await
+        .unwrap());
+    assert!(voice::soft_delete(pool, v.id, Some(version(v.updated_at)))
+        .await
+        .unwrap());
+    assert!(!tag::soft_delete(pool, t.id, stale(t.updated_at))
+        .await
+        .unwrap());
+    assert!(tag::soft_delete(pool, t.id, Some(version(t.updated_at)))
+        .await
+        .unwrap());
+    assert!(
+        !arrangement::soft_delete(pool, arr.id, stale(arr.updated_at))
+            .await
+            .unwrap()
+    );
+    assert!(
+        arrangement::soft_delete(pool, arr.id, Some(version(arr.updated_at)))
+            .await
+            .unwrap()
+    );
+    assert!(!membership::delete(pool, m.id, stale(m.updated_at))
+        .await
+        .unwrap());
+    assert!(membership::delete(pool, m.id, Some(version(m.updated_at)))
+        .await
+        .unwrap());
+    assert!(!work::delete(pool, w.id, stale(w.updated_at)).await.unwrap());
+    assert!(work::delete(pool, w.id, Some(version(w.updated_at)))
+        .await
+        .unwrap());
+    // The org delete is a cascade: a stale one must remove nothing at all.
+    let survivor = arrangement::create(
+        pool,
+        Uuid::now_v7(),
+        org.id,
+        "egmont",
+        fields("Egmont"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!organization::delete(pool, org.id, stale(org.updated_at))
+        .await
+        .unwrap());
+    assert!(arrangement::find_by_id(pool, survivor.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(
+        organization::delete(pool, org.id, Some(version(org.updated_at)))
+            .await
+            .unwrap()
+    );
+    let loner = create_plain_user(pool, "loner").await;
+    assert!(!user::delete(pool, loner.id, stale(loner.updated_at))
+        .await
+        .unwrap());
+    assert!(
+        user::delete(pool, loner.id, Some(version(loner.updated_at)))
+            .await
+            .unwrap()
+    );
+}
+
+/// Concurrent PATCHes holding one ETag: exactly one wins, the others get
+/// 412, and the winner's change survives (before #64 every one passed the
+/// read-time check and the last write erased the others).
+#[tokio::test]
+async fn concurrent_writes_with_one_etag_let_exactly_one_through() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let created = create_arrangement_json(&app, &token, org_id, "Bolero").await;
+    let uri = format!(
+        "/v1/orgs/{org_id}/arrangements/{}",
+        created["id"].as_str().unwrap()
+    );
+    let etag = etag_of(&app, &token, &uri).await;
+
+    let attempts = 8;
+    let sends = (0..attempts).map(|n| {
+        let request = bearer_request("PATCH", &uri, &token)
+            .header(axum::http::header::IF_MATCH, &etag)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "publisher": format!("Publisher {n}") }).to_string(),
+            ))
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+    });
+    let results = futures_util::future::join_all(sends).await;
+
+    let winners: Vec<&serde_json::Value> = results
+        .iter()
+        .filter(|(status, _)| *status == axum::http::StatusCode::OK)
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    assert!(results
+        .iter()
+        .all(|(status, _)| *status == axum::http::StatusCode::OK
+            || *status == axum::http::StatusCode::PRECONDITION_FAILED));
+    let request = bearer_request("GET", &uri, &token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let now = body_json(app.clone().oneshot(request).await.unwrap()).await;
+    assert_eq!(
+        now["publisher"], winners[0]["publisher"],
+        "the winner's change survives"
+    );
+    assert_eq!(audit_count(&db.pool, "arrangement.update").await, 1);
+
+    // Same for deletes: one 204, the rest 412 (stale) or 404 (already gone).
+    let etag = etag_of(&app, &token, &uri).await;
+    let deletes = (0..attempts).map(|_| {
+        let request = bearer_request("DELETE", &uri, &token)
+            .header(axum::http::header::IF_MATCH, &etag)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    });
+    let statuses = futures_util::future::join_all(deletes).await;
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == axum::http::StatusCode::NO_CONTENT)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    assert_eq!(audit_count(&db.pool, "arrangement.soft_delete").await, 1);
+}

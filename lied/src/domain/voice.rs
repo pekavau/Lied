@@ -336,9 +336,17 @@ pub async fn list_for_arrangement(
 
 /// Update a voice's mutable fields (`name`, `instrument_id`, `part_number`).
 /// `slug` is immutable. Returns `None` if no live row (own + parent) matched `id`.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     name: &str,
     instrument_id: Uuid,
     part_number: PartNumberChange,
@@ -361,6 +369,7 @@ pub async fn update(
             part_number = CASE WHEN $5 THEN v.part_number ELSE $4 END,
             updated_at = now()
         WHERE v.id = $1 AND v.deleted_at IS NULL
+          AND ($6::bigint IS NULL OR floor(extract(epoch FROM v.updated_at) * 1000)::bigint = $6)
         RETURNING
             v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
             v.created_at as "created_at: DateTime<Utc>",
@@ -373,6 +382,7 @@ pub async fn update(
         instrument_id,
         explicit,
         keep,
+        expected_version,
     )
     .fetch_optional(pool)
     .await
@@ -383,10 +393,22 @@ pub async fn update(
 
 /// Soft-delete: sets `deleted_at` on this row ONLY. Returns `false` if no
 /// live row matched `id`.
-pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
+pub async fn soft_delete(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query!(
-        r#"UPDATE voice SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL"#,
+        r#"UPDATE voice SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2)"#,
         id,
+        expected_version,
     )
     .execute(pool)
     .await?;
