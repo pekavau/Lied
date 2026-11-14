@@ -12,7 +12,7 @@
 //! `LIED_MAX_UPLOAD_BYTES` while streaming (→ 413).
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -31,9 +31,11 @@ use crate::file_service;
 use crate::pagination::{Page, PageParams};
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, PayloadTooLarge413, Range416,
-    UnsupportedMedia415,
+    UnsupportedMedia415, Validation400,
 };
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 use crate::storage::{self, StorageError};
 
@@ -284,6 +286,7 @@ async fn do_upload(
     responses(
         (status = 201, description = "File uploaded", body = FileResponse),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -320,6 +323,7 @@ async fn upload_score_file(
     responses(
         (status = 201, description = "File uploaded", body = FileResponse),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -442,6 +446,7 @@ async fn do_download(
             content_type = "application/octet-stream",
             headers(("Content-Range" = String, description = "Satisfied byte range"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Range416,
@@ -483,6 +488,7 @@ async fn download_score_file(
             content_type = "application/octet-stream",
             headers(("Content-Range" = String, description = "Satisfied byte range"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Range416,
@@ -570,6 +576,7 @@ async fn do_list(
         (status = 200, description = "Paginated file list",
             body = inline(Page<FileResponse>)),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -601,6 +608,7 @@ async fn list_score_files(
         (status = 200, description = "Paginated file list",
             body = inline(Page<FileResponse>)),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -716,6 +724,7 @@ async fn do_replace(
     responses(
         (status = 200, description = "File replaced", body = FileResponse),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -753,6 +762,7 @@ async fn replace_score_file(
     responses(
         (status = 200, description = "File replaced", body = FileResponse),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -843,6 +853,7 @@ async fn do_delete(
     responses(
         (status = 204, description = "File soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -872,6 +883,7 @@ async fn delete_score_file(
     responses(
         (status = 204, description = "File soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )

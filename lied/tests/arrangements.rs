@@ -1864,3 +1864,83 @@ async fn a_refused_work_delete_is_not_audited() {
     );
     assert_eq!(audit_count(&db.pool, "work.delete").await, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Rejected path and query parameters are Problem Details (issue #66).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bad_path_and_query_parameters_are_problem_details_naming_them() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let created = create_arrangement_json(&app, &token, org_id, "Bolero").await;
+    let arr_id = created["id"].as_str().unwrap();
+    let coll = Uuid::now_v7();
+
+    for (uri, field) in [
+        // A single path parameter.
+        ("/v1/works/not-a-uuid".to_string(), "id"),
+        // Tuple paths: first and second position, both named.
+        ("/v1/orgs/not-a-uuid/arrangements".to_string(), "orgId"),
+        (format!("/v1/orgs/{org_id}/arrangements/nope"), "id"),
+        (
+            format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices/x1"),
+            "id",
+        ),
+        // Query parameters: wrong type, out of range, missing.
+        (format!("/v1/orgs/{org_id}/arrangements?limit=abc"), "limit"),
+        (
+            format!("/v1/orgs/{org_id}/arrangements?offset=-1"),
+            "offset",
+        ),
+        (
+            format!(
+                "/v1/orgs/{org_id}/collections/{coll}/bulk-assignments/preview?instrumentId={}",
+                Uuid::now_v7()
+            ),
+            "userId",
+        ),
+    ] {
+        let (status, request_id, problem) = send_raw(
+            &app,
+            &token,
+            "GET",
+            &uri,
+            None,
+            None,
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{uri} → {problem}"
+        );
+        assert_eq!(
+            problem["type"], "https://lied/errors/validation-failed",
+            "{uri}"
+        );
+        assert!(problem["errors"][field].is_array(), "{uri} → {problem}");
+        assert_eq!(
+            problem["instance"],
+            format!("urn:uuid:{request_id}"),
+            "{uri}"
+        );
+    }
+
+    // Well-formed parameters still work, and unknown query keys (the
+    // `filter[…]` syntax) are not refused by the extractor.
+    let request = bearer_request(
+        "GET",
+        &format!("/v1/orgs/{org_id}/arrangements?limit=5&filter%5Bstatus%5D=active"),
+        &token,
+    )
+    .body(axum::body::Body::empty())
+    .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        axum::http::StatusCode::OK
+    );
+}

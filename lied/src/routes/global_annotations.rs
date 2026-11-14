@@ -13,7 +13,7 @@
 //! entity), so its audit row keeps the deleted content — afterwards it is the
 //! only copy.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -35,6 +35,8 @@ use crate::routes::openapi::{
     CommonErrors, Forbidden403, JsonBodyErrors, NotFound404, Precondition412, Validation400,
 };
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -279,6 +281,7 @@ async fn create_annotation(
         (status = 200, description = "Annotation", body = GlobalAnnotation,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -413,6 +416,7 @@ async fn update_annotation(
     responses(
         (status = 204, description = "Annotation deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,

@@ -6,7 +6,7 @@
 //! [`require_collection_editor_v1`]. Optimistic concurrency (ETag/`If-Match`),
 //! RFC 7807 errors, and an `audit()` on every write, per the API guidelines.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -32,6 +32,8 @@ use crate::routes::openapi::{
 };
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -333,6 +335,7 @@ async fn create_collection(
         (status = 200, description = "Collection", body = collection::Collection,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -456,6 +459,7 @@ async fn update_collection(
     responses(
         (status = 204, description = "Collection soft-deleted"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -511,6 +515,7 @@ async fn delete_collection(
     responses(
         (status = 204, description = "Collection restored"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -629,6 +634,7 @@ async fn reorder_items(
         (status = 200, description = "Items in index order",
             body = Vec<collection_item::CollectionItemView>),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -743,6 +749,7 @@ async fn add_item(
         (status = 200, description = "Item", body = collection_item::CollectionItem,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -866,6 +873,7 @@ async fn update_item(
     responses(
         (status = 204, description = "Item removed"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
@@ -934,6 +942,7 @@ async fn delete_item(
     responses(
         (status = 204, description = "Item restored"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -994,6 +1003,7 @@ async fn undelete_item(
                                       section when they are a principal",
             body = coverage::CoverageReport),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )

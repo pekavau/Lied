@@ -6,7 +6,7 @@
 //! app-password CRUD endpoints, scoped to the authenticated user. Other
 //! domain entities land in later phase-1 items.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,8 @@ use crate::routes::openapi::{
     CommonErrors, Conflict409, JsonBodyErrors, NotFound404, Validation400,
 };
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 // ── API version ─────────────────────────────────────────────────────────────
@@ -70,6 +72,7 @@ async fn version() -> Json<VersionInfo> {
         (status = 200, description = "Paginated instrument list",
             body = inline(Page<instrument::Instrument>)),
         CommonErrors,
+        Validation400,
     )
 )]
 async fn list_instruments(
@@ -356,6 +359,7 @@ async fn list_app_passwords(
     responses(
         (status = 204, description = "App password revoked"),
         CommonErrors,
+        Validation400,
         NotFound404,
     )
 )]

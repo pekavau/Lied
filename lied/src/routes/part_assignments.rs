@@ -16,7 +16,7 @@
 //! write, per the API guidelines. `part_assignment` has no soft-delete —
 //! unassign is a hard delete.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -40,6 +40,8 @@ use crate::routes::openapi::{
 };
 use crate::routes::patch::present_or_null;
 use crate::routes::RequestId;
+// Problem Details on a bad parameter (issue #66); see `routes::params`.
+use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -128,6 +130,7 @@ async fn find_assignment_scoped(
         (status = 200, description = "Paginated assignment list",
             body = inline(Page<part_assignment::PartAssignment>)),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -269,6 +272,7 @@ async fn assign_voice(
         (status = 200, description = "Assignment", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
     )
@@ -417,6 +421,7 @@ async fn update_assignment(
     responses(
         (status = 204, description = "Assignment removed"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Precondition412,
