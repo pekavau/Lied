@@ -55,9 +55,9 @@ A few project-specific rules worth knowing up front:
 - New behavior should come with a test. Coverage isn't gated on a percentage —
   meaningful tests over numbers.
 - The API conventions (pagination, ETags/optimistic concurrency, RFC 7807 error
-  shape, OpenAPI completeness) are documented in
-  [`docs/api-guidelines.md`](docs/api-guidelines.md); every `/v1` endpoint must
-  carry its OpenAPI annotation.
+  shape) are in `CLAUDE.md` ("HTTP & REST API conventions"); how to add or
+  change a `/v1` endpoint, including its OpenAPI annotation, is in
+  [`docs/api-guidelines.md`](docs/api-guidelines.md).
 
 ## Pull request workflow
 
