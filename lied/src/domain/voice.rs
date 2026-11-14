@@ -337,12 +337,7 @@ pub async fn list_for_arrangement(
 /// Update a voice's mutable fields (`name`, `instrument_id`, `part_number`).
 /// `slug` is immutable. Returns `None` if no live row (own + parent) matched `id`.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
@@ -394,12 +389,7 @@ pub async fn update(
 /// Soft-delete: sets `deleted_at` on this row ONLY. Returns `false` if no
 /// live row matched `id`.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn soft_delete(
     pool: &PgPool,
     id: Uuid,

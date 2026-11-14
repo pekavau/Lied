@@ -1823,3 +1823,44 @@ async fn concurrent_writes_with_one_etag_let_exactly_one_through() {
     );
     assert_eq!(audit_count(&db.pool, "arrangement.soft_delete").await, 1);
 }
+
+/// A work delete that is refused leaves no audit row (it was written before
+/// the delete, so a 409 claimed a deletion that never happened).
+#[tokio::test]
+async fn a_refused_work_delete_is_not_audited() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let request = bearer_request("POST", "/v1/works", &token)
+        .body(axum::body::Body::from(r#"{"title":"Egmont"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let work_id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_id}/arrangements"), &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({ "title": "Egmont Overture", "workId": work_id }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        axum::http::StatusCode::CREATED
+    );
+
+    let uri = format!("/v1/works/{work_id}");
+    let etag = etag_of(&app, &token, &uri).await;
+    let request = bearer_request("DELETE", &uri, &token)
+        .header(axum::http::header::IF_MATCH, etag)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        axum::http::StatusCode::CONFLICT
+    );
+    assert_eq!(audit_count(&db.pool, "work.delete").await, 0);
+}

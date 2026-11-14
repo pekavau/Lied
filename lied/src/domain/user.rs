@@ -298,12 +298,7 @@ pub async fn list(
 ///   active memberships/assignments/annotations — an explicit
 ///   reassignment flow is the correct fix and is deferred, per CLAUDE.md.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(
     pool: &PgPool,
     id: Uuid,

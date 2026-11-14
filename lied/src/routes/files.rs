@@ -30,8 +30,8 @@ use crate::error::AppError;
 use crate::file_service;
 use crate::pagination::{Page, PageParams};
 use crate::routes::openapi::{
-    CommonErrors, Conflict409, Forbidden403, NotFound404, PayloadTooLarge413, Precondition412,
-    Range416, UnsupportedMedia415,
+    CommonErrors, Conflict409, Forbidden403, NotFound404, PayloadTooLarge413, Range416,
+    UnsupportedMedia415,
 };
 use crate::routes::RequestId;
 use crate::state::AppState;
@@ -617,6 +617,11 @@ async fn list_voice_files(
 // ---------------------------------------------------------------------------
 // Replace (PUT) — new row + soft-delete old in one txn; bytes overwrite the
 // same derived key (MinIO versions the content).
+//
+// No `If-Match` here or on delete: a file row is never edited in place, so
+// its id is its version. Replacing or deleting acts on that exact row, and
+// only while it is live — a second concurrent replace or delete of the same
+// id finds it already gone and gets 404 (issue #64).
 // ---------------------------------------------------------------------------
 
 // Internal shared helper with a deliberately flat path/auth parameter list;
@@ -691,7 +696,7 @@ async fn do_replace(
     )))
 }
 
-/// Replace a full-score file in-place (owner/archivist; requires `If-Match`).
+/// Replace a full-score file in-place (owner/archivist).
 ///
 /// The replacement must carry the same `Content-Type` as the original. A
 /// format change requires uploading a new file instead. The MinIO object key
@@ -705,7 +710,6 @@ async fn do_replace(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
         ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body(content = UploadForm, content_type = "multipart/form-data"),
@@ -715,7 +719,6 @@ async fn do_replace(
         Forbidden403,
         NotFound404,
         Conflict409,
-        Precondition412,
         UnsupportedMedia415,
         PayloadTooLarge413,
     )
@@ -733,7 +736,7 @@ async fn replace_score_file(
     .await
 }
 
-/// Replace a voice file in-place (owner/archivist; requires `If-Match`).
+/// Replace a voice file in-place (owner/archivist).
 #[utoipa::path(
     put,
     path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
@@ -744,7 +747,6 @@ async fn replace_score_file(
         ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body(content = UploadForm, content_type = "multipart/form-data"),
@@ -754,7 +756,6 @@ async fn replace_score_file(
         Forbidden403,
         NotFound404,
         Conflict409,
-        Precondition412,
         UnsupportedMedia415,
         PayloadTooLarge413,
     )
@@ -824,7 +825,7 @@ async fn do_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Soft-delete a full-score file (owner/archivist; requires `If-Match`).
+/// Soft-delete a full-score file (owner/archivist).
 ///
 /// The MinIO object is retained; the DB row is hidden from listings. The
 /// object can be recovered via a future admin hard-delete / undelete path.
@@ -837,7 +838,6 @@ async fn do_delete(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
         ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -845,7 +845,6 @@ async fn do_delete(
         CommonErrors,
         Forbidden403,
         NotFound404,
-        Precondition412,
     )
 )]
 async fn delete_score_file(
@@ -857,7 +856,7 @@ async fn delete_score_file(
     do_delete(state, auth, request_id, org_id, arr_id, None, file_id).await
 }
 
-/// Soft-delete a voice file (owner/archivist; requires `If-Match`).
+/// Soft-delete a voice file (owner/archivist).
 #[utoipa::path(
     delete,
     path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
@@ -868,7 +867,6 @@ async fn delete_score_file(
         ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID"),
-        ("If-Match" = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -876,7 +874,6 @@ async fn delete_score_file(
         CommonErrors,
         Forbidden403,
         NotFound404,
-        Precondition412,
     )
 )]
 async fn delete_voice_file(

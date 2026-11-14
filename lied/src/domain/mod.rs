@@ -7,6 +7,20 @@
 //! `organization` and `membership`. Item 6 (issue #6) adds `work`,
 //! `arrangement`, `voice`, and `tag` (the latter also owns the
 //! `arrangement_tag` join). Later items add the rest.
+//!
+//! # Guarded writes
+//!
+//! Every update/delete behind an `If-Match` check takes an
+//! `expected_version: Option<i64>` — the caller's ETag, the row's
+//! millisecond `updated_at` ([`crate::listing::version_of`]). With `Some`,
+//! the statement itself requires
+//! `floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` (a
+//! cascade locks the row at that version first), so two writers holding one
+//! ETag cannot both pass a read-time check and both write (issue #64). A
+//! write that matches nothing reports no row (`None` / `false`), exactly as
+//! for a missing one; the caller tells the two apart
+//! ([`crate::listing::stale_or_gone`]). `None` writes unconditionally:
+//! fixtures, and console buttons that carry no version.
 
 pub mod app_password;
 pub mod arrangement;

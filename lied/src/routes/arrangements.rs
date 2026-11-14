@@ -295,9 +295,7 @@ async fn update_work(
     headers: HeaderMap,
     ApiJson(body): ApiJson<UpdateWorkRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    let current = work::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let current = work_by_id(&state, id).await?;
 
     if !current.is_editable_by(auth.user.id, auth.user.is_system_admin) {
         return Err(AppError::Forbidden);
@@ -376,9 +374,7 @@ async fn delete_work(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, AppError> {
-    let current = work::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let current = work_by_id(&state, id).await?;
 
     if !current.is_editable_by(auth.user.id, auth.user.is_system_admin) {
         return Err(AppError::Forbidden);
@@ -386,20 +382,6 @@ async fn delete_work(
 
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
-
-    audit(
-        &state.db,
-        &AuditContext {
-            actor_user_id: Some(auth.user.id),
-            org_id: None,
-            request_id: Some(request_id),
-        },
-        "work.delete",
-        "work",
-        Some(id),
-        serde_json::json!({ "title": current.title, "composer": current.composer }),
-    )
-    .await;
 
     let deleted = work::delete(&state.db, id, Some(listing::version_of(current.updated_at)))
         .await
@@ -417,6 +399,22 @@ async fn delete_work(
     if !deleted {
         return Err(listing::stale_or_gone(work_by_id(&state, id)).await);
     }
+
+    // After the delete, so a refused one (412, or 409 while an arrangement
+    // still references the work) leaves no audit row.
+    audit(
+        &state.db,
+        &AuditContext {
+            actor_user_id: Some(auth.user.id),
+            org_id: None,
+            request_id: Some(request_id),
+        },
+        "work.delete",
+        "work",
+        Some(id),
+        serde_json::json!({ "title": current.title, "composer": current.composer }),
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }

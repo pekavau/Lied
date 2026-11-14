@@ -765,14 +765,17 @@ async fn update(
             .await;
             Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
         }
-        // Read a moment ago, so another edit got in first (or it was just
-        // removed — the reload shows which).
-        Ok(None) => console::precondition_page(
-            &ctx,
-            Section::Arrangements,
-            "arrangement",
-            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}"),
-        ),
+        // Read a moment ago: still there means another edit got in first;
+        // gone means it was removed meanwhile.
+        Ok(None) => match scoped_arrangement(&state, &ctx, arr_id, false).await {
+            Ok(Some(_)) => console::precondition_page(
+                &ctx,
+                Section::Arrangements,
+                "arrangement",
+                &format!("/admin/orgs/{org_id}/arrangements/{arr_id}"),
+            ),
+            _ => error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found."),
+        },
         Err(arrangement::ArrangementError::UnknownWork) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,
@@ -1078,7 +1081,8 @@ async fn update_work(
     };
     let composer = blank_to_none(form.composer);
     match work::update(&state.db, work_id, None, &title, composer.as_deref()).await {
-        Ok(_) => {
+        Ok(None) => error_page(&ctx, StatusCode::NOT_FOUND, "Work not found."),
+        Ok(Some(_)) => {
             audit(
                 &state.db,
                 &instance_audit_ctx(&ctx, request_id),
@@ -1692,12 +1696,17 @@ async fn update_voice(
             ))
             .into_response()
         }
-        Ok(None) => console::precondition_page(
-            &ctx,
-            Section::Arrangements,
-            "voice",
-            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"),
-        ),
+        // Read a moment ago: still there means another edit got in first;
+        // gone means it was removed meanwhile.
+        Ok(None) => match scoped_voice(&state, &ctx, arr_id, voice_id, false).await {
+            Ok(Some(_)) => console::precondition_page(
+                &ctx,
+                Section::Arrangements,
+                "voice",
+                &format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"),
+            ),
+            _ => error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
+        },
         Err(voice::VoiceError::UnknownInstrument) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,

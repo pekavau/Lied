@@ -450,12 +450,17 @@ async fn update_member(
     )
     .await
     {
-        Ok(None) => console::precondition_page(
-            &ctx,
-            Section::Members,
-            "member",
-            &format!("/admin/orgs/{org_id}/members/{membership_id}"),
-        ),
+        // Read a moment ago: still there means another edit got in first;
+        // gone means it was removed meanwhile.
+        Ok(None) => match scoped_membership(&state, org_id, membership_id).await {
+            Ok(Some(_)) => console::precondition_page(
+                &ctx,
+                Section::Members,
+                "member",
+                &format!("/admin/orgs/{org_id}/members/{membership_id}"),
+            ),
+            _ => error_page(&ctx, StatusCode::NOT_FOUND, "Member not found."),
+        },
         Ok(Some(_)) => {
             // Distinguish the security-relevant transitions (CLAUDE.md audit
             // events: "role change, principal-flag change"), matching the /v1

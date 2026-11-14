@@ -1131,3 +1131,42 @@ async fn org_patch_is_partial_and_an_empty_one_writes_nothing() {
     assert_eq!(body["name"], "Loud Org");
     assert_ne!(renamed, etag, "a real change moves the ETag");
 }
+
+/// A stale write learns it is stale before any rule is checked against a
+/// state it never saw: a stale demotion of the org's only owner reports
+/// "nothing written" (→ 412), not "last owner" (→ 409).
+#[tokio::test]
+async fn a_stale_membership_write_is_stale_before_it_is_the_last_owner() {
+    let db = TestDb::create_and_migrate().await;
+    let owner = create_plain_user(&db.pool, "owner", "correct horse battery staple").await;
+    let org = create_org(&db.pool, "Solo Org").await;
+    let m = add_member(&db.pool, org.id, owner.id, membership::Role::Owner).await;
+    let stale = Some(lied::listing::version_of(m.updated_at) - 1);
+    let demote = membership::MembershipFields {
+        role: membership::Role::Musician,
+        instrument_ids: &[],
+        is_principal: false,
+        principal_instrument_ids: &[],
+    };
+
+    let updated = membership::update(&db.pool, m.id, stale, demote)
+        .await
+        .expect("stale is not an error");
+    assert!(updated.is_none());
+    assert!(!membership::delete(&db.pool, m.id, stale)
+        .await
+        .expect("stale is not an error"));
+
+    // At the current version the rule still holds.
+    let current = Some(lied::listing::version_of(m.updated_at));
+    let demote = membership::MembershipFields {
+        role: membership::Role::Musician,
+        instrument_ids: &[],
+        is_principal: false,
+        principal_instrument_ids: &[],
+    };
+    assert!(matches!(
+        membership::update(&db.pool, m.id, current, demote).await,
+        Err(membership::MembershipError::LastOwner)
+    ));
+}
