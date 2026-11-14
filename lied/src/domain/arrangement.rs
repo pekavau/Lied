@@ -365,6 +365,12 @@ pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
     ("relevance", RELEVANCE_FRAGMENT),
 ];
 
+/// The sort a list uses when the request names none: (SQL column from
+/// [`SORT_ALLOWLIST`], direction). The OpenAPI description must name it;
+/// `sort_and_filter_docs_match_the_allowlists` checks that it does.
+pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
+    ("a.title", crate::listing::SortDirection::Asc);
+
 /// The `relevance` sort fragment. `$5` is the `q` bind in [`list_for_org`]'s
 /// query — the ranking is only meaningful alongside the search term, which is
 /// why [`resolve_search_sort`] refuses to use it without one.

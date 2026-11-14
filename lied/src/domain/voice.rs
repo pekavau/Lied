@@ -250,6 +250,12 @@ pub async fn find_by_id_including_deleted(
 // `ORDER BY created_at` is ambiguous and errors at runtime.
 pub const SORT_ALLOWLIST: &[(&str, &str)] = &[("name", "v.name"), ("createdAt", "v.created_at")];
 
+/// The sort a list uses when the request names none: (SQL column from
+/// [`SORT_ALLOWLIST`], direction). The OpenAPI description must name it;
+/// `sort_and_filter_docs_match_the_allowlists` checks that it does.
+pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
+    ("v.name", crate::listing::SortDirection::Asc);
+
 /// Filter allowlist: exact match on `instrumentId`.
 pub const FILTER_ALLOWLIST: &[&str] = &["instrumentId"];
 
