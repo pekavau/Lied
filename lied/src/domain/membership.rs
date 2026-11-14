@@ -422,9 +422,17 @@ pub async fn list_for_org(
 /// one *other* owner remains in the org.
 ///
 /// Returns `Ok(None)` if no row matched `id`.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     fields: MembershipFields<'_>,
 ) -> Result<Option<Membership>, MembershipError> {
     validate_fields(pool, &fields).await?;
@@ -445,7 +453,7 @@ pub async fn update(
         r#"
         UPDATE membership
         SET role = $2, instrument_ids = $3, is_principal = $4, principal_instrument_ids = $5, updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND ($6::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $6)
         RETURNING
             id, user_id, organization_id, role,
             instrument_ids, is_principal, principal_instrument_ids,
@@ -457,6 +465,7 @@ pub async fn update(
         fields.instrument_ids,
         fields.is_principal,
         fields.principal_instrument_ids,
+        expected_version,
     )
     .fetch_optional(pool)
     .await?;
@@ -484,7 +493,18 @@ pub async fn has_any_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sq
 /// Returns `Ok(true)` if a row was deleted, `Ok(false)` if `id` did not
 /// exist, or `Err(MembershipError::LastOwner)` if the deletion would leave
 /// the org without an owner.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, MembershipError> {
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
+pub async fn delete(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+) -> Result<bool, MembershipError> {
     let Some(current) = find_by_id(pool, id).await? else {
         return Ok(false);
     };
@@ -496,7 +516,11 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, MembershipError> {
         }
     }
 
-    let result = sqlx::query!(r#"DELETE FROM membership WHERE id = $1"#, id)
+    let result = sqlx::query!(
+        r#"DELETE FROM membership WHERE id = $1 AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2)"#,
+        id,
+        expected_version,
+    )
         .execute(pool)
         .await?;
 

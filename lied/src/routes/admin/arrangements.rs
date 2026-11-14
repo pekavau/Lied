@@ -29,7 +29,7 @@ use crate::auth::csrf;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::{arrangement, global_annotation, instrument, tag, voice, work};
-use crate::listing::{check_if_match, SortDirection};
+use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
 use crate::routes::RequestId;
@@ -745,7 +745,14 @@ async fn update(
         Err(message) => return error_page(&ctx, StatusCode::BAD_REQUEST, &message),
     };
 
-    match arrangement::update(&state.db, arr_id, parsed.as_fields()).await {
+    match arrangement::update(
+        &state.db,
+        arr_id,
+        Some(listing::version_of(current.updated_at)),
+        parsed.as_fields(),
+    )
+    .await
+    {
         Ok(Some(updated)) => {
             audit(
                 &state.db,
@@ -758,7 +765,14 @@ async fn update(
             .await;
             Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
         }
-        Ok(None) => error_page(&ctx, StatusCode::NOT_FOUND, "Arrangement not found."),
+        // Read a moment ago, so another edit got in first (or it was just
+        // removed — the reload shows which).
+        Ok(None) => console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "arrangement",
+            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}"),
+        ),
         Err(arrangement::ArrangementError::UnknownWork) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,
@@ -800,7 +814,7 @@ async fn delete(
             );
         }
     }
-    match arrangement::soft_delete(&state.db, arr_id).await {
+    match arrangement::soft_delete(&state.db, arr_id, None).await {
         Ok(true) => {
             audit(
                 &state.db,
@@ -1063,7 +1077,7 @@ async fn update_work(
         );
     };
     let composer = blank_to_none(form.composer);
-    match work::update(&state.db, work_id, &title, composer.as_deref()).await {
+    match work::update(&state.db, work_id, None, &title, composer.as_deref()).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1645,6 +1659,7 @@ async fn update_voice(
     match voice::update(
         &state.db,
         voice_id,
+        Some(listing::version_of(current.updated_at)),
         &name,
         instrument_id,
         voice::PartNumberChange::Set(part_number),
@@ -1677,7 +1692,12 @@ async fn update_voice(
             ))
             .into_response()
         }
-        Ok(None) => error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
+        Ok(None) => console::precondition_page(
+            &ctx,
+            Section::Arrangements,
+            "voice",
+            &format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"),
+        ),
         Err(voice::VoiceError::UnknownInstrument) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,
@@ -1718,7 +1738,7 @@ async fn delete_voice(
     ) {
         return response;
     }
-    match voice::soft_delete(&state.db, voice_id).await {
+    match voice::soft_delete(&state.db, voice_id, None).await {
         Ok(true) => {
             audit(
                 &state.db,

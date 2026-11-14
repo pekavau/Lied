@@ -965,7 +965,9 @@ async fn a_piece_whose_arrangement_was_deleted_renders_as_removed() {
 
     // Soft-deleting the arrangement must not silently drop it from the program:
     // hide-with-references means the slot stays, marked.
-    arrangement::soft_delete(&ctx.pool, arr).await.unwrap();
+    arrangement::soft_delete(&ctx.pool, arr, None)
+        .await
+        .unwrap();
 
     let (status, html) = load_page(&ctx.app, &browser, &detail_url).await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -1580,7 +1582,9 @@ async fn a_piece_whose_arrangement_was_removed_takes_no_new_assignees() {
         .unwrap()
         .unwrap()
         .arrangement_id;
-    arrangement::soft_delete(&ctx.pool, arr_id).await.unwrap();
+    arrangement::soft_delete(&ctx.pool, arr_id, None)
+        .await
+        .unwrap();
 
     let (status, html) = load_page(&ctx.app, &browser, &url).await;
     assert_eq!(status, axum::http::StatusCode::OK);

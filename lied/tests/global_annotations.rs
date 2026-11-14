@@ -700,7 +700,7 @@ async fn a_removed_arrangement_hides_its_annotations_until_restored() {
         note["id"].as_str().unwrap()
     );
 
-    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr)
+    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr, None)
         .await
         .unwrap());
     let (status, _, _) = send(&ctx.app, req("GET", &url, &tok, None)).await;
@@ -792,7 +792,7 @@ async fn a_hidden_annotation_cannot_be_deleted_or_edited() {
     let (note, _) = create(&ctx, &tok, arr, "tempo", "keep me").await;
     let id: Uuid = note["id"].as_str().unwrap().parse().unwrap();
     let version = version_of(&ctx, arr, id).await;
-    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr)
+    assert!(lied::domain::arrangement::soft_delete(&ctx.pool, arr, None)
         .await
         .unwrap());
 

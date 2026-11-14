@@ -337,9 +337,17 @@ pub async fn list_deleted_for_collection(
 /// Move a single item to `new_index`. Maps a clash on the existing index to
 /// [`CollectionItemError::DuplicateIndex`]. Returns `None` if no live item
 /// matched.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update_index(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     new_index: i32,
 ) -> Result<Option<CollectionItem>, CollectionItemError> {
     let row = sqlx::query_as!(
@@ -348,6 +356,7 @@ pub async fn update_index(
         UPDATE collection_item
         SET index = $2, updated_at = now()
         WHERE id = $1 AND deleted_at IS NULL
+          AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
         RETURNING
             id, collection_id, arrangement_id, index,
             created_at as "created_at: DateTime<Utc>",
@@ -357,6 +366,7 @@ pub async fn update_index(
         "#,
         id,
         new_index,
+        expected_version,
     )
     .fetch_optional(pool)
     .await
@@ -511,19 +521,29 @@ async fn live_ids_in_order(
 /// more, count on" is not a state worth rendering.
 ///
 /// Returns `false` if no live item matched.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn remove(
     pool: &PgPool,
     collection_id: Uuid,
     item_id: Uuid,
+    expected_version: Option<i64>,
 ) -> Result<bool, CollectionItemError> {
     let mut tx = pool.begin().await?;
 
     let removed = sqlx::query!(
         r#"UPDATE collection_item SET deleted_at = now(), updated_at = now()
            WHERE id = $1 AND collection_id = $2 AND deleted_at IS NULL
+             AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
            RETURNING id"#,
         item_id,
         collection_id,
+        expected_version,
     )
     .fetch_optional(&mut *tx)
     .await?;

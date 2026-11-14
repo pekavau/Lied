@@ -24,7 +24,7 @@ use crate::domain::audit_log::audit;
 use crate::domain::{
     arrangement, collection, collection_item, coverage, membership, part_assignment, user,
 };
-use crate::listing::{check_if_match, SortDirection};
+use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, require_found, scoped_arrangement,
 };
@@ -635,7 +635,15 @@ async fn update_collection(
 
     // The slug is immutable by design (CLAUDE.md: renaming a slug is a separate
     // admin operation), so only name and type move here.
-    match collection::update(&state.db, collection_id, &name, &collection_type).await {
+    match collection::update(
+        &state.db,
+        collection_id,
+        Some(listing::version_of(current.updated_at)),
+        &name,
+        &collection_type,
+    )
+    .await
+    {
         Ok(Some(_)) => {
             audit(
                 &state.db,
@@ -648,7 +656,12 @@ async fn update_collection(
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
         }
-        Ok(None) => error_page(&ctx, StatusCode::NOT_FOUND, "Collection not found."),
+        Ok(None) => console::precondition_page(
+            &ctx,
+            Section::Collections,
+            "collection",
+            &detail_url(org_id, collection_id),
+        ),
         Err(collection::CollectionError::DuplicateSlug) => error_page(
             &ctx,
             StatusCode::CONFLICT,
@@ -683,7 +696,7 @@ async fn delete_collection(
     ) {
         return response;
     }
-    match collection::soft_delete(&state.db, collection_id).await {
+    match collection::soft_delete(&state.db, collection_id, None).await {
         Ok(true) => {
             audit(
                 &state.db,
@@ -1034,7 +1047,7 @@ async fn delete_item(
     ) {
         return response;
     }
-    match collection_item::remove(&state.db, collection_id, item_id).await {
+    match collection_item::remove(&state.db, collection_id, item_id, None).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1515,7 +1528,7 @@ async fn unassign_part(
     ) {
         return response;
     }
-    match part_assignment::delete(&state.db, assignment_id).await {
+    match part_assignment::delete(&state.db, assignment_id, None).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1576,7 +1589,9 @@ async fn mark_state(
         StateStamp::Notified => (now, keep),
         StateStamp::Acknowledged => (keep, now),
     };
-    match part_assignment::update_state(&state.db, assignment_id, notified, acknowledged).await {
+    match part_assignment::update_state(&state.db, assignment_id, None, notified, acknowledged)
+        .await
+    {
         Ok(_) => {
             audit(
                 &state.db,

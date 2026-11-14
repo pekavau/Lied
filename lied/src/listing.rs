@@ -238,6 +238,26 @@ pub fn check_if_match(header_value: Option<&str>, updated_at: DateTime<Utc>) -> 
     }
 }
 
+/// The version a guarded domain write takes for `updated_at` — the number in
+/// its ETag. Pass the version of the row the `If-Match` check was made
+/// against, so the write itself re-checks it (issue #64).
+pub fn version_of(updated_at: DateTime<Utc>) -> i64 {
+    updated_at.timestamp_millis()
+}
+
+/// A guarded write matched no row: either someone else wrote first (`412`)
+/// or the row went away (`404`). `still_there` re-reads it the way the
+/// handler read it before writing; it only runs on this failure path.
+pub async fn stale_or_gone<T>(
+    still_there: impl std::future::Future<Output = Result<T, crate::error::AppError>>,
+) -> crate::error::AppError {
+    match still_there.await {
+        Ok(_) => crate::error::AppError::PreconditionFailed,
+        Err(crate::error::AppError::NotFound) => crate::error::AppError::NotFound,
+        Err(other) => other,
+    }
+}
+
 /// The raw `If-Match` header value, if present and ASCII.
 pub fn if_match_header(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers

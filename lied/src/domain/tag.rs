@@ -233,9 +233,17 @@ pub async fn list_for_org(
 
 /// Update a tag's mutable fields (`name`, `kind`). Returns `None` if no live
 /// row matched `id`.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     name: &str,
     kind: Option<&str>,
 ) -> Result<Option<Tag>, TagError> {
@@ -245,6 +253,7 @@ pub async fn update(
         UPDATE tag
         SET name = $2, kind = $3, updated_at = now()
         WHERE id = $1 AND deleted_at IS NULL
+          AND ($4::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $4)
         RETURNING
             id, organization_id, name, kind,
             created_at as "created_at: DateTime<Utc>",
@@ -255,6 +264,7 @@ pub async fn update(
         id,
         name,
         kind,
+        expected_version,
     )
     .fetch_optional(pool)
     .await
@@ -269,10 +279,22 @@ pub async fn update(
 /// through [`list_tags_for_arrangement`]'s `tag.deleted_at IS NULL` filter
 /// without the join row itself being modified, the same hide-with-references
 /// pattern as Arrangement -> Voice.
-pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
+pub async fn soft_delete(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query!(
-        r#"UPDATE tag SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL"#,
+        r#"UPDATE tag SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2)"#,
         id,
+        expected_version,
     )
     .execute(pool)
     .await?;

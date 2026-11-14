@@ -200,16 +200,24 @@ pub async fn list(
 
 /// Update an organization's `name`. `slug` is immutable (see module doc).
 /// Returns the updated row, or `None` if no row matched `id`.
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
 pub async fn update_name(
     pool: &PgPool,
     id: Uuid,
+    expected_version: Option<i64>,
     name: &str,
 ) -> Result<Option<Organization>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         UPDATE organization
         SET name = $2, updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
         RETURNING
             id, name, slug,
             created_at as "created_at: DateTime<Utc>",
@@ -217,6 +225,7 @@ pub async fn update_name(
         "#,
         id,
         name,
+        expected_version,
     )
     .fetch_optional(pool)
     .await?;
@@ -245,8 +254,32 @@ pub async fn update_name(
 /// it does. MinIO objects are not touched here — file/object cleanup for a
 /// hard-deleted org is a phase-2 concern once the File domain module (and its
 /// S3 key derivation) exists; flagged here rather than silently doing nothing.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
+/// `Some`, the write happens only if the row is still at that version, checked
+/// inside the statement so two writers holding one ETag cannot both succeed;
+/// otherwise nothing is written and this reports no row (`None` / `false`),
+/// exactly as for a missing one — the caller tells the two apart. `None`
+/// writes unconditionally (fixtures, internal callers with no ETag).
+pub async fn delete(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+
+    // Lock the row at the caller's version before the cascade, so a stale
+    // delete removes nothing (the transaction rolls back on return).
+    let locked = sqlx::query_scalar!(
+        r#"SELECT id FROM organization WHERE id = $1 AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2) FOR UPDATE"#,
+        id,
+        expected_version,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        return Ok(false);
+    }
 
     sqlx::query!(
         r#"

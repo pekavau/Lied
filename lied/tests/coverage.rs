@@ -320,6 +320,7 @@ async fn acknowledge(pool: &PgPool, assignment: Uuid) {
     part_assignment::update_state(
         pool,
         assignment,
+        None,
         part_assignment::StampChange::Keep,
         part_assignment::StampChange::Set(Some(chrono::Utc::now())),
     )
@@ -458,7 +459,7 @@ async fn soft_deleted_voices_items_and_arrangements_are_never_required() {
     );
 
     // A retired voice stops being a gap to chase.
-    voice::soft_delete(&db.pool, programme.voices[0].0)
+    voice::soft_delete(&db.pool, programme.voices[0].0, None)
         .await
         .unwrap();
     assert_eq!(
@@ -475,7 +476,7 @@ async fn soft_deleted_voices_items_and_arrangements_are_never_required() {
             .unwrap(),
     )
     .unwrap();
-    arrangement::soft_delete(&db.pool, arrangement_id)
+    arrangement::soft_delete(&db.pool, arrangement_id, None)
         .await
         .unwrap();
     let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
@@ -490,7 +491,7 @@ async fn soft_deleted_voices_items_and_arrangements_are_never_required() {
     );
 
     // A piece removed from the programme disappears entirely.
-    collection_item::remove(&db.pool, programme.collection_id, programme.items[1])
+    collection_item::remove(&db.pool, programme.collection_id, programme.items[1], None)
         .await
         .unwrap();
     let report = coverage_json(&app, &token, org_id, programme.collection_id).await;
@@ -914,7 +915,7 @@ async fn a_removed_piece_reports_no_players_even_though_it_lists_them() {
             .unwrap(),
     )
     .unwrap();
-    arrangement::soft_delete(&db.pool, arrangement_id)
+    arrangement::soft_delete(&db.pool, arrangement_id, None)
         .await
         .unwrap();
 

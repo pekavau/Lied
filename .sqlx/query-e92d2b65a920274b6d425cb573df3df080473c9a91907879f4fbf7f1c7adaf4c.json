@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE arrangement\n        SET title = $2, work_id = $3, instrumentation = $4, arranger = $5,\n            publisher = $6, purchase_date = $7::text::date, license_notes = $8,\n            copy_count_allowed = $9, status = $10, duration_seconds = $11,\n            difficulty = $12, difficulty_ratings = $13, difficulty_notes = $14,\n            updated_at = now()\n        WHERE id = $1 AND deleted_at IS NULL\n        RETURNING\n            id, organization_id, title, slug, work_id, instrumentation, arranger,\n            publisher,\n            purchase_date as \"purchase_date: NaiveDate\",\n            license_notes, copy_count_allowed, status,\n            duration_seconds, difficulty, difficulty_ratings, difficulty_notes,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "query": "\n        UPDATE arrangement\n        SET title = $2, work_id = $3, instrumentation = $4, arranger = $5,\n            publisher = $6, purchase_date = $7::text::date, license_notes = $8,\n            copy_count_allowed = $9, status = $10, duration_seconds = $11,\n            difficulty = $12, difficulty_ratings = $13, difficulty_notes = $14,\n            updated_at = now()\n        WHERE id = $1 AND deleted_at IS NULL\n          AND ($15::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $15)\n        RETURNING\n            id, organization_id, title, slug, work_id, instrumentation, arranger,\n            publisher,\n            purchase_date as \"purchase_date: NaiveDate\",\n            license_notes, copy_count_allowed, status,\n            duration_seconds, difficulty, difficulty_ratings, difficulty_notes,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
   "describe": {
     "columns": [
       {
@@ -119,7 +119,8 @@
         "Int4",
         "Int2",
         "Jsonb",
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -145,5 +146,5 @@
       true
     ]
   },
-  "hash": "157ddfd6a7ba4ff7deae3f72910ec86cb9f2cbe7087bdf614cb69552564adec6"
+  "hash": "e92d2b65a920274b6d425cb573df3df080473c9a91907879f4fbf7f1c7adaf4c"
 }
