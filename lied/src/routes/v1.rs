@@ -23,7 +23,8 @@ use crate::domain::user;
 use crate::domain::{app_password, instrument};
 use crate::error::AppError;
 use crate::pagination::{Page, PageParams};
-use crate::routes::openapi::{CommonErrors, Conflict409, NotFound404};
+use crate::routes::json::ApiJson;
+use crate::routes::openapi::{CommonErrors, Conflict409, NotFound404, Validation400};
 use crate::routes::RequestId;
 use crate::state::AppState;
 
@@ -91,7 +92,7 @@ async fn list_instruments(
 
 /// Request body for `POST /v1/tokens`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MintTokenRequest {
     /// Optional active org id to scope the token to (CLAUDE.md JWT claims:
     /// `org`, nullable). Not validated against Membership in this item —
@@ -128,13 +129,14 @@ struct MintTokenResponse {
         // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
         // RFC 7807 ProblemDetails bodies (API guidelines §4).
         CommonErrors,
+        Validation400,
     )
 )]
 async fn mint_token(
     State(state): State<AppState>,
     session: tower_sessions::Session,
     RequestId(request_id): RequestId,
-    Json(body): Json<MintTokenRequest>,
+    ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, AppError> {
     let request_id = Some(request_id);
 
@@ -218,7 +220,7 @@ async fn mint_token(
 
 /// Request body for `POST /v1/app-passwords`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateAppPasswordRequest {
     /// Human-readable label (e.g. "iPad in rehearsal room"). Must be unique
     /// per user.
@@ -255,6 +257,7 @@ struct CreateAppPasswordResponse {
         (status = 201, description = "App password created; token shown once",
             body = CreateAppPasswordResponse),
         CommonErrors,
+        Validation400,
         Conflict409,
     )
 )]
@@ -262,7 +265,7 @@ async fn create_app_password(
     auth: BearerOrSession,
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
-    Json(body): Json<CreateAppPasswordRequest>,
+    ApiJson(body): ApiJson<CreateAppPasswordRequest>,
 ) -> Result<(StatusCode, Json<CreateAppPasswordResponse>), AppError> {
     let generated = generate_app_password()
         .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to generate app password")))?;

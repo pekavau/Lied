@@ -25,6 +25,7 @@ use crate::error::AppError;
 use crate::listing::{self, SortDirection};
 use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
@@ -151,7 +152,7 @@ async fn find_item_scoped(
 
 /// Request body for creating a collection.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CollectionRequest {
     name: String,
     /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
@@ -265,7 +266,7 @@ async fn create_collection(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    Json(body): Json<CollectionRequest>,
+    ApiJson(body): ApiJson<CollectionRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
@@ -375,7 +376,7 @@ async fn update_collection(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateCollectionRequest>,
+    ApiJson(body): ApiJson<UpdateCollectionRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
 
@@ -537,7 +538,7 @@ async fn undelete_collection(
 
 /// Request body for reordering a collection's items.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReorderRequest {
     /// The item IDs in their new order; reassigned indices `1..=n`.
     ordered_ids: Vec<Uuid>,
@@ -558,6 +559,7 @@ struct ReorderRequest {
     responses(
         (status = 204, description = "Items reordered"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -568,7 +570,7 @@ async fn reorder_items(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<ReorderRequest>,
+    ApiJson(body): ApiJson<ReorderRequest>,
 ) -> Result<StatusCode, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, id).await?;
@@ -630,7 +632,7 @@ async fn list_items(
 
 /// Request body for adding an item to a collection.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AddItemRequest {
     arrangement_id: Uuid,
     index: i32,
@@ -663,7 +665,7 @@ async fn add_item(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<AddItemRequest>,
+    ApiJson(body): ApiJson<AddItemRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, id).await?;
@@ -780,7 +782,7 @@ async fn update_item(
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateItemRequest>,
+    ApiJson(body): ApiJson<UpdateItemRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     let current = find_item_scoped(&state, org_id, collection_id, item_id, false).await?;

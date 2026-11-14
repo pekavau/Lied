@@ -26,6 +26,7 @@ use crate::domain::{organization, user};
 use crate::error::AppError;
 use crate::listing::{self, etag_response, if_match_header, SortDirection};
 use crate::pagination::Page;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
@@ -96,7 +97,7 @@ impl From<organization::Organization> for OrganizationResponse {
 
 /// Request body for `POST /v1/orgs`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateOrgRequest {
     name: String,
 }
@@ -200,7 +201,7 @@ async fn create_org(
     auth: BearerOrSession,
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
-    Json(body): Json<CreateOrgRequest>,
+    ApiJson(body): ApiJson<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<OrganizationResponse>), AppError> {
     require_system_admin(&auth.user)?;
 
@@ -306,7 +307,7 @@ async fn update_org(
     RequestId(request_id): RequestId,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<UpdateOrgRequest>,
+    ApiJson(body): ApiJson<UpdateOrgRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_system_admin(&auth.user)?;
 
@@ -421,7 +422,7 @@ async fn delete_org(
 
 /// Request body for `POST /v1/users`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateUserRequest {
     username: String,
     email: Option<String>,
@@ -522,7 +523,7 @@ async fn create_user(
     auth: BearerOrSession,
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
-    Json(body): Json<CreateUserRequest>,
+    ApiJson(body): ApiJson<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<user::User>), AppError> {
     require_system_admin(&auth.user)?;
 
@@ -733,7 +734,7 @@ impl From<membership::Membership> for MembershipResponse {
 
 /// Request body for `POST /v1/orgs/{orgId}/members`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateMemberRequest {
     user_id: Uuid,
     role: String,
@@ -853,7 +854,7 @@ async fn create_member(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    Json(body): Json<CreateMemberRequest>,
+    ApiJson(body): ApiJson<CreateMemberRequest>,
 ) -> Result<(StatusCode, Json<MembershipResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Owner).await?;
 
@@ -1026,7 +1027,7 @@ async fn update_member(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateMemberRequest>,
+    ApiJson(body): ApiJson<UpdateMemberRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Owner).await?;
 

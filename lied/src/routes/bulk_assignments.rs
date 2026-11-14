@@ -27,6 +27,7 @@ use crate::domain::bulk_assign::{self, PartKey, PlanItem};
 use crate::domain::{instrument, part_assignment, user};
 use crate::error::AppError;
 use crate::routes::collections::find_collection_scoped;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{CommonErrors, Conflict409, Forbidden403, NotFound404, Validation400};
 use crate::routes::RequestId;
 use crate::state::AppState;
@@ -132,7 +133,7 @@ struct PairRequest {
 
 /// Request body for `POST …/bulk-assignments`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApplyRequest {
     user_id: Uuid,
     /// The part being assigned — the same `instrumentId` / `partNumber` the
@@ -199,7 +200,7 @@ async fn apply_bulk_assignment(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<ApplyRequest>,
+    ApiJson(body): ApiJson<ApplyRequest>,
 ) -> Result<Json<ApplyResponse>, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, collection_id).await?;

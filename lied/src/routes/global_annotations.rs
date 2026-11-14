@@ -30,6 +30,7 @@ use crate::error::AppError;
 use crate::listing::{self, etag_response, etag_response_status, if_match_header, SortDirection};
 use crate::pagination::Page;
 use crate::routes::arrangements::find_arrangement_scoped;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
     CommonErrors, Forbidden403, NotFound404, Precondition412, Validation400,
 };
@@ -187,7 +188,7 @@ async fn list_annotations(
 
 /// Request body for `POST …/annotations`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateRequest {
     /// One of `tempo`, `dynamics`, `articulation`, `structure`, `general`.
     #[serde(rename = "type")]
@@ -223,7 +224,7 @@ async fn create_annotation(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<CreateRequest>,
+    ApiJson(body): ApiJson<CreateRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
@@ -334,7 +335,7 @@ async fn update_annotation(
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id, id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateRequest>,
+    ApiJson(body): ApiJson<UpdateRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::can_author_global_annotations).await?;
     let current = find_scoped(&state, org_id, arrangement_id, id).await?;
