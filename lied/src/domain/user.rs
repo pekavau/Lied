@@ -288,21 +288,21 @@ pub async fn list(
 
 /// Hard-delete a user (CLAUDE.md: "user deletion is admin-gated hard delete
 /// with explicit reassignment-or-anonymization of PartAssignments,
-/// GlobalAnnotations, and audit log entries" — full reassignment/
-/// anonymization flows are a phase-2 concern per the entity doc, but this
-/// item still must not leave a dangling FK or silently 500). To keep the
-/// delete itself safe today without a full reassignment UI, the rows this
-/// user is referenced from are nulled/cleared rather than cascaded:
-/// - `membership.created_by`, `organization.created_by`, and other
-///   `created_by` audit columns are nullable and simply keep pointing at a
-///   (now-gone) id only via `ON DELETE` behavior already declared on the
-///   FK — *except* `membership.user_id`, `part_assignment.user_id`, and
-///   `global_annotation.author_id`, which are `NOT NULL` and have no
-///   `ON DELETE` clause, so a delete while those rows exist would violate
-///   the FK and error. Phase 1 accepts this as a hard stop (the caller sees
-///   a clear DB error) rather than silently deleting a user who still has
-///   active memberships/assignments/annotations — an explicit
-///   reassignment flow is the correct fix and is deferred, per CLAUDE.md.
+/// GlobalAnnotations, and audit log entries" — the reassignment/
+/// anonymization flow is not yet built, but this delete still must not
+/// leave a dangling FK or silently 500). Nothing is cascaded or nulled here:
+/// - `audit_log.actor_user_id` is `ON DELETE SET NULL` (migration 0020), so
+///   audit rows survive with the actor anonymized;
+/// - `created_by` on `organization`, `membership`, `user` and `instrument`
+///   carries no FK at all, so it keeps the gone id;
+/// - every other reference has the default `ON DELETE NO ACTION`:
+///   `membership.user_id`, `part_assignment.user_id`,
+///   `global_annotation.author_id`, `app_password.user_id`, and the
+///   `created_by` columns of work, arrangement, voice, file, collection,
+///   collection item, part assignment, tag and global annotation. A delete
+///   while any such row exists violates the FK and errors, which the routes
+///   report as `409` — a hard stop rather than silently deleting a user
+///   whose work is still on record.
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(

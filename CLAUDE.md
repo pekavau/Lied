@@ -296,7 +296,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 - **Phase 1 backup posture (minimum bar).** The README documents:
   - **Postgres:** `pg_dump --format=custom` to a host-mounted volume on a cron schedule; `pg_restore --clean` for recovery.
   - **MinIO:** `mc mirror` to a second MinIO instance or host directory on the same schedule; reverse mirror for recovery.
-  - **Ordering:** dump **Postgres first, then MinIO**; restore in the same order. The DB is the authority for existence, so the safe failure mode is a DB reference to a not-yet-mirrored file (a detectable 404) rather than a MinIO object with no DB row (dead bytes, non-corrupting). This is best-effort, not a consistent snapshot — acceptable at this posture; true snapshot coordination is a phase-2 runbook item.
+  - **Ordering:** dump **Postgres first, then MinIO**; restore in the same order. The DB is the authority for existence, so the safe failure mode is a DB reference to a not-yet-mirrored file (a detectable 404) rather than a MinIO object with no DB row (dead bytes, non-corrupting). This is best-effort, not a consistent snapshot — acceptable at this posture; true snapshot coordination is a later runbook item (deferred).
   - **Required volume mounts** in `docker-compose.yml`: Postgres data dir, MinIO data dir, backup target dir, all host-mounted.
   - **Back up:** those three volumes plus the `.env` / secrets files.
   - **OK to lose on restore:** in-memory rate-limit state (acceptable), session cookies (users re-login).
@@ -310,7 +310,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 |---|---|---|---|
 | Max single file upload | `LIED_MAX_UPLOAD_BYTES` | 200 MB | Covers 99.9th-percentile orchestral PDFs; anything larger is almost always a mistake or needs splitting |
 | Max non-upload request body | `LIED_MAX_REQUEST_BYTES` | 256 KB | JSON / form bodies; prevents bomb attacks |
-| Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached |
+| Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached. *(configured, not yet enforced — #45)* |
 | Max arrangements per org | `LIED_MAX_ARRANGEMENTS_PER_ORG` | unset (no limit) | Reserved for SaaS-mode quotas later |
 | Max list page size | `LIED_MAX_PAGE_SIZE` | 200 (default 50) | Offset/limit pagination ceiling (see HTTP & REST API conventions) |
 | Rate limit, authenticated | `LIED_RATELIMIT_AUTH_PER_MIN` | 120 req/min | HTMX UIs fire several requests per interaction |
@@ -633,13 +633,13 @@ Unique on `(arrangement_id, voice_id, name, format)`. The MinIO object key is **
 An orchestra or ensemble.
 Fields: `name` (text), `slug` (text, immutable, unique globally), audit fields.
 No `deleted_at`: deleting an org is admin-gated hard delete because the cascade impact is large and undelete UX is messy.
-**Cascade order** (FK-safe, one transaction): PartAssignments → CollectionItems → Collections → ArrangementTags → Tags → GlobalAnnotations → Files (and their MinIO objects) → Voices → Arrangements → Memberships → the Organization row. **Not cascaded:** `Work` rows (instance-wide, shared across orgs) and `audit_log` rows (retained with their `org_id` so the deletion itself stays forensically auditable after the org is gone).
+**Cascade order** (FK-safe, one transaction): PartAssignments → CollectionItems → Collections → ArrangementTags → Tags → GlobalAnnotations → Files → Voices → Arrangements → Memberships → the Organization row. Deleting the Files' MinIO objects is *(not yet built)*: they stay in the bucket. **Not cascaded:** `Work` rows (instance-wide, shared across orgs) and `audit_log` rows (retained with their `org_id` so the deletion itself stays forensically auditable after the org is gone).
 
 **User**
 A person using the system. No system-wide application role — authorization is per-org via `Membership.role`. Optional `is_system_admin` boolean for instance-level operations (org provisioning, user management).
 Fields: `slug` (text, immutable, unique globally), `username` (citext, unique) — login identifier; renameable, distinct from `slug` so the personal WebDAV path stays stable across renames. `email` (citext, unique, nullable) — used for password reset and notifications; nullable so admins can create users without one (shared kiosk accounts, youth orchestra members). `password_hash` (text, nullable) — argon2id; nullable because OIDC users have no local password. `display_name` (text). `is_system_admin` (bool, default false). Audit fields.
 Updating a user (username, password, display name) is *(not yet built)*: `/v1/users` and the console create, read and delete users only.
-No `deleted_at` initially — user deletion is admin-gated hard delete with explicit reassignment-or-anonymization of PartAssignments, GlobalAnnotations, and audit log entries. That reassignment flow is deferred; until it exists, deleting a user who still holds a Membership, PartAssignment or GlobalAnnotation is refused by the foreign keys.
+No `deleted_at` initially — user deletion is admin-gated hard delete with explicit reassignment-or-anonymization of PartAssignments, GlobalAnnotations, and audit log entries. That reassignment flow is *(not yet built)*; until it exists, a user cannot be deleted (409) while they hold a Membership, PartAssignment, GlobalAnnotation authorship or AppPassword, or appear as `created_by` on any content row (Work, Arrangement, Voice, File, Collection, CollectionItem, PartAssignment, Tag, GlobalAnnotation). Audit-log rows do not block: their actor is set to NULL.
 
 **AppPassword**
 A revocable, WebDAV-scoped credential issued per device (the per-user app passwords from the Auth section).
@@ -749,13 +749,17 @@ This is the product's outer boundary — distinct from the *deferral* lists in t
 **Tenancy posture** (cross-references NFR)
 - **Strict multi-tenant SaaS isolation (topology 3)** — explicitly out for phase 1; requires a tenant-isolation pass. Phase 1 assumes every org in an instance trusts the others.
 
-## Phase 1 cut
+## Phase cuts
 
-**Status: complete.** Phase status lives here and in the Phase 2 cut; elsewhere in this spec, "deferred" points here. Operations marked *(not yet built)* or *(console only)* are designed but not (or not yet) exposed under `/v1`.
+Phase status lives here; elsewhere in this spec, "deferred" points here. Operations marked *(not yet built)* or *(console only)* are designed but not (or not yet) exposed under `/v1`.
+
+### Phase 1 cut
+
+**Status: complete.**
 
 Smallest version that closes the **archivist → musician loop** end-to-end: an archivist uploads a piece, builds a concert program, assigns parts; each musician opens their part on an iPad via WebDAV. Later phases plug in cleanly because the data model already accommodates them.
 
-### In scope for phase 1
+#### In scope for phase 1
 
 **Backend infrastructure**
 - Postgres + MinIO + REST API + WebDAV server.
@@ -780,7 +784,7 @@ Smallest version that closes the **archivist → musician loop** end-to-end: an 
 
 **UI** — minimal admin web UI for the archivist (entity CRUD, file upload, build collections, assign parts). Conductor uses the same UI for program planning. Musicians have no UI — WebDAV is their interface.
 
-### Deferred beyond phase 1
+#### Deferred beyond phase 1
 
 Model supports these; phase 1 has no implementation. Items marked **(→ phase 2)** are pulled into the management-console phase — see **Phase 2 cut** below; everything else is phase 3+.
 
@@ -797,11 +801,11 @@ Model supports these; phase 1 has no implementation. Items marked **(→ phase 2
 - Annotation staleness indicator.
 - Purpose-built display app (already deferred indefinitely in the spec) — now scoped as the phase-3 consumer client.
 
-### Trade-off accepted
+#### Trade-off accepted
 
 Phase 1 is unglamorous from the conductor's perspective (title ILIKE only, no tags, no fancy program planning aids) and from the format-conversion angle (you upload what you upload). It delivers the actual base value — getting parts from archivist to musician — and every later phase plugs in cleanly because the data model already accommodates it.
 
-## Phase 2 cut
+### Phase 2 cut
 
 **Status: complete** — every phase-2 issue is closed. Anything below under "Deferred to phase 3+" is still open.
 
@@ -813,7 +817,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 **One deliberate carve-out to "musicians have no phase-2 UI":** a **principal** (`musician` with `is_principal = true`) may log into the console for the **section-coverage screen only** — this realizes the view the model already grants them (Membership decision: `is_principal` "adds the section-coverage view without changing other permissions"), not a new permission. It is read-only and scoped to their own section. The principal's day-to-day, mobile-first coverage experience is deferred to the phase-3 client; the console screen is the "at my laptop" fallback.
 
-### In scope for phase 2
+#### In scope for phase 2
 
 **Backend — the "medium" features.** Each lands on `/v1` (JSON, with OpenAPI coverage so the contract stays complete for the future client + MCP server); the HTMX admin fragments call the same `domain/*` service functions — no logic duplication.
 
@@ -834,7 +838,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 **Correctness/quality carried in this phase.** PATCH partial-update semantics (#23 — see HTTP & REST API conventions) and CI for the PR gates (#24, orthogonal but cheap to land alongside).
 
-### Deferred to phase 3+
+#### Deferred to phase 3+
 
 Still model-supported, still not built:
 
@@ -843,7 +847,7 @@ Still model-supported, still not built:
 - Distribution **delivery** (UC-12): notification email + sync. Assignment state (`notifiedAt` / `acknowledgedAt`) is settable in the phase-2 admin, but automated delivery is deferred.
 - OIDC / SSO; the MCP server; external repertoire discovery → purchase pipeline (UC-4); annotation staleness indicator; `difficulty_ratings` cross-scale search.
 
-### Trade-off accepted
+#### Trade-off accepted
 
 Phase 2 makes the archivist and conductor-planner experience genuinely good — real search, program building, coverage, global annotations, and part-distribution state — but musicians still have no dedicated app; they remain on WebDAV + forScore / MobileSheets / MuseScore, which the spec sanctions. Two consequences are accepted deliberately. **Global annotations are authored but not yet consumed:** they are structured Postgres records, invisible over WebDAV, so the musicians they target have no surface to read them until the phase-3 client — phase 2 ships the conductor's authoring half only. And **automated distribution (email/sync) and format conversion stay deferred.** The payoff is a complete, exercised `/v1` contract and a mature management surface — exactly the evidence base needed before committing to the consumer client in phase 3.
 
