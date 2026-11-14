@@ -20,6 +20,7 @@ pub mod collections;
 pub mod files;
 pub mod global_annotations;
 pub mod infra;
+pub(crate) mod json;
 pub mod openapi;
 pub mod orgs;
 pub mod part_assignments;
@@ -120,6 +121,23 @@ pub fn request_id_from_parts(parts: &Parts) -> Uuid {
         .unwrap_or_else(Uuid::now_v7)
 }
 
+/// Run the rest of the request with its id in [`crate::error::REQUEST_ID`],
+/// so any `AppError` rendered while serving it carries the id as the Problem
+/// Details `instance`. Sits inside [`SetRequestIdLayer`], which has already
+/// stamped the header by the time this runs.
+async fn scope_request_id(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .unwrap_or_else(Uuid::now_v7);
+    crate::error::REQUEST_ID.scope(id, next.run(request)).await
+}
+
 /// Compose the full application router: the four sibling trees plus shared
 /// middleware (request-ID generation/propagation, request tracing).
 pub fn build_router(state: AppState) -> Router {
@@ -139,6 +157,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(v1_router)
         .merge(webdav::router(&state))
         .with_state(state)
+        .layer(axum::middleware::from_fn(scope_request_id))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
                 let request_id = request

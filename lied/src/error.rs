@@ -10,6 +10,22 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+tokio::task_local! {
+    /// The id of the request being served, set for the whole request by the
+    /// router's request-ID middleware so an error rendered anywhere below it
+    /// (handler, extractor rejection) can carry it as the Problem Details
+    /// `instance` — the log-correlation key CLAUDE.md asks for.
+    pub static REQUEST_ID: uuid::Uuid;
+}
+
+/// The Problem Details `instance` for the current request: its id as a
+/// `urn:uuid:` URI, or empty outside a request (unit tests, background work).
+fn current_instance() -> String {
+    REQUEST_ID
+        .try_with(|id| format!("urn:uuid:{id}"))
+        .unwrap_or_default()
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum AppError {
     #[error("resource not found")]
@@ -20,6 +36,11 @@ pub enum AppError {
 
     #[error("validation failed")]
     Validation(garde::Report),
+
+    /// The request could not be understood at all — a body that is not valid
+    /// JSON, say. Field-level problems are [`AppError::Validation`] instead.
+    #[error("{0}")]
+    BadRequest(String),
 
     #[error("database error")]
     Database(#[from] sqlx::Error),
@@ -95,6 +116,7 @@ impl AppError {
             AppError::NotFound => StatusCode::NOT_FOUND,
             AppError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
+            AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -112,6 +134,7 @@ impl AppError {
             AppError::NotFound => "https://lied/errors/not-found",
             AppError::PreconditionFailed => "https://lied/errors/precondition-failed",
             AppError::Validation(_) => "https://lied/errors/validation-failed",
+            AppError::BadRequest(_) => "https://lied/errors/bad-request",
             AppError::Database(_) => "https://lied/errors/internal",
             AppError::Internal(_) => "https://lied/errors/internal",
             AppError::Unauthorized => "https://lied/errors/unauthorized",
@@ -129,6 +152,7 @@ impl AppError {
             AppError::NotFound => "Not Found",
             AppError::PreconditionFailed => "Precondition Failed",
             AppError::Validation(_) => "Validation Failed",
+            AppError::BadRequest(_) => "Bad Request",
             AppError::Database(_) => "Internal Server Error",
             AppError::Internal(_) => "Internal Server Error",
             AppError::Unauthorized => "Unauthorized",
@@ -158,15 +182,12 @@ impl IntoResponse for AppError {
             _ => None,
         };
 
-        // request-ID correlation: `instance` is populated by middleware in the
-        // future; left empty here since this skeleton has no request-ID
-        // extension wired into AppError yet.
         let body = ProblemDetails {
             type_: self.type_uri().to_string(),
             title: self.title().to_string(),
             status: status.as_u16(),
             detail: self.to_string(),
-            instance: String::new(),
+            instance: current_instance(),
             errors,
         };
 

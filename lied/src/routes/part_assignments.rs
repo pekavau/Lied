@@ -33,6 +33,7 @@ use crate::domain::{collection_item, part_assignment};
 use crate::error::AppError;
 use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
@@ -158,7 +159,7 @@ async fn list_assignments(
 
 /// Request body for `POST .../assignments`.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AssignRequest {
     user_id: Uuid,
     voice_id: Uuid,
@@ -201,7 +202,7 @@ async fn assign_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
-    Json(body): Json<AssignRequest>,
+    ApiJson(body): ApiJson<AssignRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
@@ -330,7 +331,7 @@ async fn update_assignment(
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id, assignment_id)): Path<(Uuid, Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateAssignmentStateRequest>,
+    ApiJson(body): ApiJson<UpdateAssignmentStateRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     let current =

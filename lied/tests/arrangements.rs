@@ -940,7 +940,6 @@ async fn patch_json(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    // Body-shape rejections come from axum's extractor as plain text.
     let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, etag, body)
 }
@@ -1009,14 +1008,15 @@ async fn arrangement_patch_changes_only_the_fields_it_sends() {
     assert_eq!(body["title"], "Carmen Suite No. 2");
 
     // A misspelled field is refused, not silently ignored.
-    let (status, _, _) = patch_json(
+    let (status, _, problem) = patch_json(
         &app,
         &token,
         &uri,
         serde_json::json!({ "publsher": "Bärenreiter" }),
     )
     .await;
-    assert!(status.is_client_error(), "got {status}");
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(problem["errors"]["publsher"].is_array(), "{problem}");
     let (_, _, body) = patch_json(&app, &token, &uri, serde_json::json!({})).await;
     assert!(
         body["publisher"].is_null(),
@@ -1250,4 +1250,131 @@ async fn arrangement_patch_validates_the_merged_row_and_audits_what_changed() {
             "after": { "licenseNotes": null },
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rejected request bodies are Problem Details (issue #62).
+// ---------------------------------------------------------------------------
+
+/// Send `body` raw with `content_type`; return status, the response's
+/// request-id header and its Problem Details body.
+async fn send_raw(
+    app: &axum::Router,
+    token: &str,
+    method: &str,
+    uri: &str,
+    if_match: Option<&str>,
+    content_type: Option<&str>,
+    body: impl Into<axum::body::Body>,
+) -> (axum::http::StatusCode, String, serde_json::Value) {
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(etag) = if_match {
+        builder = builder.header(axum::http::header::IF_MATCH, etag);
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(body.into()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/problem+json",
+        "{method} {uri} → {status}"
+    );
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    (status, request_id, body_json(response).await)
+}
+
+#[tokio::test]
+async fn rejected_bodies_are_problem_details_on_create_and_patch() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let created = create_arrangement_json(&app, &token, org_id, "Bolero").await;
+    let create_uri = format!("/v1/orgs/{org_id}/arrangements");
+    let patch_uri = format!("{create_uri}/{}", created["id"].as_str().unwrap());
+    let json = Some("application/json");
+
+    for (method, uri) in [("POST", &create_uri), ("PATCH", &patch_uri)] {
+        let etag = etag_of(&app, &token, &patch_uri).await;
+        let if_match = (method == "PATCH").then_some(etag.as_str());
+
+        // Shape errors: 400 validation-failed, keyed by the offending field.
+        let mut cases = vec![
+            (r#"{"title":"x","difficulty":"hard"}"#, "difficulty"),
+            (r#"{"title":"x","publsher":"Schott"}"#, "publsher"),
+        ];
+        if method == "POST" {
+            cases.push((r#"{"arranger":"Ravel"}"#, "title"));
+        }
+        for (body, field) in cases {
+            let (status, request_id, problem) =
+                send_raw(&app, &token, method, uri, if_match, json, body).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{method} {body}"
+            );
+            assert_eq!(problem["type"], "https://lied/errors/validation-failed");
+            assert!(
+                problem["errors"][field].is_array(),
+                "{method} {body} → {problem}"
+            );
+            assert_eq!(problem["instance"], format!("urn:uuid:{request_id}"));
+        }
+
+        // Not JSON at all: 400 bad-request.
+        for body in ["{", r#"{"title":"x",}"#, ""] {
+            let (status, _, problem) =
+                send_raw(&app, &token, method, uri, if_match, json, body).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{method} {body:?}"
+            );
+            assert_eq!(problem["type"], "https://lied/errors/bad-request");
+        }
+
+        // No JSON content type: 415.
+        for content_type in [None, Some("text/plain")] {
+            let (status, _, problem) = send_raw(
+                &app,
+                &token,
+                method,
+                uri,
+                if_match,
+                content_type,
+                r#"{"title":"x"}"#,
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(
+                problem["type"],
+                "https://lied/errors/unsupported-media-type"
+            );
+        }
+
+        // Over LIED_MAX_REQUEST_BYTES (256 KiB in the test config): 413.
+        let huge = serde_json::json!({ "title": "x".repeat(300 * 1024) }).to_string();
+        let (status, _, problem) = send_raw(&app, &token, method, uri, if_match, json, huge).await;
+        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(problem["type"], "https://lied/errors/payload-too-large");
+    }
+
+    // Nothing above wrote anything.
+    let (status, _, body) = patch_json(&app, &token, &patch_uri, serde_json::json!({})).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["title"], "Bolero");
+    assert_eq!(audit_count(&db.pool, "arrangement.update").await, 0);
 }

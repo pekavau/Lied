@@ -21,6 +21,7 @@ use crate::error::AppError;
 use crate::listing::{self, SortDirection};
 use crate::listing::{etag_response, if_match_header};
 use crate::pagination::Page;
+use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, NotFound404, Precondition412, Validation400,
 };
@@ -71,7 +72,7 @@ fn validation_error(report: garde::Report) -> AppError {
 
 /// Request/response body for works.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateWorkRequest {
     title: String,
     composer: Option<String>,
@@ -181,7 +182,7 @@ async fn create_work(
     auth: BearerOrSession,
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
-    Json(body): Json<CreateWorkRequest>,
+    ApiJson(body): ApiJson<CreateWorkRequest>,
 ) -> Result<(StatusCode, Json<work::Work>), AppError> {
     if body.title.trim().is_empty() {
         let mut report = garde::Report::new();
@@ -282,7 +283,7 @@ async fn update_work(
     RequestId(request_id): RequestId,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(body): Json<UpdateWorkRequest>,
+    ApiJson(body): ApiJson<UpdateWorkRequest>,
 ) -> Result<axum::response::Response, AppError> {
     let current = work::find_by_id(&state.db, id)
         .await?
@@ -456,7 +457,7 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
 
 /// Request body for creating an arrangement.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ArrangementRequest {
     title: String,
     work_id: Option<Uuid>,
@@ -726,7 +727,7 @@ async fn create_arrangement(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    Json(body): Json<ArrangementRequest>,
+    ApiJson(body): ApiJson<ArrangementRequest>,
 ) -> Result<(StatusCode, Json<ArrangementResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -860,7 +861,7 @@ async fn update_arrangement(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateArrangementRequest>,
+    ApiJson(body): ApiJson<UpdateArrangementRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1106,7 +1107,7 @@ impl From<voice::Voice> for VoiceResponse {
 
 /// Request body for creating a voice.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VoiceRequest {
     name: String,
     instrument_id: Uuid,
@@ -1279,7 +1280,7 @@ async fn create_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<VoiceRequest>,
+    ApiJson(body): ApiJson<VoiceRequest>,
 ) -> Result<(StatusCode, Json<VoiceResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1430,7 +1431,7 @@ async fn update_voice(
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id, id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateVoiceRequest>,
+    ApiJson(body): ApiJson<UpdateVoiceRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1624,7 +1625,7 @@ impl From<tag::Tag> for TagResponse {
 
 /// Request body for creating a tag.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TagRequest {
     name: String,
     kind: Option<String>,
@@ -1755,7 +1756,7 @@ async fn create_tag(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
-    Json(body): Json<TagRequest>,
+    ApiJson(body): ApiJson<TagRequest>,
 ) -> Result<(StatusCode, Json<TagResponse>), AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -1867,7 +1868,7 @@ async fn update_tag(
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
-    Json(body): Json<UpdateTagRequest>,
+    ApiJson(body): ApiJson<UpdateTagRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
@@ -2065,7 +2066,7 @@ async fn list_arrangement_tags(
 
 /// Request body for attaching a tag to an arrangement.
 #[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttachTagRequest {
     tag_id: Uuid,
 }
@@ -2085,6 +2086,7 @@ struct AttachTagRequest {
     responses(
         (status = 201, description = "Tag attached"),
         CommonErrors,
+        Validation400,
         Forbidden403,
         NotFound404,
         Conflict409,
@@ -2095,7 +2097,7 @@ async fn attach_tag(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
-    Json(body): Json<AttachTagRequest>,
+    ApiJson(body): ApiJson<AttachTagRequest>,
 ) -> Result<StatusCode, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
