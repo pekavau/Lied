@@ -164,7 +164,7 @@ async fn list_assignments(
 /// Request body for `POST .../assignments`.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AssignRequest {
+struct CreateAssignmentRequest {
     user_id: Uuid,
     voice_id: Uuid,
 }
@@ -190,7 +190,7 @@ struct AssignRequest {
         ("itemId"       = Uuid, Path, description = "Collection item ID"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = AssignRequest,
+    request_body = CreateAssignmentRequest,
     responses(
         (status = 201, description = "Musician added to the voice", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -207,7 +207,7 @@ async fn assign_voice(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
-    ApiJson(body): ApiJson<AssignRequest>,
+    ApiJson(body): ApiJson<CreateAssignmentRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
@@ -295,7 +295,7 @@ async fn get_assignment(
 /// settable now. A partial update: an omitted field is kept, `null` clears it.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct UpdateAssignmentStateRequest {
+struct UpdateAssignmentRequest {
     #[serde(default, deserialize_with = "present_or_null")]
     #[schema(value_type = Option<DateTime<Utc>>, nullable)]
     notified_at: Option<Option<DateTime<Utc>>>,
@@ -319,7 +319,7 @@ struct UpdateAssignmentStateRequest {
         ("If-Match"     = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
-    request_body = UpdateAssignmentStateRequest,
+    request_body = UpdateAssignmentRequest,
     responses(
         (status = 200, description = "Updated assignment", body = part_assignment::PartAssignment,
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
@@ -338,7 +338,7 @@ async fn update_assignment(
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id, assignment_id)): Path<(Uuid, Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
-    ApiJson(body): ApiJson<UpdateAssignmentStateRequest>,
+    ApiJson(body): ApiJson<UpdateAssignmentRequest>,
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     let current =
