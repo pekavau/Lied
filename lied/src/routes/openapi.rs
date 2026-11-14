@@ -4,8 +4,8 @@
 //! The base `ApiDoc` seeds the `OpenApiRouter` tree in `routes/mod.rs`.
 //! Every `/v1` handler carries `#[utoipa::path]`; the `routes!` macro
 //! registers each handler into both axum and the OpenAPI document so a
-//! missing annotation is a compile error, not a documentation gap (§2 of the
-//! API guidelines).
+//! missing annotation is a compile error, not a documentation gap (see
+//! `docs/api-guidelines.md`).
 
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::Modify;
@@ -71,7 +71,7 @@ pub struct ProblemDetails {
 // ── IntoResponses error-profile types ───────────────────────────────────────
 //
 // Define once; compose in each handler's `responses(...)` to avoid
-// per-handler copy-paste (API guidelines §4.2).
+// per-handler copy-paste.
 
 /// `401` + `429` + `500` — every authenticated endpoint can emit these.
 #[derive(utoipa::IntoResponses)]

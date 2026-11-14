@@ -3,19 +3,19 @@
 //! guidelines (`docs/api-guidelines.md`). This test enforces the mechanical,
 //! machine-checkable subset:
 //!
-//! - **Completeness (§2).** The set of documented `/v1` paths equals the
+//! - **Completeness.** The set of documented `/v1` paths equals the
 //!   canonical `EXPECTED_PATHS` list exactly — a new endpoint or a typo in a
 //!   `#[utoipa::path(path = …)]` annotation fails until the list is updated
 //!   (a deliberate review checkpoint). No `/v1` route may bypass the OpenAPI
 //!   registration via a bare `.route(...)`.
-//! - **Documentation (§2).** Every operation has a non-empty summary and at
+//! - **Documentation.** Every operation has a non-empty summary and at
 //!   least one `2xx` response.
-//! - **Auth (§3).** Every operation declares a `bearer`-or-`session` security
+//! - **Auth.** Every operation declares a `bearer`-or-`session` security
 //!   requirement, or explicitly declares none (the unauthenticated endpoints).
-//! - **Error model (§4).** Every *authenticated* operation carries the
+//! - **Error model.** Every *authenticated* operation carries the
 //!   `CommonErrors` triple (401/429/500); every `PATCH` carries `412`; every
 //!   `4xx`/`5xx` response body is the shared RFC 7807 `ProblemDetails` schema.
-//! - **Casing (§5).** Every component-schema property name is `camelCase`
+//! - **Casing.** Every component-schema property name is `camelCase`
 //!   (no snake_case leaking to the wire).
 //!
 //! This is a pure unit test — no database or MinIO required. It builds the
@@ -146,7 +146,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations/{id}",
 ];
 
-/// §2 completeness: the documented path set equals `EXPECTED_PATHS` exactly.
+/// Completeness: the documented path set equals `EXPECTED_PATHS` exactly.
 /// Reports both missing (expected but absent) and unexpected (present but not
 /// listed) so a drift in either direction fails loudly.
 #[test]
@@ -177,11 +177,11 @@ fn path_set_matches_expected_exactly() {
     );
 }
 
-/// §2: no `/v1` route may be wired with a bare `.route(...)`, which registers
+/// No `/v1` route may be wired with a bare `.route(...)`, which registers
 /// the handler with axum but *not* with the OpenAPI document — the one hole
 /// `split_for_parts` cannot reveal (axum's `Router` is not introspectable).
 /// Every endpoint must go through the `routes!` macro. This guards the escape
-/// hatch the guidelines reserve but say is unused in `/v1`.
+/// hatch, which no `/v1` route uses.
 #[test]
 fn no_v1_route_bypasses_openapi_registration() {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -311,7 +311,7 @@ fn security_requirements_declare_bearer_or_session_or_none() {
     );
 }
 
-/// §4: every authenticated operation can emit the `CommonErrors` triple, so its
+/// Every authenticated operation can emit the `CommonErrors` triple, so its
 /// documented responses must include 401, 429, and 500. Public endpoints are
 /// exempt from 401 (they have no auth to fail).
 #[test]
@@ -343,11 +343,11 @@ fn authenticated_operations_declare_common_errors() {
     );
 }
 
-/// §4.3: every `PATCH` is an `If-Match`-guarded metadata update, so it must
+/// Every `PATCH` is an `If-Match`-guarded metadata update, so it must
 /// document `412 Precondition Failed`. (DELETE/PUT 412 coverage is not asserted
 /// here because detach/undelete DELETEs are deliberately un-guarded, which
-/// needs per-endpoint classification the guidelines table carries but this
-/// structural test does not.)
+/// needs a per-endpoint classification this structural test does not
+/// make.)
 #[test]
 fn patch_operations_declare_precondition_412() {
     let api = build_openapi();
@@ -369,7 +369,7 @@ fn patch_operations_declare_precondition_412() {
     );
 }
 
-/// §4: every `4xx`/`5xx` response body is the shared RFC 7807 `ProblemDetails`
+/// Every `4xx`/`5xx` response body is the shared RFC 7807 `ProblemDetails`
 /// schema (referenced via `$ref`), never a bespoke error shape.
 #[test]
 fn error_responses_use_problem_details_schema() {
@@ -415,7 +415,7 @@ fn error_responses_use_problem_details_schema() {
     );
 }
 
-/// §5: wire JSON is `camelCase`. Every property name in every component schema
+/// Wire JSON is `camelCase`. Every property name in every component schema
 /// must be free of underscores (the snake_case tell). Catches a DTO field that
 /// forgot `#[serde(rename_all = "camelCase")]` / `ToSchema` alignment.
 #[test]
