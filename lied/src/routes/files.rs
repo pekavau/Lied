@@ -274,12 +274,12 @@ async fn do_upload(
 /// fixed chunk buffer, not proportional to file size.
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{arrId}/files",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/files",
     tag = "files",
     summary = "Upload a full-score file",
     params(
         ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("arrId"  = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"  = Uuid, Path, description = "Arrangement ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     request_body(content = UploadForm, content_type = "multipart/form-data"),
@@ -310,12 +310,12 @@ async fn upload_score_file(
 /// carries a recognised `Content-Type`.
 #[utoipa::path(
     post,
-    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",
     tag = "files",
     summary = "Upload a voice file",
     params(
         ("orgId"    = Uuid, Path, description = "Organization ID"),
-        ("arrId"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
         ("voiceId"  = Uuid, Path, description = "Voice ID"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -423,12 +423,12 @@ async fn do_download(
 /// Download a full-score file (requires `musician` role). Supports HTTP `Range`.
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/files/{fileId}",
     tag = "files",
     summary = "Download a full-score file",
     params(
         ("orgId"   = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"   = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"   = Uuid,   Path,   description = "Arrangement ID"),
         ("fileId"  = Uuid,   Path,   description = "File ID"),
         ("Range"   = Option<String>, Header,
             description = "Byte-range request (e.g. `bytes=0-1023`). Returns 206 Partial Content."),
@@ -464,12 +464,12 @@ async fn download_score_file(
 /// Download a voice file (requires `musician` role). Supports HTTP `Range`.
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
     tag = "files",
     summary = "Download a voice file",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID"),
         ("Range"    = Option<String>, Header,
@@ -562,12 +562,12 @@ async fn do_list(
 /// List full-score files for an arrangement (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrId}/files",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/files",
     tag = "files",
     summary = "List full-score files",
     params(
         ("orgId"  = Uuid, Path, description = "Organization ID"),
-        ("arrId"  = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"  = Uuid, Path, description = "Arrangement ID"),
         ("limit"  = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset" = Option<u32>, Query, description = "Page offset"),
     ),
@@ -593,12 +593,12 @@ async fn list_score_files(
 /// List voice files for a specific voice (requires `musician` role).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",
     tag = "files",
     summary = "List voice files",
     params(
         ("orgId"    = Uuid, Path, description = "Organization ID"),
-        ("arrId"    = Uuid, Path, description = "Arrangement ID"),
+        ("arrangementId"    = Uuid, Path, description = "Arrangement ID"),
         ("voiceId"  = Uuid, Path, description = "Voice ID"),
         ("limit"    = Option<u32>, Query, description = "Page size (default 50, max 200)"),
         ("offset"   = Option<u32>, Query, description = "Page offset"),
@@ -711,12 +711,12 @@ async fn do_replace(
 /// is unchanged; MinIO versioning captures the content history.
 #[utoipa::path(
     put,
-    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/files/{fileId}",
     tag = "files",
     summary = "Replace a full-score file",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -748,12 +748,12 @@ async fn replace_score_file(
 /// Replace a voice file in-place (owner/archivist).
 #[utoipa::path(
     put,
-    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
     tag = "files",
     summary = "Replace a voice file",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID to replace"),
     ),
@@ -841,12 +841,12 @@ async fn do_delete(
 /// object can be recovered via a future admin hard-delete / undelete path.
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/files/{fileId}",
     tag = "files",
     summary = "Soft-delete a full-score file",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -870,12 +870,12 @@ async fn delete_score_file(
 /// Soft-delete a voice file (owner/archivist).
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
     tag = "files",
     summary = "Soft-delete a voice file",
     params(
         ("orgId"    = Uuid,   Path,   description = "Organization ID"),
-        ("arrId"    = Uuid,   Path,   description = "Arrangement ID"),
+        ("arrangementId"    = Uuid,   Path,   description = "Arrangement ID"),
         ("voiceId"  = Uuid,   Path,   description = "Voice ID"),
         ("fileId"   = Uuid,   Path,   description = "File ID"),
     ),

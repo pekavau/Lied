@@ -349,11 +349,11 @@ async fn list_app_passwords(
 /// the three auth paths are independent.
 #[utoipa::path(
     delete,
-    path = "/app-passwords/{id}",
+    path = "/app-passwords/{appPasswordId}",
     tag = "app-passwords",
     summary = "Revoke an app password",
     params(
-        ("id" = Uuid, Path, description = "App password ID"),
+        ("appPasswordId" = Uuid, Path, description = "App password ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(

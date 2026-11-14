@@ -1881,13 +1881,16 @@ async fn bad_path_and_query_parameters_are_problem_details_naming_them() {
 
     for (uri, field) in [
         // A single path parameter.
-        ("/v1/works/not-a-uuid".to_string(), "id"),
+        ("/v1/works/not-a-uuid".to_string(), "workId"),
         // Tuple paths: first and second position, both named.
         ("/v1/orgs/not-a-uuid/arrangements".to_string(), "orgId"),
-        (format!("/v1/orgs/{org_id}/arrangements/nope"), "id"),
+        (
+            format!("/v1/orgs/{org_id}/arrangements/nope"),
+            "arrangementId",
+        ),
         (
             format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices/x1"),
-            "id",
+            "voiceId",
         ),
         // Query parameters: wrong type, out of range, missing.
         (format!("/v1/orgs/{org_id}/arrangements?limit=abc"), "limit"),

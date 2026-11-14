@@ -92,47 +92,47 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/instruments",
     "/v1/tokens",
     "/v1/app-passwords",
-    "/v1/app-passwords/{id}",
+    "/v1/app-passwords/{appPasswordId}",
     // Orgs
     "/v1/orgs",
-    "/v1/orgs/{id}",
+    "/v1/orgs/{orgId}",
     // Users (admin — system-scoped)
     "/v1/users",
-    "/v1/users/{id}",
+    "/v1/users/{userId}",
     // Members
     "/v1/orgs/{orgId}/members",
-    "/v1/orgs/{orgId}/members/{id}",
+    "/v1/orgs/{orgId}/members/{memberId}",
     // Works (instance-wide)
     "/v1/works",
-    "/v1/works/{id}",
+    "/v1/works/{workId}",
     // Arrangements
     "/v1/orgs/{orgId}/arrangements",
-    "/v1/orgs/{orgId}/arrangements/{id}",
-    "/v1/orgs/{orgId}/arrangements/{id}/undelete",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/undelete",
     // Voices
-    "/v1/orgs/{orgId}/arrangements/{id}/voices",
-    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}",
-    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{id}/undelete",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/undelete",
     // Tags (org-level)
     "/v1/orgs/{orgId}/tags",
-    "/v1/orgs/{orgId}/tags/{id}",
-    "/v1/orgs/{orgId}/tags/{id}/undelete",
+    "/v1/orgs/{orgId}/tags/{tagId}",
+    "/v1/orgs/{orgId}/tags/{tagId}/undelete",
     // Arrangement-tag join
-    "/v1/orgs/{orgId}/arrangements/{id}/tags",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/tags",
     "/v1/orgs/{orgId}/arrangements/{arrangementId}/tags/{tagId}",
     // Full-score files
-    "/v1/orgs/{orgId}/arrangements/{arrId}/files",
-    "/v1/orgs/{orgId}/arrangements/{arrId}/files/{fileId}",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/files",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/files/{fileId}",
     // Voice files
-    "/v1/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files",
-    "/v1/orgs/{orgId}/arrangements/{arrId}/voices/{voiceId}/files/{fileId}",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
     // Collections
     "/v1/orgs/{orgId}/collections",
-    "/v1/orgs/{orgId}/collections/{id}",
-    "/v1/orgs/{orgId}/collections/{id}/undelete",
-    "/v1/orgs/{orgId}/collections/{id}/reorder",
+    "/v1/orgs/{orgId}/collections/{collectionId}",
+    "/v1/orgs/{orgId}/collections/{collectionId}/undelete",
+    "/v1/orgs/{orgId}/collections/{collectionId}/reorder",
     // Collection items
-    "/v1/orgs/{orgId}/collections/{id}/items",
+    "/v1/orgs/{orgId}/collections/{collectionId}/items",
     "/v1/orgs/{orgId}/collections/{collectionId}/coverage",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete",
@@ -143,7 +143,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/orgs/{orgId}/collections/{collectionId}/bulk-assignments/preview",
     // Global annotations
     "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations",
-    "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations/{id}",
+    "/v1/orgs/{orgId}/arrangements/{arrangementId}/annotations/{annotationId}",
 ];
 
 /// §2 completeness: the documented path set equals `EXPECTED_PATHS` exactly.
@@ -621,7 +621,7 @@ fn sort_and_filter_docs_match_the_allowlists() {
             arrangement::DEFAULT_SORT,
         ),
         (
-            "/v1/orgs/{orgId}/arrangements/{id}/voices",
+            "/v1/orgs/{orgId}/arrangements/{arrangementId}/voices",
             voice::SORT_ALLOWLIST,
             voice::FILTER_ALLOWLIST,
             voice::DEFAULT_SORT,
@@ -748,5 +748,45 @@ fn sort_and_filter_docs_match_the_allowlists() {
         problems.is_empty(),
         "Sort/filter docs drift:\n{}",
         problems.join("\n")
+    );
+}
+
+/// Issue #74: a path parameter is named after the collection segment before
+/// it, singular, plus `Id` (`orgs/{orgId}`, `members/{memberId}`,
+/// `app-passwords/{appPasswordId}`). Since #66 these names are what a bad
+/// parameter's Problem Details reports in `errors`, so they are contract.
+#[test]
+fn path_parameters_are_named_after_their_collection() {
+    fn expected(segment: &str) -> String {
+        let singular = segment.strip_suffix('s').unwrap_or(segment);
+        let mut parts = singular.split('-');
+        let mut name = parts.next().unwrap_or_default().to_string();
+        for part in parts {
+            let mut chars = part.chars();
+            if let Some(first) = chars.next() {
+                name.extend(first.to_uppercase());
+                name.push_str(chars.as_str());
+            }
+        }
+        name + "Id"
+    }
+    let json = build_openapi_json();
+    let mut violations = Vec::new();
+    for path in json["paths"].as_object().expect("paths object").keys() {
+        let segments: Vec<&str> = path.split('/').collect();
+        for (i, segment) in segments.iter().enumerate() {
+            let Some(name) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+                continue;
+            };
+            let want = expected(segments[i - 1]);
+            if name != want {
+                violations.push(format!("{path}: {{{name}}} should be {{{want}}}"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Path parameter names:\n{}",
+        violations.join("\n")
     );
 }

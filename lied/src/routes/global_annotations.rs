@@ -268,13 +268,13 @@ async fn create_annotation(
 /// Fetch one global annotation (owner/archivist/conductor).
 #[utoipa::path(
     get,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{annotationId}",
     tag = "global-annotations",
     summary = "Get a global annotation",
     params(
         ("orgId"         = Uuid, Path, description = "Organization ID"),
         ("arrangementId" = Uuid, Path, description = "Arrangement ID"),
-        ("id"            = Uuid, Path, description = "Annotation ID"),
+        ("annotationId"            = Uuid, Path, description = "Annotation ID"),
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
@@ -312,13 +312,13 @@ struct UpdateRequest {
 /// requires `If-Match`).
 #[utoipa::path(
     patch,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{annotationId}",
     tag = "global-annotations",
     summary = "Update a global annotation",
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("id"            = Uuid,   Path,   description = "Annotation ID"),
+        ("annotationId"            = Uuid,   Path,   description = "Annotation ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
@@ -403,13 +403,13 @@ async fn update_annotation(
 /// There is no undelete: the audit log keeps the removed content.
 #[utoipa::path(
     delete,
-    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{id}",
+    path = "/orgs/{orgId}/arrangements/{arrangementId}/annotations/{annotationId}",
     tag = "global-annotations",
     summary = "Delete a global annotation (hard delete)",
     params(
         ("orgId"         = Uuid,   Path,   description = "Organization ID"),
         ("arrangementId" = Uuid,   Path,   description = "Arrangement ID"),
-        ("id"            = Uuid,   Path,   description = "Annotation ID"),
+        ("annotationId"            = Uuid,   Path,   description = "Annotation ID"),
         ("If-Match"      = String, Header, description = "ETag from a prior GET; stale → 412"),
     ),
     security(("bearer" = []), ("session" = [])),
