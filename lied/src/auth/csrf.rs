@@ -10,17 +10,22 @@
 //! `SameSite=Lax` on the session cookie is a backstop, not the primary
 //! defense, per CLAUDE.md.
 //!
-//! Bearer-token `/v1` REST is exempt (not cookie-auth, so not CSRF-able) —
-//! this middleware is only ever mounted on the `/admin` tree.
+//! The middleware is mounted only on the `/admin` tree. `/v1` enforces the
+//! same token through [`verify_header`], called where the auth path is
+//! actually known: `BearerOrSession` when it resolves the user from the
+//! session cookie, and `POST /v1/tokens` when it mints from a session
+//! (issue #72). Bearer-token requests are exempt (not cookie-auth, so not
+//! CSRF-able).
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rand::RngCore;
 use tower_sessions::Session;
 
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub const CSRF_SESSION_KEY: &str = "csrf_token";
@@ -55,6 +60,37 @@ pub async fn ensure_token(session: &Session) -> Result<String, tower_sessions::s
     let token = generate_token();
     session.insert(CSRF_SESSION_KEY, token.clone()).await?;
     Ok(token)
+}
+
+/// Whether `method` changes state, so a cookie-authenticated `/v1` request
+/// using it must carry the CSRF token. Everything except `GET`/`HEAD`/
+/// `OPTIONS`/`TRACE` counts, so an unusual method cannot pass as "safe".
+pub fn is_state_changing(method: &Method) -> bool {
+    !matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
+}
+
+/// The `/v1` half of the double-submit check (issue #72): the `HX-CSRF`
+/// header must equal the token stored in `session`. Only the header is
+/// accepted — `/v1` is a JSON API, so there is no form field to read, and
+/// the URL-borne token the admin multipart forms use is deliberately not
+/// offered. A session with no token established fails too; the client reads
+/// the token from the `lied_csrf` cookie the console sets.
+pub async fn verify_header(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
+    let expected = session
+        .get::<String>(CSRF_SESSION_KEY)
+        .await
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("reading the CSRF token: {error}")))?;
+    let presented = headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok());
+    match (expected, presented) {
+        (Some(expected), Some(presented)) if expected == presented => Ok(()),
+        _ => {
+            tracing::warn!("CSRF check failed on a cookie-authenticated /v1 write");
+            Err(AppError::CsrfTokenInvalid)
+        }
+    }
 }
 
 /// Paths exempt from the double-submit header check even though they're

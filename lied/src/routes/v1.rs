@@ -128,6 +128,9 @@ struct MintTokenResponse {
                    or via `username`+`password` in the body (programmatic path). \
                    Hence the security list: anonymous (with credentials in the body) \
                    or a `session` cookie; a bearer token is not accepted here. \
+                   The cookie path is a cookie-authenticated write, so it must carry the \
+                   session's CSRF token (the `lied_csrf` cookie) in the `HX-CSRF` header; \
+                   the username/password path needs no header. \
                    The returned token is valid for the configured lifetime (default 30 days).",
     // `()` = anonymous allowed (credentials in the body); `session` = an
     // existing admin-console cookie, which `mint_token` checks first.
@@ -135,6 +138,8 @@ struct MintTokenResponse {
     request_body = MintTokenRequest,
     responses(
         (status = 200, description = "Bearer JWT minted", body = MintTokenResponse),
+        (status = 403, description = "Session cookie presented without a matching `HX-CSRF` header",
+         body = crate::routes::openapi::ProblemDetails, content_type = "application/problem+json"),
         // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
         // RFC 7807 ProblemDetails bodies.
         CommonErrors,
@@ -145,6 +150,7 @@ struct MintTokenResponse {
 async fn mint_token(
     State(state): State<AppState>,
     session: tower_sessions::Session,
+    headers: axum::http::HeaderMap,
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, AppError> {
@@ -155,7 +161,14 @@ async fn mint_token(
         .ok()
         .flatten()
     {
-        Some(id) => Some(id),
+        // Minting from the cookie is a cookie-authenticated write (issue #72):
+        // without this a cross-site page could mint a token for the victim.
+        // A logged-in session always takes this path, even when the body also
+        // carries credentials, so the rule does not depend on the body.
+        Some(id) => {
+            crate::auth::csrf::verify_header(&session, &headers).await?;
+            Some(id)
+        }
         None => match (&body.username, &body.password) {
             (Some(username), Some(password)) => {
                 let found = user::find_by_username(&state.db, username)
