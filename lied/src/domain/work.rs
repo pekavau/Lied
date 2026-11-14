@@ -186,12 +186,7 @@ pub async fn list(
 /// responsible for the [`Work::is_editable_by`] check before calling this.
 /// Returns `None` if no row matched `id`.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
@@ -234,12 +229,7 @@ pub async fn update(
 /// rather than a raw `500` (see [`user::delete`](super::user::delete) for the
 /// same pattern).
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(
     pool: &PgPool,
     id: Uuid,

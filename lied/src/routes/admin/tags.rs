@@ -269,12 +269,17 @@ async fn update_tag(
     )
     .await
     {
-        Ok(None) => console::precondition_page(
-            &ctx,
-            Section::Arrangements,
-            "tag",
-            &format!("/admin/orgs/{org_id}/tags"),
-        ),
+        // Read a moment ago: still there means another edit got in first;
+        // gone means it was removed meanwhile.
+        Ok(None) => match scoped_tag(&state, org_id, tag_id).await {
+            Ok(Some(_)) => console::precondition_page(
+                &ctx,
+                Section::Arrangements,
+                "tag",
+                &format!("/admin/orgs/{org_id}/tags"),
+            ),
+            _ => error_page(&ctx, StatusCode::NOT_FOUND, "Tag not found."),
+        },
         Ok(Some(_)) => {
             audit(
                 &state.db,

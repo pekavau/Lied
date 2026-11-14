@@ -239,12 +239,7 @@ pub type StampChange = super::Change<DateTime<Utc>>;
 /// conflict the other way, by using server-side `now()` instead of a bound
 /// timestamp.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update_state(
     pool: &PgPool,
     id: Uuid,
@@ -292,12 +287,7 @@ pub async fn update_state(
 /// Hard-delete (unassign). No soft-delete on this entity — see the module
 /// doc comment. Returns `true` if a row was removed.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(
     pool: &PgPool,
     id: Uuid,

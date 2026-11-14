@@ -328,9 +328,7 @@ async fn update_org(
 ) -> Result<axum::response::Response, AppError> {
     require_system_admin(&auth.user)?;
 
-    let current = organization::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let current = org_by_id(&state, id).await?;
 
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
@@ -407,9 +405,7 @@ async fn delete_org(
 ) -> Result<StatusCode, AppError> {
     require_system_admin(&auth.user)?;
 
-    let current = organization::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let current = org_by_id(&state, id).await?;
 
     let if_match = headers
         .get(axum::http::header::IF_MATCH)
@@ -682,9 +678,7 @@ async fn delete_user(
 ) -> Result<StatusCode, AppError> {
     require_system_admin(&auth.user)?;
 
-    let current = user::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let current = user_by_id(&state, id).await?;
 
     let if_match = headers
         .get(axum::http::header::IF_MATCH)

@@ -338,12 +338,7 @@ pub async fn list_deleted_for_collection(
 /// [`CollectionItemError::DuplicateIndex`]. Returns `None` if no live item
 /// matched.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update_index(
     pool: &PgPool,
     id: Uuid,
@@ -522,12 +517,7 @@ async fn live_ids_in_order(
 ///
 /// Returns `false` if no live item matched.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn remove(
     pool: &PgPool,
     collection_id: Uuid,

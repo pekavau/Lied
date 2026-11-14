@@ -656,12 +656,17 @@ async fn update_collection(
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
         }
-        Ok(None) => console::precondition_page(
-            &ctx,
-            Section::Collections,
-            "collection",
-            &detail_url(org_id, collection_id),
-        ),
+        // Read a moment ago: still there means another edit got in first;
+        // gone means it was removed meanwhile.
+        Ok(None) => match scoped_collection(&state, org_id, collection_id).await {
+            Ok(Some(_)) => console::precondition_page(
+                &ctx,
+                Section::Collections,
+                "collection",
+                &detail_url(org_id, collection_id),
+            ),
+            _ => error_page(&ctx, StatusCode::NOT_FOUND, "Collection not found."),
+        },
         Err(collection::CollectionError::DuplicateSlug) => error_page(
             &ctx,
             StatusCode::CONFLICT,

@@ -201,12 +201,7 @@ pub async fn list(
 /// Update an organization's `name`. `slug` is immutable (see module doc).
 /// Returns the updated row, or `None` if no row matched `id`.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update_name(
     pool: &PgPool,
     id: Uuid,
@@ -255,12 +250,7 @@ pub async fn update_name(
 /// hard-deleted org is a phase-2 concern once the File domain module (and its
 /// S3 key derivation) exists; flagged here rather than silently doing nothing.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(
     pool: &PgPool,
     id: Uuid,

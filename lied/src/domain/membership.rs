@@ -416,6 +416,12 @@ pub async fn list_for_org(
     Ok((items, total))
 }
 
+/// Whether `expected_version` names an older version than `current`. The
+/// guarded statement re-checks it; this only orders the answers.
+fn is_stale(expected_version: Option<i64>, current: &Membership) -> bool {
+    expected_version.is_some_and(|v| v != current.updated_at.timestamp_millis())
+}
+
 /// Update an existing membership's mutable fields. Enforces the last-owner
 /// invariant: if the membership currently holds `role = owner` and the new
 /// `fields.role` is something else, the update is rejected unless at least
@@ -423,23 +429,23 @@ pub async fn list_for_org(
 ///
 /// Returns `Ok(None)` if no row matched `id`.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
     expected_version: Option<i64>,
     fields: MembershipFields<'_>,
 ) -> Result<Option<Membership>, MembershipError> {
-    validate_fields(pool, &fields).await?;
-
     let Some(current) = find_by_id(pool, id).await? else {
         return Ok(None);
     };
+    // A stale caller learns that first (412), not about rules evaluated
+    // against a state it never saw (400 / 409 last-owner).
+    if is_stale(expected_version, &current) {
+        return Ok(None);
+    }
+
+    validate_fields(pool, &fields).await?;
 
     if current.role == Role::Owner && fields.role != Role::Owner {
         let remaining = other_owner_count(pool, current.organization_id, id).await?;
@@ -494,12 +500,7 @@ pub async fn has_any_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sq
 /// exist, or `Err(MembershipError::LastOwner)` if the deletion would leave
 /// the org without an owner.
 ///
-/// `expected_version` is the caller's ETag (millisecond `updated_at`). With
-/// `Some`, the write happens only if the row is still at that version, checked
-/// inside the statement so two writers holding one ETag cannot both succeed;
-/// otherwise nothing is written and this reports no row (`None` / `false`),
-/// exactly as for a missing one — the caller tells the two apart. `None`
-/// writes unconditionally (fixtures, internal callers with no ETag).
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn delete(
     pool: &PgPool,
     id: Uuid,
@@ -508,6 +509,9 @@ pub async fn delete(
     let Some(current) = find_by_id(pool, id).await? else {
         return Ok(false);
     };
+    if is_stale(expected_version, &current) {
+        return Ok(false);
+    }
 
     if current.role == Role::Owner {
         let remaining = other_owner_count(pool, current.organization_id, id).await?;
