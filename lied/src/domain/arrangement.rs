@@ -92,6 +92,101 @@ pub struct ArrangementFields<'a> {
     pub difficulty_notes: Option<&'a str>,
 }
 
+/// A field of [`ArrangementFields`] that breaks an arrangement rule. `field`
+/// is the wire (camelCase) name, so the REST layer can report it as-is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidField {
+    pub field: &'static str,
+    pub message: String,
+}
+
+impl InvalidField {
+    fn new(field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+/// Check the rules an arrangement row must satisfy, before it is written.
+///
+/// Run on the **complete** row a write would leave behind — for a partial
+/// PATCH that is the merge of the stored row and the patch, because a field
+/// that is fine on its own can disagree with one the client did not send
+/// (a new `difficulty` against a stored ABRSM rating). The CHECK constraints
+/// back up `status` and `difficulty`; the rest is enforced only here.
+pub fn validate(fields: &ArrangementFields<'_>) -> Result<(), InvalidField> {
+    if fields.title.trim().is_empty() {
+        return Err(InvalidField::new("title", "title must not be empty"));
+    }
+    if !matches!(fields.status, "active" | "archived") {
+        return Err(InvalidField::new(
+            "status",
+            "status must be `active` or `archived`",
+        ));
+    }
+    if fields.difficulty.is_some_and(|d| !(1..=8).contains(&d)) {
+        return Err(InvalidField::new(
+            "difficulty",
+            "difficulty must be between 1 and 8 (ABRSM)",
+        ));
+    }
+    if fields.copy_count_allowed.is_some_and(|n| n < 0) {
+        return Err(InvalidField::new(
+            "copyCountAllowed",
+            "copyCountAllowed must not be negative",
+        ));
+    }
+    if fields.duration_seconds.is_some_and(|n| n < 0) {
+        return Err(InvalidField::new(
+            "durationSeconds",
+            "durationSeconds must not be negative",
+        ));
+    }
+    match &fields.difficulty_ratings {
+        None => {}
+        Some(serde_json::Value::Object(ratings)) => {
+            if let Some(abrsm) = ratings.get("abrsm") {
+                validate_abrsm(abrsm, fields.difficulty)?;
+            }
+        }
+        Some(_) => {
+            return Err(InvalidField::new(
+                "difficultyRatings",
+                "difficultyRatings must be an object mapping scale to grade",
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// The ABRSM rating is the one scale tied to the numeric `difficulty`
+/// column: it must be a grade on the 1–8 scale and, when `difficulty` is
+/// set, agree with it (rounded) — CLAUDE.md difficulty_ratings rule.
+fn validate_abrsm(abrsm: &serde_json::Value, difficulty: Option<i16>) -> Result<(), InvalidField> {
+    let grade = match abrsm {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .map(f64::round)
+    .filter(|g| (1.0..=8.0).contains(g))
+    .ok_or_else(|| {
+        InvalidField::new(
+            "difficultyRatings",
+            "the abrsm rating must be a grade from 1 to 8",
+        )
+    })?;
+    match difficulty {
+        Some(d) if f64::from(d) != grade => Err(InvalidField::new(
+            "difficultyRatings",
+            format!("the abrsm rating ({abrsm}) must agree with difficulty ({d})"),
+        )),
+        _ => Ok(()),
+    }
+}
+
 struct Row {
     id: Uuid,
     organization_id: Uuid,
@@ -613,5 +708,66 @@ mod tests {
     #[test]
     fn slugify_matches_shared_algorithm() {
         assert_eq!(slugify("Symphony No. 5"), "symphony-no-5");
+    }
+
+    fn fields(
+        difficulty: Option<i16>,
+        ratings: Option<serde_json::Value>,
+    ) -> ArrangementFields<'static> {
+        ArrangementFields {
+            title: "Bolero",
+            work_id: None,
+            instrumentation: None,
+            arranger: None,
+            publisher: None,
+            purchase_date: None,
+            license_notes: None,
+            copy_count_allowed: None,
+            status: "active",
+            duration_seconds: None,
+            difficulty,
+            difficulty_ratings: ratings,
+            difficulty_notes: None,
+        }
+    }
+
+    fn field_of(result: Result<(), InvalidField>) -> Option<&'static str> {
+        result.err().map(|e| e.field)
+    }
+
+    #[test]
+    fn validate_refuses_out_of_range_values() {
+        assert_eq!(
+            field_of(validate(&fields(Some(9), None))),
+            Some("difficulty")
+        );
+        let mut f = fields(None, None);
+        f.status = "retired";
+        assert_eq!(field_of(validate(&f)), Some("status"));
+        let mut f = fields(None, None);
+        f.copy_count_allowed = Some(-1);
+        assert_eq!(field_of(validate(&f)), Some("copyCountAllowed"));
+        let mut f = fields(None, None);
+        f.title = "  ";
+        assert_eq!(field_of(validate(&f)), Some("title"));
+        assert!(validate(&fields(Some(8), None)).is_ok());
+    }
+
+    #[test]
+    fn the_abrsm_rating_must_be_a_grade_and_agree_with_difficulty() {
+        let ratings = |v: serde_json::Value| Some(serde_json::json!({ "abrsm": v, "henle": "5" }));
+        assert!(validate(&fields(Some(6), ratings(serde_json::json!("6")))).is_ok());
+        assert!(validate(&fields(Some(6), ratings(serde_json::json!(5.6)))).is_ok());
+        assert!(validate(&fields(None, ratings(serde_json::json!("3")))).is_ok());
+        for bad in [
+            fields(Some(3), ratings(serde_json::json!("6"))),
+            fields(None, ratings(serde_json::json!("99"))),
+            fields(None, ratings(serde_json::json!("x"))),
+            fields(None, Some(serde_json::json!(["abrsm", 6]))),
+        ] {
+            assert_eq!(field_of(validate(&bad)), Some("difficultyRatings"));
+        }
+        // Other scales are free-form.
+        assert!(validate(&fields(Some(2), Some(serde_json::json!({ "aba": "3.5" })))).is_ok());
     }
 }

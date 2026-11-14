@@ -338,12 +338,8 @@ async fn update_assignment(
     crate::listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
 
-    let change = |field: Option<Option<DateTime<Utc>>>| match field {
-        None => part_assignment::StampChange::Keep,
-        Some(value) => part_assignment::StampChange::Set(value),
-    };
-    let notified_at = change(body.notified_at);
-    let acknowledged_at = change(body.acknowledged_at);
+    let notified_at = part_assignment::StampChange::from(body.notified_at);
+    let acknowledged_at = part_assignment::StampChange::from(body.acknowledged_at);
     // Compared at the stored (millisecond) precision, so re-sending the value
     // a GET returned is recognised as no change.
     let same = |a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>| {

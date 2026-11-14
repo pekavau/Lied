@@ -1169,3 +1169,85 @@ async fn tag_patch_keeps_the_kind_unless_it_is_sent() {
     assert!(body["kind"].is_null());
     assert_eq!(body["name"], "Celebration");
 }
+
+#[tokio::test]
+async fn arrangement_patch_validates_the_merged_row_and_audits_what_changed() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_id}/arrangements"), &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({
+                "title": "Egmont",
+                "difficulty": 6,
+                "difficultyRatings": { "abrsm": "6" },
+                "licenseNotes": "Hire only",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let uri = format!("/v1/orgs/{org_id}/arrangements/{id}");
+
+    // Out-of-range values are a 400 naming the field, not a CHECK-violation 500.
+    for (body, field) in [
+        (serde_json::json!({ "difficulty": 9 }), "difficulty"),
+        (serde_json::json!({ "status": "retired" }), "status"),
+        // Fine on its own, but disagrees with the stored ABRSM rating.
+        (serde_json::json!({ "difficulty": 3 }), "difficultyRatings"),
+    ] {
+        let (status, _, problem) = patch_json(&app, &token, &uri, body.clone()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(problem["errors"][field].is_array(), "{body} → {problem}");
+    }
+    // Changing both together is fine.
+    let (status, _, _) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "difficulty": 3, "difficultyRatings": { "abrsm": "3" } }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    // Creating with a mismatched pair is refused the same way.
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_id}/arrangements"), &token)
+        .body(axum::body::Body::from(
+            serde_json::json!({ "title": "Coriolan", "difficulty": 2,
+                                "difficultyRatings": { "abrsm": "7" } })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    // The audit row keeps a value the PATCH erased.
+    let (status, _, _) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "licenseNotes": null }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE action = 'arrangement.update' ORDER BY at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "before": { "licenseNotes": "Hire only" },
+            "after": { "licenseNotes": null },
+        })
+    );
+}

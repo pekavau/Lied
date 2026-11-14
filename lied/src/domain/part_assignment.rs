@@ -222,23 +222,7 @@ pub async fn list_for_item(
 }
 
 /// What an update does to one distribution timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StampChange {
-    /// Leave it as it is.
-    Keep,
-    /// Replace it — `None` clears it (a "notified" recorded by mistake).
-    Set(Option<DateTime<Utc>>),
-}
-
-impl StampChange {
-    /// The value this change leaves behind, given the current one.
-    pub fn apply(self, current: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-        match self {
-            StampChange::Keep => current,
-            StampChange::Set(value) => value,
-        }
-    }
-}
+pub type StampChange = super::Change<DateTime<Utc>>;
 
 /// Set or clear `notified_at` / `acknowledged_at`; [`StampChange::Keep`]
 /// leaves that field unchanged. Returns `None` if no row matched.

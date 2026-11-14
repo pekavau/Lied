@@ -1076,6 +1076,35 @@ async fn member_patch_without_a_role_keeps_the_role() {
     let (status, again, _) = patch_with(&app, &token, &uri, &etag, r#"{"role":"conductor"}"#).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(again, etag);
+
+    // Narrowing the instruments alone drops the ones no longer played from
+    // the principal list instead of refusing over a field not sent.
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM instrument ORDER BY key LIMIT 2")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    let (tpt, flg) = (ids[0], ids[1]);
+    let (status, etag, _) = patch_with(
+        &app,
+        &token,
+        &uri,
+        &etag,
+        &serde_json::json!({ "instrumentIds": [tpt, flg], "principalInstrumentIds": [flg] })
+            .to_string(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _, body) = patch_with(
+        &app,
+        &token,
+        &uri,
+        &etag,
+        &serde_json::json!({ "instrumentIds": [tpt] }).to_string(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "got {body}");
+    assert_eq!(body["instrumentIds"], serde_json::json!([tpt]));
+    assert_eq!(body["principalInstrumentIds"], serde_json::json!([]));
 }
 
 #[tokio::test]

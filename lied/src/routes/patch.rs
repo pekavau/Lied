@@ -43,6 +43,31 @@ pub(crate) fn reject_blank(field: &str, value: Option<&str>) -> Result<(), AppEr
     }
 }
 
+/// The audit payload for an update: `{ "before": {…}, "after": {…} }` holding
+/// only the fields whose serialized value differs. Bookkeeping fields
+/// (`updatedAt`) are left out; a field this write did not touch never
+/// appears, so the payload reads as the diff the audit rule asks for.
+pub(crate) fn changed_fields<T: serde::Serialize>(before: &T, after: &T) -> serde_json::Value {
+    let as_map = |value: &T| match serde_json::to_value(value) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let (old, new) = (as_map(before), as_map(after));
+    let mut was = serde_json::Map::new();
+    let mut now = serde_json::Map::new();
+    for (key, value) in &new {
+        if key == "updatedAt" {
+            continue;
+        }
+        let previous = old.get(key).cloned().unwrap_or(serde_json::Value::Null);
+        if previous != *value {
+            was.insert(key.clone(), previous);
+            now.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::json!({ "before": was, "after": now })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +87,16 @@ mod tests {
         assert_eq!(parse("{}"), None);
         assert_eq!(parse(r#"{"note":null}"#), Some(None));
         assert_eq!(parse(r#"{"note":"x"}"#), Some(Some("x".to_string())));
+    }
+
+    #[test]
+    fn changed_fields_holds_only_what_moved() {
+        let before = serde_json::json!({ "title": "A", "notes": "keep me", "updatedAt": 1 });
+        let after = serde_json::json!({ "title": "A", "notes": null, "updatedAt": 2 });
+        assert_eq!(
+            changed_fields(&before, &after),
+            serde_json::json!({ "before": { "notes": "keep me" }, "after": { "notes": null } })
+        );
     }
 
     #[test]

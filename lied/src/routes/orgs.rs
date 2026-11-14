@@ -1042,9 +1042,18 @@ async fn update_member(
     let instrument_ids = body
         .instrument_ids
         .unwrap_or_else(|| current.instrument_ids.clone());
-    let principal_instrument_ids = body
-        .principal_instrument_ids
-        .unwrap_or_else(|| current.principal_instrument_ids.clone());
+    // The principal list must stay a subset of the instruments. When a PATCH
+    // narrows the instruments without restating the principal list, the
+    // instruments the member no longer plays drop out of it too, rather than
+    // refusing the request over a field the client did not send.
+    let principal_instrument_ids = body.principal_instrument_ids.unwrap_or_else(|| {
+        current
+            .principal_instrument_ids
+            .iter()
+            .copied()
+            .filter(|id| instrument_ids.contains(id))
+            .collect()
+    });
     let is_principal = body.is_principal.unwrap_or(current.is_principal);
 
     if role == current.role
