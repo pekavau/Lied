@@ -47,8 +47,10 @@ this document uses them.
 | **Voice** | One instrumental part of an arrangement ("Trumpet in B♭ 1"). Musicians say *part*; the model says *voice*. Same thing. |
 | **Part number** | The ordinal in a voice's name (the `1` in "Trumpet 1"); with the instrument, it identifies "the same part" across pieces. |
 | **File** | One stored representation of a full score or a voice: PDF, MusicXML, LilyPond or an image. |
-| **Collection** | A numbered set of arrangements: a **program** (a concert, played in order) or a **standing** collection (a march book, a pad of party pieces, called by number). |
-| **Item** / piece number | One arrangement's entry in a collection, and its number there. |
+| **Collection** | A numbered set of arrangements: a **program** (a concert, played in order) or a **standing** collection (a Marschbuch, a Frühschoppenmappe: a folder of sleeves or a printed book, called by number). |
+| **Item** / piece number | One arrangement's entry in a collection, and its number there: a position in a program, a **label** (`12`, `12a`) in a standing collection. |
+| **Section** | A heading over a range of numbers in a standing collection ("Märsche" from 1, "Polkas" from 61). |
+| **Hand-out** | The moment a standing collection's paper copies reach the players. From then on its numbers are printed on paper and change only deliberately. |
 | **Part assignment** | "This player plays this voice of this item." What gives a musician (or a guest) access to the files. |
 | **Member**, **role** | A user's membership in an org, with one of `owner`, `archivist`, `conductor`, `musician`. |
 | **Principal** | A musician who leads a section (*Satzführer*); sees whether their section's parts are covered. |
@@ -96,6 +98,7 @@ A dedicated role within an orchestra, often part of a small team with a head arc
   - **Concert programs:** Each upcoming concert has a program; the archivist assembles and distributes the relevant parts to each musician. The sequence is fixed and pre-planned.
   - **Standing repertoire:** A go-to collection for recurring informal events (e.g. Oktoberfest-style gatherings, civic functions). Indexed but drawn from flexibly during performance.
   - **Indexed books:** For marching bands, a numbered march book; for jazz ensembles, a standard repertoire book — pieces referenced by their index number.
+  - **Paper copies:** Standing collections usually also exist on paper, as a folder of sleeves (Marschbuch, Frühschoppenmappe) or a printed book, handed out to every player. Re-sleeving everyone's folder happens rarely, sometimes once a decade, so a number must not change until the band decides it does: a removed piece leaves a gap, and a piece added later is slipped in as a gap or as "12a".
 - Collections are updated in consultation with the conductor or artistic director.
 
 **Distribution:**
@@ -646,7 +649,7 @@ Canonical directory tree (also the public contract for external tools mounting t
                             <name>.pdf         ← personal annotation files
     collections/
         <collection-slug>/                  ← read-only computed view; paths assembled
-            <index>-<arrangement-slug>/        from CollectionItems + PartAssignments
+            <label>-<arrangement-slug>/        from CollectionItems + PartAssignments
                 ...
 
 /users/<user-slug>/
@@ -764,7 +767,8 @@ erDiagram
     File |o--o{ File : "derived from"
     Arrangement }o--o{ Tag : "tagged (ArrangementTag)"
     Arrangement ||--o{ GlobalAnnotation : "annotated by"
-    Collection ||--o{ CollectionItem : "numbered 1..n"
+    Collection ||--o{ CollectionItem : "numbered"
+    Collection ||--o{ CollectionSection : "divided into"
     Arrangement ||--o{ CollectionItem : "appears as"
     CollectionItem ||--o{ PartAssignment : "has"
     Voice ||--o{ PartAssignment : "assigned in"
@@ -967,7 +971,7 @@ A named, numbered set of arrangements.
 | `organization_id` | FK | |
 | `name` | text | |
 | `slug` | text | Immutable, unique per organization. |
-| `type` | text | `program` (a fixed running order, for a concert) or `standing` (called by number: a march book, party pieces). |
+| `type` | text | `program` (a fixed running order, for a concert) or `standing` (called by number: a Marschbuch, a Frühschoppenmappe). Decides the numbering rules; see *Collection numbering*. |
 
 Audit fields, soft-deletable.
 
@@ -977,14 +981,66 @@ One arrangement in a collection, under its piece number.
 
 | Field | Type | Notes |
 |---|---|---|
-| `collection_id`, `arrangement_id` | FK | One live item per arrangement per collection. |
-| `index` | int | The piece number, 1..n. |
+| `collection_id`, `arrangement_id` | FK | One live item per arrangement per collection: a piece appears once, never under two numbers (it confuses players mid-performance). |
+| `position` | int | Running order, 1..n, always dense; maintained by the server. |
+| `label` | text | The number players are called by, `^[1-9][0-9]{0,5}[a-z]?$`: `12`, or `12a` for a piece slipped in later. Stored lowercase. In a program it is always `position` as text. *(not yet built: today a single `index` int.)* |
 
-Audit fields, soft-deletable. **Numbering is dense and follows the order:**
-adding appends at the end, removing closes the gap, restoring puts a piece back
-at its old number (or the end, if the collection has shrunk), and reordering
-renumbers 1..n. For a program the order *is* the concert; for a standing
-collection the numbers are what the band is called to play.
+Audit fields, soft-deletable. Clients **display `label` and order by
+`position`**, whatever the collection's type. How the two are maintained is
+*Collection numbering* below.
+
+#### CollectionSection *(not yet built)*
+
+A heading over a range of numbers in a standing collection.
+
+| Field | Type | Notes |
+|---|---|---|
+| `collection_id` | FK | Standing collections only. |
+| `name` | text | "Märsche", "Polkas", "Choräle". |
+| `starts_at` | int | The first number the section covers; it runs until the next section's start. Unique per collection. |
+
+Audit fields, hard-deleted. Items do not point at a section; a section is a
+range, so piece 65 (or 65a) falls into the section covering 65. Adding a
+piece therefore never needs a section choice, and a gap belongs to a section
+too ("the next free polka number").
+
+#### Collection numbering *(not yet built)*
+
+The type of a collection decides what its numbers mean.
+
+| | `program` (concert) | `standing` (Marschbuch, Frühschoppenmappe) |
+|---|---|---|
+| A number is | a position in the running order | the piece's identity, matching the paper copy |
+| Add a piece | at the end, or at position *k* with the rest shifting down | under the suggested label (highest number + 1) or any free label (a gap, or `12a`); nothing else moves |
+| Remove a piece | the gap closes | **the gap stays** until it is filled or renumbered |
+| Move a piece | free reordering | relabel to a free label, or swap two pieces |
+| Restore a removed piece | at its old position | at its old label if still free; otherwise refused (409) until a label is chosen |
+| Close the gaps | automatic | only by an explicit **Renumber**, which first shows old → new for every piece |
+
+- **Standing positions follow the labels.** A standing collection's
+  `position` is the labels' natural order (`12` < `12a` < `13`), recomputed
+  on every write; it is never set directly.
+- **Renumber** assigns 1..n in the current order, drops letter suffixes and
+  moves each section's start to its first piece's new number. It is the one
+  operation that changes printed numbers, so it is a separate action, audited,
+  and previewed before it runs. It is the reprint (or re-sleeve) of the folder.
+- **No hand-out flag.** A folder being assembled is a standing collection
+  without gaps; before the hand-out, Renumber is cheap. A stored "handed out"
+  state with warnings can be added later if the explicit action proves too
+  easy to press.
+- **Changing the type** carries the numbers over: program → standing keeps
+  positions as labels; standing → program closes the gaps (a renumber, with
+  the same preview).
+- **Sections** exist for standing collections only. A concert's parts (before
+  and after the interval) would need sections anchored to pieces rather than
+  numbers; deferred.
+
+**Why:** a program's order *is* the concert and is rebuilt for every one, so
+automatic renumbering helps. A standing collection lives on paper in every
+player's folder for years, and a number that shifts in the app but not on
+the paper makes the band play different pieces. Gaps and `12a` are how paper
+folders absorb change without a hand-out; the app has to be able to show
+them, and to agree with the paper until the band decides to re-sleeve.
 
 #### PartAssignment
 
@@ -1065,7 +1121,8 @@ Attaching and detaching are real inserts and deletes.
   | `File` | `(arrangement_id, voice_id, name, format)` for voice files; `(arrangement_id, name, format) WHERE voice_id IS NULL` for full-score files (Postgres treats NULL as distinct, so a partial index covers the score case) |
   | `Membership` | `(user_id, organization_id)` |
   | `Collection` | `(organization_id, slug)` |
-  | `CollectionItem` | `(collection_id, index)`; `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
+  | `CollectionItem` | `(collection_id, position)`; `(collection_id, label)`; `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
+  | `CollectionSection` | `(collection_id, starts_at)` |
   | `PartAssignment` | `(collection_item_id, voice_id, user_id)` — a part is played by as many musicians as the section has; the same person twice on one part is the mistake |
   | `Tag` | `(organization_id, name, kind)` |
   | `ArrangementTag` | `(arrangement_id, tag_id)` |
