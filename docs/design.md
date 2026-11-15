@@ -1011,12 +1011,26 @@ The type of a collection decides what its numbers mean.
 | | `program` (concert) | `standing` (Marschbuch, Frühschoppenmappe) |
 |---|---|---|
 | A number is | a position in the running order | the piece's identity, matching the paper copy |
-| Add a piece | at the end, or at position *k* with the rest shifting down | under the suggested label (highest number + 1) or any free label (a gap, or `12a`); nothing else moves |
+| Add a piece | at the end, or at position *k* with the rest shifting down | under an allowed label (see below); nothing else moves |
 | Remove a piece | the gap closes | **the gap stays** until it is filled or renumbered |
 | Move a piece | free reordering | relabel to a free label, or swap two pieces |
 | Restore a removed piece | at its old position | at its old label if still free; otherwise refused (409) until a label is chosen |
 | Close the gaps | automatic | only by an explicit **Renumber**, which first shows old → new for every piece |
 
+- **Which labels a new piece may take.** A free gap below the highest
+  number; the next number after the highest in a section (the suggestion,
+  overall or within the section being added to); a section's own start, while
+  the section is still empty; or a letter label (`12a`) next to an existing
+  number. Any other number is refused (400). A number far past the end
+  usually means a typo, and it would leave a gap nobody chose.
+- **A new section can start beyond the end.** Adding "Modern" after Märsche
+  and Polkas typically starts it at 101 while the polkas end at 75, so that
+  more polkas fit in without breaking the order. The section's start is what
+  makes 101 an allowed number. A section may also start inside the numbers
+  already used, to divide an existing folder after the fact; the pieces from
+  its start onward then fall into it, and no number changes. When a section's
+  next number would collide with the following section's start, the section
+  is full: the choices are a gap, a letter label, or a Renumber.
 - **Standing positions follow the labels.** A standing collection's
   `position` is the labels' natural order (`12` < `12a` < `13`), recomputed
   on every write; it is never set directly.
