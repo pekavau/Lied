@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n        ORDER BY ci.position ASC, ci.id ASC\n        ",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            s.id as \"section_id?\", s.name as \"section_name?\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        LEFT JOIN LATERAL (\n            SELECT s.id, s.name FROM collection_section s\n            WHERE s.collection_id = ci.collection_id\n              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int\n            ORDER BY s.starts_at DESC LIMIT 1\n        ) s ON true\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n        ORDER BY ci.position ASC, ci.id ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -50,16 +50,26 @@
       },
       {
         "ordinal": 9,
-        "name": "arrangement_slug",
-        "type_info": "Text"
+        "name": "section_id?",
+        "type_info": "Uuid"
       },
       {
         "ordinal": 10,
-        "name": "arrangement_title",
+        "name": "section_name?",
         "type_info": "Text"
       },
       {
         "ordinal": 11,
+        "name": "arrangement_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
         "name": "arrangement_removed!",
         "type_info": "Bool"
       }
@@ -81,8 +91,10 @@
       true,
       false,
       false,
+      false,
+      false,
       null
     ]
   },
-  "hash": "34ab5a930ecc94a85549812bf99156fabe3739d953f75ac9333655ca6f18158b"
+  "hash": "2368b43b279d81eec06ce337dc8fd9a9f9e64accd46dc2c67b225af6cb4ee071"
 }

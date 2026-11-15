@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,\n            s.id as \"section_id?\", s.name as \"section_name?\",\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\"\n        FROM collection_item ci\n        LEFT JOIN LATERAL (\n            SELECT s.id, s.name FROM collection_section s\n            WHERE s.collection_id = ci.collection_id\n              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int\n            ORDER BY s.starts_at DESC LIMIT 1\n        ) s ON true\n        WHERE ci.id = $1 AND ci.deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "position",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "label",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "section_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "section_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "deleted_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "e7ae84c4bd9e44da851fbdf51eec805945735c988f7b32b2600b22c6a4c738a8"
+}

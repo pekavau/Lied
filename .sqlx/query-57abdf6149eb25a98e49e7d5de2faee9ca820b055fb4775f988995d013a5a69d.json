@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            s.id as \"section_id?\", s.name as \"section_name?\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        LEFT JOIN LATERAL (\n            SELECT s.id, s.name FROM collection_section s\n            WHERE s.collection_id = ci.collection_id\n              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int\n            ORDER BY s.starts_at DESC LIMIT 1\n        ) s ON true\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL\n          AND NOT EXISTS (\n              SELECT 1 FROM collection_item live\n              WHERE live.collection_id = ci.collection_id\n                AND live.arrangement_id = ci.arrangement_id\n                AND live.deleted_at IS NULL\n          )\n          AND ci.deleted_at = (\n              SELECT max(newer.deleted_at) FROM collection_item newer\n              WHERE newer.collection_id = ci.collection_id\n                AND newer.arrangement_id = ci.arrangement_id\n                AND newer.deleted_at IS NOT NULL\n          )\n        ORDER BY ci.deleted_at DESC, ci.id ASC\n        LIMIT $2 OFFSET $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "arrangement_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "position",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "label",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "deleted_at: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "section_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "section_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "arrangement_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "arrangement_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "arrangement_removed!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "57abdf6149eb25a98e49e7d5de2faee9ca820b055fb4775f988995d013a5a69d"
+}

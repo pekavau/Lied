@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::auth::extractors::AuthSession;
 use crate::domain::audit_log::audit;
 use crate::domain::{
-    arrangement, collection, collection_item, coverage, membership, part_assignment, user,
+    arrangement, collection, collection_item, collection_section, coverage, membership,
+    part_assignment, user,
 };
 use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
@@ -416,17 +417,30 @@ async fn collection_detail_page(
     let standing =
         collection_item::Kind::parse(&c.collection_type) == collection_item::Kind::Standing;
     // The label a new piece gets unless the form says otherwise: the
-    // highest number + 1 (#104 turns this into a choice of the gaps too).
-    let suggested_label = collection_item::Numbering::new(
-        items
-            .iter()
-            .filter_map(|i| collection_item::Label::parse(&i.item.label)),
-        c.number_width,
-    )
-    .choices()
-    .suggested
-    .map(|l| l.to_string())
-    .unwrap_or_default();
+    // highest number + 1 (#104 turns this into a choice of the gaps and the
+    // sections' next numbers too).
+    let suggested_label = if standing {
+        match collection_item::label_choices(&state.db, collection_id).await {
+            Ok(choices) => choices.suggested.map(|l| l.to_string()),
+            Err(error) => {
+                tracing::error!(?error, "failed to compute the label choices");
+                None
+            }
+        }
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let sections = if standing {
+        collection_section::list_for_collection(&state.db, collection_id)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list the collection's sections");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     let next_position = items.len() + 1;
     let items_base = format!("{}/items", detail_url(org_id, collection_id));
 
@@ -452,6 +466,15 @@ async fn collection_detail_page(
                 "The numbers match the players' folders: a removed piece leaves "
                 "its number free until another piece takes it."
             }
+            @if !sections.is_empty() {
+                p {
+                    "Sections: "
+                    @for (i, section) in sections.iter().enumerate() {
+                        @if i > 0 { " · " }
+                        (section.name) " from " (section.starts_at)
+                    }
+                }
+            }
         } @else {
             p class="muted" {
                 "Use ▲/▼ to rearrange. Pieces are renumbered from 1 on every move, "
@@ -468,11 +491,24 @@ async fn collection_detail_page(
         form method="post" action=(format!("{items_base}/reorder")) {
             (layout::csrf_field(&token))
             table {
-                thead { tr { th { "#" } th { "Piece" } th { "Order" } th {} } }
+                thead {
+                    tr {
+                        th { "#" }
+                        @if !sections.is_empty() { th { "Section" } }
+                        th { "Piece" } th { "Order" } th {}
+                    }
+                }
                 tbody {
                     @for (pos, view) in items.iter().enumerate() {
                         tr {
                             td { (view.item.label) }
+                            @if !sections.is_empty() {
+                                td {
+                                    @if let Some(section) = &view.item.section {
+                                        (section.name)
+                                    }
+                                }
+                            }
                             td {
                                 @if view.arrangement_removed {
                                     span class="muted" { "[removed] " (view.arrangement_slug) }
@@ -784,9 +820,11 @@ async fn update_collection(
             StatusCode::CONFLICT,
             "A collection with this slug already exists in this organization.",
         ),
-        Err(err @ collection::CollectionError::LabelsTooWide { .. }) => {
-            error_page(&ctx, StatusCode::CONFLICT, &format!("Not saved: {err}."))
-        }
+        Err(
+            err @ (collection::CollectionError::LabelsTooWide { .. }
+            | collection::CollectionError::SectionsTooWide { .. }
+            | collection::CollectionError::HasSections),
+        ) => error_page(&ctx, StatusCode::CONFLICT, &format!("Not saved: {err}.")),
         Err(collection::CollectionError::Database(error)) => {
             tracing::error!(%error, "failed to update collection");
             error_page(

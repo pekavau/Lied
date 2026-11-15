@@ -57,6 +57,12 @@ pub enum CollectionError {
     /// A narrower `number_width` than a live piece's label needs.
     #[error("a piece is numbered {highest}, which does not fit {width} digits")]
     LabelsTooWide { highest: u16, width: i16 },
+    /// A narrower `number_width` than a section's start needs.
+    #[error("a section starts at {start}, which does not fit {width} digits")]
+    SectionsTooWide { start: u16, width: i16 },
+    /// A standing collection with sections cannot become a program.
+    #[error("a program has no sections; delete the collection's sections first")]
+    HasSections,
 }
 
 /// The allowed `number_width` values.
@@ -314,7 +320,10 @@ pub struct CollectionFields<'a> {
 ///   program closes the gaps (a renumber), since a program's labels are its
 ///   positions;
 /// - **number_width** may always widen; narrowing is refused
-///   ([`CollectionError::LabelsTooWide`]) while a live label would not fit.
+///   ([`CollectionError::LabelsTooWide`], [`CollectionError::SectionsTooWide`])
+///   while a live label or a section start would not fit;
+/// - a standing collection with sections cannot become a program
+///   ([`CollectionError::HasSections`]).
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update(
@@ -340,6 +349,7 @@ pub async fn update(
         return Ok(None);
     };
 
+    let sections = collection_item::live_sections(&mut tx, id).await?;
     if fields.number_width < current.number_width {
         let highest = collection_item::highest_number_in(&mut tx, id).await?;
         if highest > collection_item::max_number(fields.number_width) {
@@ -348,8 +358,22 @@ pub async fn update(
                 width: fields.number_width,
             });
         }
+        if let Some(section) = sections
+            .iter()
+            .find(|s| s.starts_at > collection_item::max_number(fields.number_width))
+        {
+            return Err(CollectionError::SectionsTooWide {
+                start: section.starts_at,
+                width: fields.number_width,
+            });
+        }
     }
     if current.collection_type == "standing" && fields.collection_type == "program" {
+        // A program has no sections; dropping them silently would lose the
+        // folder's structure, so the archivist deletes them first.
+        if !sections.is_empty() {
+            return Err(CollectionError::HasSections);
+        }
         collection_item::close_gaps_for_program(&mut tx, id).await?;
     }
 

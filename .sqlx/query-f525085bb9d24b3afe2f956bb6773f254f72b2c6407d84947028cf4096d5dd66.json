@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE collection_section SET starts_at = $2, updated_at = now()\n               WHERE id = $1 AND collection_id = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f525085bb9d24b3afe2f956bb6773f254f72b2c6407d84947028cf4096d5dd66"
+}

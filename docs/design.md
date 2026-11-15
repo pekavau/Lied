@@ -310,9 +310,9 @@ List endpoints page by **offset/limit** and answer with an envelope:
 - **Unpaginated by design**, each bounded and read as a whole:
   - per-collection reports (the coverage report, the bulk-assignment preview) —
     a report split across pages cannot be read;
-  - a collection's items (its running order), the tags on one arrangement,
-    the caller's own app passwords, and the caller's memberships in
-    `GET /v1/me`.
+  - a collection's items (its running order) and its sections, the tags on
+    one arrangement, the caller's own app passwords, and the caller's
+    memberships in `GET /v1/me`.
 
 **Why:** offset gives a cheap `total` for "page 3 of 7"; its weakness, rows
 shifting under concurrent inserts, does not matter at this scale. An optional
@@ -893,7 +893,7 @@ An orchestra or ensemble.
 Audit fields. No `deleted_at`: deleting an org is an admin-only **hard**
 delete, because the cascade is large and undelete would be messy. It runs in
 one transaction, in FK-safe order: part assignments → collection items →
-collections → arrangement tags → tags → global annotations → files → voices →
+collection sections → collections → arrangement tags → tags → global annotations → files → voices →
 arrangements → memberships → the organization. **Not deleted:** works
 (shared with other orgs) and audit-log rows (kept with their `org_id`, so the
 deletion itself stays auditable). Removing the files' stored objects is
@@ -1002,20 +1002,30 @@ Audit fields, soft-deletable. Clients **display `label` and order by
 `position`**, whatever the collection's type. How the two are maintained is
 *Collection numbering* below.
 
-#### CollectionSection *(not yet built)*
+#### CollectionSection
 
 A heading over a range of numbers in a standing collection.
 
 | Field | Type | Notes |
 |---|---|---|
-| `collection_id` | FK | Standing collections only. |
+| `collection_id` | FK | Standing collections only; a program refuses sections (409). |
 | `name` | text | "Märsche", "Polkas", "Choräle". |
-| `starts_at` | int | The first number the section covers; it runs until the next section's start. Unique per collection. |
+| `starts_at` | int | The first number the section covers, within the collection's `number_width`; it runs until the next section's start. Unique per collection. |
 
 Audit fields, hard-deleted. Items do not point at a section; a section is a
-range, so piece 65 (or 65a) falls into the section covering 65. Adding a
-piece therefore never needs a section choice, and a gap belongs to a section
-too ("the next free polka number").
+range, so piece 65 (or 65a) falls into the section covering 65, and the
+pieces before the first section belong to none. Adding a piece therefore
+never needs a section choice, and a gap belongs to a section too ("the next
+free polka number"). Adding, moving or deleting a section changes no
+number: the pieces regroup around it. Section writes take the same
+collection lock as item writes.
+
+On `/v1`: `…/collections/{collectionId}/sections` (list, add) and
+`…/sections/{sectionId}` (get, change, delete, with `If-Match`); every item
+carries `section: { id, name }` or `null`; and
+`…/collections/{collectionId}/label-choices` lists what a new piece can be
+numbered: the suggestion, the gaps, and each section's next number, with
+`full: true` where there is none.
 
 #### Collection numbering
 
@@ -1030,15 +1040,17 @@ The type of a collection decides what its numbers mean.
 | Restore a removed piece | at its old position | at its old label if still free; otherwise refused (409) until a label is chosen |
 | Close the gaps | automatic | only by an explicit **Renumber**, which first shows old → new for every piece |
 
-- **Which labels a new piece may take.** A free gap below the highest
-  number; the next number after the highest in a section (the suggestion,
-  overall or within the section being added to); a section's own start, while
-  the section is still empty; or a letter label (`12a`) next to an existing
-  number. Any other number is refused (400), a taken one is a 409. A number
-  far past the end usually means a typo, and it would leave a gap nobody
-  chose. A moved piece's own label does not count against it. The section
-  cases arrive with sections *(not yet built, #103)*; until then an empty
-  standing collection starts at 1.
+- **Which labels a new piece may take.** The rule works per section (the
+  numbers before the first section count as one more range, and a collection
+  without sections is one range from 1): a free gap below the section's
+  highest number; the number after its highest (overall, that is the
+  suggestion); the section's own start, while the section is still empty;
+  or a letter label (`12a`) next to an existing number. Any other number is
+  refused (400), a taken one is a 409. A number far past the end of its
+  section usually means a typo, and it would leave a gap nobody chose, so
+  with polkas ending at 75 and "Modern" from 101, 76 and the free numbers
+  below 75 are allowed but 90 is not. A moved piece's own label does not
+  count against it. An empty collection without sections starts at 1.
 - **A new section can start beyond the end.** Adding "Modern" after Märsche
   and Polkas typically starts it at 101 while the polkas end at 75, so that
   more polkas fit in without breaking the order. The section's start is what
@@ -1054,29 +1066,39 @@ The type of a collection decides what its numbers mean.
   chosen when the collection is created and does not grow with it, so adding
   the 100th piece never renames folders; it is also why labels stop at 999
   (or 9999). Widening it later is allowed but renames every folder, so it is
-  a deliberate change, like Renumber. Narrowing is refused while a label
-  would not fit. The console and the app show the label as entered (`7`,
-  `12a`).
+  a deliberate change, like Renumber. Narrowing is refused while a label or
+  a section's start would not fit. The console and the app show the label
+  as entered (`7`, `12a`).
 - **Standing positions follow the labels.** A standing collection's
   `position` is the labels' natural order (`12` < `12a` < `13`), recomputed
   on every write; it is never set directly.
 - **Renumber** assigns 1..n in the current order, drops letter suffixes and
-  moves each section's start to its first piece's new number *(sections: not
-  yet built, #103)*. It is the one operation that changes printed numbers,
-  so it is a separate action, audited, and previewed before it runs:
+  moves each section's start to its first piece's new number. A section
+  without pieces keeps one number, its start, right after the pieces before
+  it: an empty "Modern" between marches 1–3 and polkas makes the polkas
+  start at 5 and keeps 4 for it, and two empty sections at the end become
+  last + 1 and last + 2. So the sections stay in their order, no two share a
+  start, and the empty one's start remains an allowed label. It is the one
+  operation that changes printed numbers, so it is a separate action,
+  audited, and previewed before it runs:
   `GET …/collections/{collectionId}/renumber` returns every piece's old and
-  new label plus a `previewToken` (a hash of the current pieces and labels),
-  and `POST …/renumber` applies only that token, a 409 if the collection has
-  changed since. It is the reprint (or re-sleeve) of the folder.
+  new label and every section's old and new start (`sectionChanges`), plus
+  a `previewToken` (a hash of the current pieces, labels and section
+  starts), and `POST …/renumber` applies only that token, a 409 if the
+  collection has changed since. It is the reprint (or re-sleeve) of the
+  folder.
 - **No hand-out flag.** A folder being assembled is a standing collection
   without gaps; before the hand-out, Renumber is cheap. A stored "handed out"
   state with warnings can be added later if the explicit action proves too
   easy to press.
 - **Changing the type** carries the numbers over: program → standing keeps
   positions as labels; standing → program closes the gaps, the same
-  renumber applied in the type change's transaction.
+  renumber applied in the type change's transaction. A standing collection
+  with sections cannot become a program (409): its sections would have to
+  go, and the archivist deletes them deliberately first.
 - **One writer per collection.** Every item write (add, move, swap, remove,
-  restore, reorder, renumber) and every collection update locks the
+  restore, reorder, renumber), every section write and every collection
+  update locks the
   collection row first (`FOR NO KEY UPDATE`), then checks the rules and
   writes under that lock, so two editors cannot both take label 12. The
   live-row uniqueness of `(collection_id, position)` and `(collection_id,
@@ -1089,7 +1111,11 @@ The type of a collection decides what its numbers mean.
 
 **Enforced by:** the numbering tests in `tests/collections.rs` (from
 `a_standing_collection_keeps_its_gaps_and_takes_allowed_labels_only` to
-`concurrent_adds_under_one_label_let_exactly_one_through`) and
+`concurrent_adds_under_one_label_let_exactly_one_through`), the section
+tests after them (from
+`a_new_section_past_the_end_allows_its_numbers_and_no_others` to
+`sections_on_the_wire_follow_the_conventions`), the `Numbering` and
+renumber-plan unit tests in `domain/collection_item.rs`, and
 `collection_numbering_migration_carries_old_numbers_over` in
 `tests/migrations.rs`.
 
@@ -1180,7 +1206,7 @@ Attaching and detaching are real inserts and deletes.
   | `Membership` | `(user_id, organization_id)` |
   | `Collection` | `(organization_id, slug)` |
   | `CollectionItem` | `(collection_id, position)` and `(collection_id, label)`, as deferred exclusion constraints (see *Collection numbering*); `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
-  | `CollectionSection` | `(collection_id, starts_at)` |
+  | `CollectionSection` | `(collection_id, starts_at)`, deferred to commit: a renumber moves every start in one transaction |
   | `PartAssignment` | `(collection_item_id, voice_id, user_id)` — a part is played by as many musicians as the section has; the same person twice on one part is the mistake |
   | `Tag` | `(organization_id, name, kind)` |
   | `ArrangementTag` | `(arrangement_id, tag_id)` |

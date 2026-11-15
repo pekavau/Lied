@@ -16,6 +16,7 @@
 pub mod admin;
 pub mod arrangements;
 pub mod bulk_assignments;
+pub mod collection_sections;
 pub mod collections;
 pub mod files;
 pub mod global_annotations;

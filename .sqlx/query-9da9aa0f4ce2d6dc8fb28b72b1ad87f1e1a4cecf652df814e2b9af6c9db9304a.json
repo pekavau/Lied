@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM collection_section\n           WHERE id = $1 AND collection_id = $2\n             AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9da9aa0f4ce2d6dc8fb28b72b1ad87f1e1a4cecf652df814e2b9af6c9db9304a"
+}

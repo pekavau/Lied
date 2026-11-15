@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, collection_id, arrangement_id, position, label,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        FROM collection_item\n        WHERE id = $1 AND deleted_at IS NULL\n        ",
+  "query": "\n        INSERT INTO collection_section (id, collection_id, name, starts_at, created_by)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING id, collection_id, name, starts_at,\n                  created_at as \"created_at: DateTime<Utc>\",\n                  updated_at as \"updated_at: DateTime<Utc>\",\n                  created_by\n        ",
   "describe": {
     "columns": [
       {
@@ -15,42 +15,36 @@
       },
       {
         "ordinal": 2,
-        "name": "arrangement_id",
-        "type_info": "Uuid"
+        "name": "name",
+        "type_info": "Text"
       },
       {
         "ordinal": 3,
-        "name": "position",
+        "name": "starts_at",
         "type_info": "Int4"
       },
       {
         "ordinal": 4,
-        "name": "label",
-        "type_info": "Text"
-      },
-      {
-        "ordinal": 5,
         "name": "created_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "updated_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "created_by",
         "type_info": "Uuid"
-      },
-      {
-        "ordinal": 8,
-        "name": "deleted_at: DateTime<Utc>",
-        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int4",
         "Uuid"
       ]
     },
@@ -61,10 +55,8 @@
       false,
       false,
       false,
-      false,
-      true,
       true
     ]
   },
-  "hash": "adecb741d01daed734f5830a0cf7735136675254282668868765cfc86a559a6b"
+  "hash": "e1505edd4e887587af326a456331c5af34d877266c19c68994757807431fc0ef"
 }

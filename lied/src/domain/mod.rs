@@ -28,6 +28,7 @@ pub mod audit_log;
 pub mod bulk_assign;
 pub mod collection;
 pub mod collection_item;
+pub mod collection_section;
 pub mod coverage;
 pub mod file;
 pub mod global_annotation;

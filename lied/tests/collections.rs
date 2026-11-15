@@ -1200,10 +1200,13 @@ async fn renumber_closes_the_gaps_only_for_the_previewed_state() {
     let fresh = collection_item::renumber_preview(&ctx.pool, book)
         .await
         .unwrap();
-    let changes = collection_item::renumber(&ctx.pool, book, &fresh.preview_token)
+    let outcome = collection_item::renumber(&ctx.pool, book, &fresh.preview_token)
         .await
         .unwrap();
-    assert_eq!(changes, fresh.changes, "apply does what the preview showed");
+    assert_eq!(
+        outcome.changes, fresh.changes,
+        "apply does what the preview showed"
+    );
     assert_eq!(labels(&ctx, book).await, owned(&["1", "2", "3", "4", "5"]));
 
     // Programs are always dense: nothing to renumber.
@@ -1461,4 +1464,626 @@ async fn the_wire_carries_positions_labels_and_the_number_width() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::CONFLICT);
+}
+
+// ── Sections (#103) ──────────────────────────────────────────────────────────
+
+use lied::domain::collection_section::{self, SectionChanges, SectionError};
+
+/// Add a section to `coll` through the domain.
+async fn add_section(
+    ctx: &Ctx,
+    coll: Uuid,
+    name: &str,
+    starts_at: i32,
+) -> Result<collection_section::CollectionSection, SectionError> {
+    collection_section::create(&ctx.pool, Uuid::now_v7(), coll, name, starts_at, None).await
+}
+
+/// The `(label, section name)` of the live items, in position order.
+async fn sectioned(ctx: &Ctx, coll: Uuid) -> Vec<(String, Option<String>)> {
+    collection_item::list_for_collection(&ctx.pool, coll)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.item.label, v.item.section.map(|s| s.name)))
+        .collect()
+}
+
+fn expect_sectioned(rows: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+    rows.iter()
+        .map(|(l, s)| (l.to_string(), s.map(str::to_string)))
+        .collect()
+}
+
+/// `(name, startsAt)` of the collection's sections, by start.
+async fn starts(ctx: &Ctx, coll: Uuid) -> Vec<(String, i32)> {
+    collection_section::list_for_collection(&ctx.pool, coll)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.name, s.starts_at))
+        .collect()
+}
+
+/// A standing folder: marches 1–3, then a "Polkas" section from 61 holding
+/// 61 and 63 (62 a gap).
+async fn folder(ctx: &Ctx) -> Uuid {
+    let book = numbered(ctx, "standing", 3).await;
+    for title in ["m1", "m2", "m3"] {
+        add(ctx, book, title, Placement::default()).await.unwrap();
+    }
+    add_section(ctx, book, "Polkas", 61).await.unwrap();
+    add(ctx, book, "p61", at("61")).await.unwrap();
+    let gone = add(ctx, book, "p62-old", at("62")).await.unwrap();
+    add(ctx, book, "p63", at("63")).await.unwrap();
+    assert!(collection_item::remove(&ctx.pool, book, gone.id, None)
+        .await
+        .unwrap());
+    book
+}
+
+#[tokio::test]
+async fn a_new_section_past_the_end_allows_its_numbers_and_no_others() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    let book = folder(&ctx).await;
+    assert_eq!(
+        labels(&ctx, book).await,
+        owned(&["1", "2", "3", "61", "63"])
+    );
+
+    // Without a section there, 101 is a number far past the end: refused.
+    assert_eq!(
+        refusal(add(&ctx, book, "x", at("101")).await),
+        LabelRefusal::NotAllowed
+    );
+    add_section(&ctx, book, "Modern", 101).await.unwrap();
+    assert_eq!(
+        refusal(add(&ctx, book, "x", at("102")).await),
+        LabelRefusal::NotAllowed,
+        "an empty section offers its start only"
+    );
+    add(&ctx, book, "mod101", at("101")).await.unwrap();
+    add(&ctx, book, "mod102", at("102")).await.unwrap();
+
+    // The polkas keep their own next number and gap; the space between the
+    // polkas and "Modern" is not a gap anybody chose.
+    assert_eq!(
+        refusal(add(&ctx, book, "x", at("80")).await),
+        LabelRefusal::NotAllowed
+    );
+    add(&ctx, book, "p62", at("62")).await.unwrap();
+    add(&ctx, book, "p64", at("64")).await.unwrap();
+    add(&ctx, book, "m4", at("4")).await.unwrap();
+
+    assert_eq!(
+        sectioned(&ctx, book).await,
+        expect_sectioned(&[
+            ("1", None),
+            ("2", None),
+            ("3", None),
+            ("4", None),
+            ("61", Some("Polkas")),
+            ("62", Some("Polkas")),
+            ("63", Some("Polkas")),
+            ("64", Some("Polkas")),
+            ("101", Some("Modern")),
+            ("102", Some("Modern")),
+        ])
+    );
+
+    // Adding without a label still suggests the highest + 1.
+    let next = add(&ctx, book, "auto", Placement::default()).await.unwrap();
+    assert_eq!(next.label, "103");
+}
+
+#[tokio::test]
+async fn a_section_divides_an_existing_folder_without_renumbering() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    let book = numbered(&ctx, "standing", 3).await;
+    for title in ["a", "b", "c", "d"] {
+        add(&ctx, book, title, Placement::default()).await.unwrap();
+    }
+    add(&ctx, book, "c-a", at("3a")).await.unwrap();
+    let polkas = add_section(&ctx, book, "Polkas", 3).await.unwrap();
+    assert_eq!(
+        sectioned(&ctx, book).await,
+        expect_sectioned(&[
+            ("1", None),
+            ("2", None),
+            ("3", Some("Polkas")),
+            ("3a", Some("Polkas")),
+            ("4", Some("Polkas")),
+        ])
+    );
+
+    // Moving the start regroups; deleting it ungroups. No number changes.
+    let moved = collection_section::update(
+        &ctx.pool,
+        book,
+        polkas.id,
+        Some(lied::listing::version_of(polkas.updated_at)),
+        SectionChanges {
+            name: None,
+            starts_at: Some(4),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(moved.starts_at, 4);
+    let in_polkas: Vec<String> = sectioned(&ctx, book)
+        .await
+        .into_iter()
+        .filter(|(_, s)| s.is_some())
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(in_polkas, owned(&["4"]));
+    assert!(collection_section::delete(&ctx.pool, book, polkas.id, None)
+        .await
+        .unwrap());
+    assert_eq!(labels(&ctx, book).await, owned(&["1", "2", "3", "3a", "4"]));
+    assert!(sectioned(&ctx, book).await.iter().all(|(_, s)| s.is_none()));
+}
+
+#[tokio::test]
+async fn a_full_section_takes_gaps_and_letters_only() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    let book = numbered(&ctx, "standing", 3).await;
+    add_section(&ctx, book, "Märsche", 1).await.unwrap();
+    add_section(&ctx, book, "Polkas", 3).await.unwrap();
+    add(&ctx, book, "m1", at("1")).await.unwrap();
+    add(&ctx, book, "m2", at("2")).await.unwrap();
+    add(&ctx, book, "p3", at("3")).await.unwrap();
+
+    // The marches' next number is the polkas' start: taken.
+    assert_eq!(
+        refusal(add(&ctx, book, "x", at("3")).await),
+        LabelRefusal::Taken
+    );
+    add(&ctx, book, "m2a", at("2a")).await.unwrap();
+
+    let choices = collection_item::label_choices(&ctx.pool, book)
+        .await
+        .unwrap();
+    let next: Vec<(u16, Option<String>)> = choices
+        .sections
+        .iter()
+        .map(|c| (c.starts_at, c.next.map(|l| l.to_string())))
+        .collect();
+    assert_eq!(
+        next,
+        [(1, None), (3, Some("4".to_string()))],
+        "the marches are full"
+    );
+}
+
+#[tokio::test]
+async fn renumber_moves_the_section_starts_and_keeps_empty_sections_in_order() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    let book = folder(&ctx).await; // 1 2 3 | Polkas 61 63
+    add_section(&ctx, book, "Modern", 50).await.unwrap(); // empty, between
+    add_section(&ctx, book, "Choräle", 200).await.unwrap(); // empty, at the end
+    add(&ctx, book, "p61a", at("61a")).await.unwrap();
+
+    let preview = collection_item::renumber_preview(&ctx.pool, book)
+        .await
+        .unwrap();
+    let pairs: Vec<(&str, &str)> = preview
+        .changes
+        .iter()
+        .map(|c| (c.from.as_str(), c.to.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("1", "1"),
+            ("2", "2"),
+            ("3", "3"),
+            ("61", "5"),
+            ("61a", "6"),
+            ("63", "7"),
+        ],
+        "4 stays free as the empty 'Modern' section's start"
+    );
+    let section_moves: Vec<(i32, i32)> = preview
+        .section_changes
+        .iter()
+        .map(|c| (c.from, c.to))
+        .collect();
+    assert_eq!(section_moves, [(50, 4), (61, 5), (200, 8)]);
+
+    // A section added after the preview makes its token stale.
+    let late = add_section(&ctx, book, "Late", 300).await.unwrap();
+    assert!(matches!(
+        collection_item::renumber(&ctx.pool, book, &preview.preview_token).await,
+        Err(CollectionItemError::StaleRenumber)
+    ));
+    collection_section::delete(&ctx.pool, book, late.id, None)
+        .await
+        .unwrap();
+
+    let fresh = collection_item::renumber_preview(&ctx.pool, book)
+        .await
+        .unwrap();
+    assert_eq!(fresh.changes, preview.changes);
+    let outcome = collection_item::renumber(&ctx.pool, book, &fresh.preview_token)
+        .await
+        .unwrap();
+    assert_eq!(outcome.changes, fresh.changes, "apply does what was shown");
+    assert_eq!(outcome.section_changes, fresh.section_changes);
+    assert_eq!(
+        starts(&ctx, book).await,
+        [
+            ("Modern".to_string(), 4),
+            ("Polkas".to_string(), 5),
+            ("Choräle".to_string(), 8),
+        ]
+    );
+    assert_eq!(
+        sectioned(&ctx, book).await,
+        expect_sectioned(&[
+            ("1", None),
+            ("2", None),
+            ("3", None),
+            ("5", Some("Polkas")),
+            ("6", Some("Polkas")),
+            ("7", Some("Polkas")),
+        ])
+    );
+    // The reserved start is an allowed label for the empty section.
+    add(&ctx, book, "mod", at("4")).await.unwrap();
+}
+
+#[tokio::test]
+async fn sections_belong_to_standing_collections_only() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    let concert = numbered(&ctx, "program", 3).await;
+    assert!(matches!(
+        add_section(&ctx, concert, "Part 1", 1).await,
+        Err(SectionError::NotStanding)
+    ));
+    assert!(matches!(
+        collection_item::label_choices(&ctx.pool, concert).await,
+        Err(CollectionItemError::NotStanding)
+    ));
+
+    // A standing collection with sections cannot become a program, and its
+    // width cannot narrow below a section's start.
+    let book = numbered(&ctx, "standing", 4).await;
+    let big = add_section(&ctx, book, "Anhang", 1500).await.unwrap();
+    let fields = |collection_type: &'static str, number_width: i16| collection::CollectionFields {
+        name: "Book",
+        collection_type,
+        number_width,
+    };
+    assert!(matches!(
+        collection::update(&ctx.pool, book, None, fields("standing", 3)).await,
+        Err(collection::CollectionError::SectionsTooWide {
+            start: 1500,
+            width: 3
+        })
+    ));
+    assert!(matches!(
+        collection::update(&ctx.pool, book, None, fields("program", 4)).await,
+        Err(collection::CollectionError::HasSections)
+    ));
+    collection_section::delete(&ctx.pool, book, big.id, None)
+        .await
+        .unwrap();
+    collection::update(&ctx.pool, book, None, fields("program", 3))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A start must fit the width and be free.
+    let book = numbered(&ctx, "standing", 3).await;
+    add_section(&ctx, book, "Polkas", 61).await.unwrap();
+    assert!(matches!(
+        add_section(&ctx, book, "Again", 61).await,
+        Err(SectionError::StartTaken { start: 61 })
+    ));
+    assert!(matches!(
+        add_section(&ctx, book, "Wide", 1000).await,
+        Err(SectionError::InvalidStart { max: 999 })
+    ));
+    assert!(matches!(
+        add_section(&ctx, book, "Zero", 0).await,
+        Err(SectionError::InvalidStart { .. })
+    ));
+}
+
+/// Two sections at one start at the same moment: the collection lock lets
+/// exactly one through.
+#[tokio::test]
+async fn concurrent_sections_at_one_start_let_exactly_one_through() {
+    let (ctx, _tok) = setup(membership::Role::Archivist).await;
+    for _ in 0..5 {
+        let book = numbered(&ctx, "standing", 3).await;
+        let (a, b) = tokio::join!(
+            add_section(&ctx, book, "A", 10),
+            add_section(&ctx, book, "B", 10)
+        );
+        let results = [a.map(|_| ()), b.map(|_| ())];
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(results
+            .iter()
+            .any(|r| matches!(r, Err(SectionError::StartTaken { .. }))));
+    }
+}
+
+/// `req` with an `If-Match` header.
+fn req_if_match(
+    method: &str,
+    uri: &str,
+    token: &str,
+    etag: &str,
+    body: Option<serde_json::Value>,
+) -> axum::http::Request<axum::body::Body> {
+    let mut request = req(method, uri, token, body);
+    request.headers_mut().insert(
+        axum::http::header::IF_MATCH,
+        axum::http::HeaderValue::from_str(etag).unwrap(),
+    );
+    request
+}
+
+async fn send_with_etag(
+    app: &axum::Router,
+    request: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, Option<String>, serde_json::Value) {
+    let resp = app.clone().oneshot(request).await.expect("request runs");
+    let status = resp.status();
+    let etag = resp
+        .headers()
+        .get(axum::http::header::ETAG)
+        .map(|v| v.to_str().unwrap().to_string());
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, etag, json)
+}
+
+async fn audits(ctx: &Ctx, action: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1")
+        .bind(action)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn sections_on_the_wire_follow_the_conventions() {
+    use axum::http::StatusCode;
+    let (ctx, tok) = setup(membership::Role::Archivist).await;
+    let base = format!("/v1/orgs/{}/collections", ctx.org);
+    let (_, book) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &base,
+            &tok,
+            Some(serde_json::json!({ "name": "Marschbuch", "type": "standing" })),
+        ),
+    )
+    .await;
+    let book_url = format!("{base}/{}", book["id"].as_str().unwrap());
+    let sections_url = format!("{book_url}/sections");
+
+    let (status, etag, polkas) = send_with_etag(
+        &ctx.app,
+        req(
+            "POST",
+            &sections_url,
+            &tok,
+            Some(serde_json::json!({ "name": "Polkas", "startsAt": 61 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{polkas}");
+    assert!(etag.is_some());
+    assert_eq!(polkas["startsAt"], 61);
+    assert_eq!(audits(&ctx, "collection_section.create").await, 1);
+
+    // Refusals: a taken start is a 409, a start out of range or a blank
+    // name a 400 naming the field, an unknown field a 400.
+    for (body, want, field) in [
+        (
+            serde_json::json!({ "name": "Again", "startsAt": 61 }),
+            StatusCode::CONFLICT,
+            None,
+        ),
+        (
+            serde_json::json!({ "name": "Wide", "startsAt": 1000 }),
+            StatusCode::BAD_REQUEST,
+            Some("startsAt"),
+        ),
+        (
+            serde_json::json!({ "name": "  ", "startsAt": 5 }),
+            StatusCode::BAD_REQUEST,
+            Some("name"),
+        ),
+        (
+            serde_json::json!({ "name": "X", "startsAt": 5, "colour": "red" }),
+            StatusCode::BAD_REQUEST,
+            None,
+        ),
+    ] {
+        let (status, problem) = send(&ctx.app, req("POST", &sections_url, &tok, Some(body))).await;
+        assert_eq!(status, want, "{problem}");
+        if let Some(field) = field {
+            assert!(problem["errors"].get(field).is_some(), "{problem}");
+        }
+    }
+
+    // GET one with its ETag; PATCH needs it.
+    let section_url = format!("{sections_url}/{}", polkas["id"].as_str().unwrap());
+    let (status, etag, _) = send_with_etag(&ctx.app, req("GET", &section_url, &tok, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = etag.unwrap();
+    let rename = serde_json::json!({ "name": "Polkas & Walzer" });
+    let (status, _) = send(
+        &ctx.app,
+        req("PATCH", &section_url, &tok, Some(rename.clone())),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "If-Match is required"
+    );
+    let (status, _, renamed) = send_with_etag(
+        &ctx.app,
+        req_if_match("PATCH", &section_url, &tok, &etag, Some(rename.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "Polkas & Walzer");
+    let (status, _) = send(
+        &ctx.app,
+        req_if_match("PATCH", &section_url, &tok, &etag, Some(rename)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "a stale ETag");
+    assert_eq!(audits(&ctx, "collection_section.update").await, 1);
+
+    // Items name their section.
+    let items_url = format!("{book_url}/items");
+    let arr = create_arrangement(&ctx.pool, ctx.org, "radetzky").await;
+    let (_, march) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &items_url,
+            &tok,
+            Some(serde_json::json!({ "arrangementId": arr })),
+        ),
+    )
+    .await;
+    assert_eq!(march["section"], serde_json::Value::Null);
+    let arr = create_arrangement(&ctx.pool, ctx.org, "annen-polka").await;
+    let (status, polka) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &items_url,
+            &tok,
+            Some(serde_json::json!({ "arrangementId": arr, "label": "61" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{polka}");
+    assert_eq!(polka["section"]["id"], polkas["id"]);
+    assert_eq!(polka["section"]["name"], "Polkas & Walzer");
+    let (_, list) = send(&ctx.app, req("GET", &items_url, &tok, None)).await;
+    let names: Vec<serde_json::Value> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["section"]["name"].clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            serde_json::Value::Null,
+            serde_json::json!("Polkas & Walzer")
+        ]
+    );
+
+    // Label choices for a client's add-piece form.
+    let (status, choices) = send(
+        &ctx.app,
+        req("GET", &format!("{book_url}/label-choices"), &tok, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(choices["suggested"], "62");
+    assert_eq!(choices["gaps"], serde_json::json!([]));
+    assert_eq!(
+        choices["sections"],
+        serde_json::json!([
+            { "sectionId": null, "name": null, "startsAt": 1, "next": "2", "full": false },
+            { "sectionId": polkas["id"], "name": "Polkas & Walzer", "startsAt": 61,
+              "next": "62", "full": false },
+        ])
+    );
+
+    // The renumber preview shows the section's new start.
+    let (_, preview) = send(
+        &ctx.app,
+        req("GET", &format!("{book_url}/renumber"), &tok, None),
+    )
+    .await;
+    assert_eq!(
+        preview["sectionChanges"],
+        serde_json::json!([{ "sectionId": polkas["id"], "from": 61, "to": 2 }])
+    );
+
+    // A musician reads but does not write.
+    let musician = create_user(&ctx.pool, "player").await;
+    add_member(&ctx.pool, ctx.org, musician, membership::Role::Musician).await;
+    let player = ctx.token_for(musician);
+    let (status, _) = send(&ctx.app, req("GET", &sections_url, &player, None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &sections_url,
+            &player,
+            Some(serde_json::json!({ "name": "Mine", "startsAt": 5 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // DELETE needs the ETag too; then the polka has no section.
+    let (_, etag, _) = send_with_etag(&ctx.app, req("GET", &section_url, &tok, None)).await;
+    let (status, _) = send(&ctx.app, req("DELETE", &section_url, &tok, None)).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    let (status, _) = send(
+        &ctx.app,
+        req_if_match("DELETE", &section_url, &tok, &etag.unwrap(), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(audits(&ctx, "collection_section.delete").await, 1);
+    let polka_url = format!("{items_url}/{}", polka["id"].as_str().unwrap());
+    let (_, polka) = send(&ctx.app, req("GET", &polka_url, &tok, None)).await;
+    assert_eq!(polka["section"], serde_json::Value::Null);
+
+    // A program refuses sections and label choices.
+    let (_, concert) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &base,
+            &tok,
+            Some(serde_json::json!({ "name": "Frühlingskonzert", "type": "program" })),
+        ),
+    )
+    .await;
+    let concert_url = format!("{base}/{}", concert["id"].as_str().unwrap());
+    let (status, _) = send(
+        &ctx.app,
+        req(
+            "POST",
+            &format!("{concert_url}/sections"),
+            &tok,
+            Some(serde_json::json!({ "name": "Part 1", "startsAt": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = send(
+        &ctx.app,
+        req("GET", &format!("{concert_url}/label-choices"), &tok, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
