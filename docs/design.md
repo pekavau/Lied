@@ -243,7 +243,7 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 **Authentication:**
 - Local accounts (username/password, argon2id hashing) are the baseline — required for self-hostable deployments without external dependencies.
 - OIDC is an optional, configurable second auth method for orgs that want SSO. When OIDC is configured, **local login stays available as a fallback by default** — the break-glass path if the IdP is misconfigured or down. Account linking is by matching verified `email`. OIDC itself is deferred (see Phase cuts); a per-org "disable local auth" (SSO-only) policy is a later toggle on top of it, and until then both paths stay to avoid lockout on self-hosted instances.
-- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). A user mints and revokes their own on the console's **App passwords** page (`/admin/app-passwords`, any logged-in user, no org role needed: issue #88) or through `/v1/app-passwords`; both go through `domain::app_password::issue`. App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
+- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). A user mints and revokes their own on the console's **App passwords** page (`/admin/app-passwords`, any logged-in user, no org role needed: issue #88) or through `/v1/app-passwords`; both mint them the same way. App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
 - REST API uses session cookies (web client) or bearer tokens (programmatic).
 
 **Authorization:**
@@ -351,12 +351,11 @@ in `If-Match`; a stale one is **`412 Precondition Failed`**.
 - **Files take no `If-Match`.** A file is never edited in place — replacing
   one inserts a new row and soft-deletes the old — so its id *is* its version;
   a second replace or delete of the same id finds it gone (404).
-- **The check is part of the write**, not a read beforehand (#64): the
-  domain update or delete adds
-  `floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` to its
-  `WHERE`, and a cascade first locks the row at that version
-  (`SELECT … FOR UPDATE`). Two writers holding one ETag therefore cannot both
-  succeed; the loser gets 412, or 404 if the row is gone.
+- **The check is part of the write**, not a read beforehand (#64): an update
+  or delete only matches the row *at the caller's version*, and a cascading
+  delete first locks the row at that version. Two writers holding one ETag
+  therefore cannot both succeed; the loser gets 412, or 404 if the row is
+  gone.
 - In the console, edit forms carry the ETag in a hidden field and show "changed
   by someone else" on a 412. Console **buttons** (delete, restore, mark
   notified / acknowledged) carry no version and act unconditionally.
@@ -364,8 +363,11 @@ in `If-Match`; a stale one is **`412 Precondition Failed`**.
 **Why:** `updated_at` already exists everywhere and millisecond precision
 catches concurrent edits, so a separate `version` column would be redundant.
 
-**Enforced by:** `patch_operations_declare_precondition_412` (every `PATCH`
-documents its 412); `concurrent_writes_with_one_etag_let_exactly_one_through`
+**Enforced by:** every domain update and delete adds
+`floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` to its
+`WHERE` (a cascade takes `SELECT … FOR UPDATE` at that version first), as the
+"Guarded writes" docs in `lied/src/domain/mod.rs` require;
+`patch_operations_declare_precondition_412` (every `PATCH` documents its 412); `concurrent_writes_with_one_etag_let_exactly_one_through`
 fires several writes holding one ETag and expects exactly one to land.
 
 #### PATCH is a partial update
@@ -1084,8 +1086,16 @@ Attaching and detaching are real inserts and deletes.
 #### Annotations & distribution state
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: a part is **covered** once at least one musician holds it (the model has no desk counts, so "enough players" is not a question it can answer); acknowledgement is reported as a **ratio of players**, not a per-part flag, because a section where two of three have replied is neither rehearsed nor unrehearsed. Coverage only ever reports — no operation refuses because a part is unassigned.
   One report, two views, differing only in which voices count as *required*: the **full-program** view (every live voice of each item) for staff, and the **section** view (voices whose `instrument_id` is in the principal's `principal_instrument_ids`) — the only view a principal may read, scoped to their own instruments. It is a query over existing tables; nothing is stored.
-- **Part identity and bulk assignment (issue #55).** "The same part across pieces" is `(Voice.instrument_id, Voice.part_number)`, with a null part number matching null (Timpani, Harp). Before #55 the ordinal lived only in the voice name. `lied_guess_part_number` (migration 0024) derives it **conservatively**: it answers only when the name carries exactly one ordinal (trailing arabic/roman, or a leading "1st"/"2."), and returns NULL for anything combined ("Horn 1 & 3", "Violin I und II", "Flute 2/Piccolo"), because a wrong number hands a player the wrong part while a missing one shows up in the preview. The same SQL function both backfilled existing voices and is the **default for a new voice created without a part number**, so later voices number like earlier ones. Part number is tri-state on the wire: on create, omitted = guess from the name, `null` = none; on PATCH, omitted = **keep** (never re-guessed from a new name), `null` = clear — the general PATCH rule (see HTTP & REST API conventions).
-  Bulk assignment ("the 1st trumpet on the whole March Book") **fans out into ordinary `PartAssignment` rows** — no standing roster, so nothing can drift from the assignments and a one-piece exception is the same edit as ever. It is **preview → confirm**: the preview reports per piece `assign` / `alreadyHeld` / `noMatch` (with the instrument's other voices as candidates) / `ambiguous` (two matching voices — assign by hand) / `removed`, and notes other parts the player already holds in that piece (a conflict, reported not refused). A piece that was ambiguous or unmatched but where the player already plays one of the candidates (settled by hand) reads as `alreadyHeld`. The confirm writes exactly the previewed `(item, voice)` pairs **for the requested part**, all-or-nothing, and refuses with 409 if any pair is gone *or is no longer that part* (renumbered, re-instrumented). It carries the player by id, not username. Audit rows are written in the same transaction as the assignments. Already-held pairs are reported, so re-running after adding pieces extends it. A voice carrying several instruments (percussion grab-bag parts, doublings) is a separate, deferred change (#57).
+- **Part identity and bulk assignment (#55).** "The same part across pieces" is the pair `(instrument_id, part_number)` of a voice; a null part number matches null (Timpani, Harp).
+  - **Part numbers are guessed conservatively** from the voice name: only when it carries exactly one ordinal (a trailing arabic or roman number, a leading "1st" or "2."), and never for a combination ("Horn 1 & 3", "Violin I und II", "Flute 2/Piccolo"). **Why:** a wrong number hands a player the wrong part; a missing one shows up in the preview, where a person fixes it.
+  - The same guess backfilled existing voices and fills in a **new voice created without a part number**, so later voices number like earlier ones.
+  - **On the wire** the field is tri-state: on create, omitted = guess from the name and `null` = none; on PATCH, omitted = keep (never re-guessed from a new name) and `null` = clear, per the general PATCH rule.
+  - **Bulk assignment** ("the 1st trumpet for the whole march book") **fans out into ordinary part assignments**. There is no standing roster, so nothing can drift from the assignments, and a one-piece exception is an ordinary edit.
+  - It is **preview → confirm.** The preview reports each piece as `assign`, `alreadyHeld`, `noMatch` (listing the instrument's other voices as candidates), `ambiguous` (two matching voices: assign by hand) or `removed`, and notes other parts the player already holds in that piece — a conflict, reported, not refused. A piece settled by hand (the player already plays one of the candidates) reads `alreadyHeld`.
+  - **The confirm writes exactly what was previewed**: the `(item, voice)` pairs for the requested part, all or nothing, with their audit rows in the same transaction. It refuses with 409 if any pair is gone or *is no longer that part* (renumbered, re-instrumented), and names the player by id, not username.
+  - Re-running after adding pieces extends the assignment, since pairs already held are only reported.
+  - **Enforced by:** the SQL function `lied_guess_part_number` (migration 0024), used both for the backfill and as the insert default.
+  - **Deferred:** a voice carrying several instruments — percussion grab-bags, doublings (#57).
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
   **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
   **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
@@ -1316,7 +1326,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 - **Coverage check (UC-13).** The coverage report on `/v1` and in the console: the full-program view for staff, the section view for principals. Designed under *Annotations & distribution state*; no migration.
 - **Global annotations (UC-16, authoring).** `/v1` CRUD with ETags, and console authoring, for conductors and owners — hard delete, controlled `type` vocabulary (migration 0025). Designed under *Annotations & distribution state* (#36).
 
-**Admin UI (HTMX) — the management/curation surface, completed.** Every screen enforces the permission matrix — a conductor gets collections / part assignments / global annotations but sees arrangement, voice, and file data **read-only**; arrangement / file / tag edits stay `owner` / `archivist`; member and role management stays `owner`. The only non-staff surface is the principal's read-only section-coverage screen (see the carve-out above).
+**Admin UI (HTMX) — the management/curation surface, completed.** Every screen enforces the permission matrix — a conductor gets collections / part assignments / global annotations but sees arrangement, voice, and file data **read-only**; arrangement / file / tag edits stay `owner` / `archivist`; member and role management stays `owner`. The non-staff exceptions are under *Auth & access → Console access*.
 
 - Arrangement / Work / Voice / Tag management: full CRUD with provenance, licensing, edition status (`active` / `archived`), difficulty + `difficulty_ratings`, duration.
 - File management: upload / replace / soft-delete score and voice files (all four formats; images accepted as-is per UC-11), surfacing each file's `format` / `mime_type` and `derived_from` provenance — the format-transparency requirement from Supported Formats. Conversion **actions** stay deferred (phase 3+).
