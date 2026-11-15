@@ -1508,8 +1508,10 @@ async fn a_standing_collection_keeps_its_numbers_and_has_no_reorder_arrows() {
         !html.contains("value=\"down:") && !html.contains("value=\"up:"),
         "a standing collection offers no reorder arrows"
     );
-    // The next piece is offered the next number after the highest.
-    assert!(html.contains("name=\"label\" value=\"4\""), "{html}");
+    // The next piece is offered the next number after the highest
+    // (preselected), and the gap left by the removal as a choice.
+    assert!(html.contains("<option value=\"4\" selected>"), "{html}");
+    assert!(html.contains("<option value=\"2\">2 (free)"), "{html}");
 
     // A forged reorder is refused and changes nothing.
     let token = form_csrf(&html);
@@ -2660,4 +2662,567 @@ async fn the_console_restores_a_tag_only_through_its_own_org() {
     assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
     assert!(tag::find_by_id(&ctx.pool, ours.id).await.unwrap().is_some());
     assert_eq!(audit_count(&ctx.pool, "tag.undelete").await, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Tests — #104: standing collections by label, gaps, sections, Renumber
+// ---------------------------------------------------------------------------
+
+/// Post a form to a collection's sub-path, fetching a fresh CSRF token from
+/// its detail page first.
+async fn post_to_collection(
+    ctx: &Ctx,
+    browser: &Browser,
+    org_id: Uuid,
+    coll: Uuid,
+    sub_path: &str,
+    fields: &[(&str, &str)],
+) -> axum::response::Response {
+    let detail_url = format!("/admin/orgs/{org_id}/collections/{coll}");
+    let (_, html) = load_page(&ctx.app, browser, &detail_url).await;
+    let token = form_csrf(&html);
+    post_form(
+        &ctx.app,
+        browser,
+        &format!("{detail_url}{sub_path}"),
+        fields,
+        &token,
+    )
+    .await
+}
+
+/// Add `title` to a collection under the given form fields; returns the
+/// response status.
+async fn add_with(
+    ctx: &Ctx,
+    browser: &Browser,
+    org_id: Uuid,
+    coll: Uuid,
+    title: &str,
+    fields: &[(&str, &str)],
+) -> (axum::http::StatusCode, String) {
+    let arr = seed_arrangement(&ctx.state, org_id, title).await;
+    let arr = arr.to_string();
+    let mut all = vec![("arrangement_id", arr.as_str())];
+    all.extend_from_slice(fields);
+    let response = post_to_collection(ctx, browser, org_id, coll, "/items", &all).await;
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+fn labels(views: &[lied::domain::collection_item::CollectionItemView]) -> Vec<String> {
+    views.iter().map(|v| v.item.label.clone()).collect()
+}
+
+/// A standing collection with pieces under the given labels, added through
+/// the console (each label in turn is the suggestion, a gap or a letter).
+async fn standing_with(ctx: &Ctx, browser: &Browser, org_id: Uuid, wanted: &[&str]) -> Uuid {
+    let coll = create_collection(ctx, browser, org_id, "Marschbuch", "standing").await;
+    for (i, label) in wanted.iter().enumerate() {
+        let (status, body) = add_with(
+            ctx,
+            browser,
+            org_id,
+            coll,
+            &format!("March {i}"),
+            &[("label", *label)],
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::SEE_OTHER, "{label}: {body}");
+    }
+    coll
+}
+
+#[tokio::test]
+async fn a_standing_piece_is_added_by_suggestion_gap_or_letter_label() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3"]).await;
+    let live = items(&ctx, coll).await;
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[1].item.id).await;
+
+    // The page offers the suggestion (preselected) and the gap.
+    let detail_url = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
+    assert!(
+        html.contains("<option value=\"4\" selected>4 (next)"),
+        "{html}"
+    );
+    assert!(html.contains("<option value=\"2\">2 (free)"), "{html}");
+
+    // The gap is taken as chosen.
+    let (status, _) = add_with(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "Gap piece",
+        &[("label", "2")],
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+
+    // The letter field wins over the select.
+    let (status, _) = add_with(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "Slipped in",
+        &[("label", "4"), ("letter_label", "3A")],
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1", "2", "3", "3a"]);
+
+    // A number far past the end is refused with the domain's reason.
+    let (status, body) =
+        add_with(&ctx, &browser, fx.org_id, coll, "Typo", &[("label", "40")]).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(body.contains("Label 40 is not allowed"), "{body}");
+    // A taken one is a conflict.
+    let (status, body) = add_with(&ctx, &browser, fx.org_id, coll, "Twin", &[("label", "3")]).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert!(body.contains("another piece has it"), "{body}");
+}
+
+#[tokio::test]
+async fn a_standing_piece_is_relabelled_or_swapped_from_its_row() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3"]).await;
+    let before = items(&ctx, coll).await;
+    remove_piece(&ctx, &browser, fx.org_id, coll, before[1].item.id).await;
+    // Fresh versions: the removal moved piece 3's position (not its label).
+    let live = items(&ctx, coll).await;
+    let (first, third) = (&live[0].item, &live[1].item);
+    assert_eq!(third.label, "3");
+
+    // A stale row form is refused (someone moved the piece meanwhile).
+    let stale = (first.updated_at.timestamp_millis() - 1).to_string();
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &format!("/items/{}/relabel", first.id),
+        &[("label", "2"), ("expected_version", &stale)],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::PRECONDITION_FAILED
+    );
+
+    // Piece 3 moves into the gap.
+    let version = third.updated_at.timestamp_millis().to_string();
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &format!("/items/{}/relabel", third.id),
+        &[("label", "2"), ("expected_version", &version)],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1", "2"]);
+
+    // And swaps with piece 1.
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &format!("/items/{}/swap", third.id),
+        &[("with_item_id", &first.id.to_string())],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after[0].item.id, third.id,
+        "the swapped piece is now number 1"
+    );
+    assert_eq!(after[0].item.label, "1");
+    assert_eq!(audit_count(&ctx.pool, "collection_item.swap").await, 1);
+    assert_eq!(audit_count(&ctx.pool, "collection_item.update").await, 1);
+}
+
+#[tokio::test]
+async fn gaps_render_as_free_rows_and_open_numbers_as_one_line() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3", "4"]).await;
+    let live = items(&ctx, coll).await;
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[2].item.id).await;
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "/sections",
+        &[("name", "Polkas"), ("starts_at", "61")],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let (status, _) = add_with(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "First polka",
+        &[("label", "61")],
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{coll}", fx.org_id),
+    )
+    .await;
+    assert!(
+        html.contains("<td>3</td><td colspan=\"4\">free</td>"),
+        "the removed piece's number is a free row: {html}"
+    );
+    assert!(
+        html.contains("5–60 free"),
+        "the open numbers before the next section are one line: {html}"
+    );
+    assert!(html.contains("Polkas"), "{html}");
+    // The add select groups the choices per range.
+    assert!(
+        html.contains("<optgroup label=\"Polkas (from 61)\">"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<option value=\"62\" selected>62 (next)"),
+        "{html}"
+    );
+}
+
+/// The preview token a renumber page carries.
+fn preview_token(html: &str) -> String {
+    let marker = "name=\"preview_token\" value=\"";
+    let start = html.find(marker).expect("preview carries a token") + marker.len();
+    html[start..].split('"').next().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn renumber_previews_only_the_changes_and_refuses_a_stale_preview() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3"]).await;
+    let live = items(&ctx, coll).await;
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[1].item.id).await;
+    let renumber_url = format!("/admin/orgs/{}/collections/{coll}/renumber", fx.org_id);
+
+    let (status, html) = load_page(&ctx.app, &browser, &renumber_url).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(html.contains("re-sleeved"), "{html}");
+    assert!(
+        html.contains("<td>March 2</td><td>3</td><td>2</td>"),
+        "piece 3 becomes 2: {html}"
+    );
+    assert!(
+        !html.contains("March 0"),
+        "an unchanged piece is not listed: {html}"
+    );
+    let token = preview_token(&html);
+
+    // A change after the preview: the confirm re-renders the new preview.
+    let (status, _) = add_with(&ctx, &browser, fx.org_id, coll, "Late", &[("label", "4")]).await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+    let csrf = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &renumber_url,
+        &[("preview_token", &token)],
+        &csrf,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let html = body_text(response).await;
+    assert!(
+        html.contains("changed since you opened the preview"),
+        "{html}"
+    );
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1", "3", "4"]);
+
+    // Confirming the fresh preview applies it.
+    let token = preview_token(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &renumber_url,
+        &[("preview_token", &token)],
+        &csrf,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1", "2", "3"]);
+    assert_eq!(audit_count(&ctx.pool, "collection.renumber").await, 1);
+}
+
+#[tokio::test]
+async fn restoring_a_piece_whose_number_was_taken_asks_for_one() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3"]).await;
+    let removed_id = items(&ctx, coll).await[1].item.id;
+    remove_piece(&ctx, &browser, fx.org_id, coll, removed_id).await;
+    let (status, _) = add_with(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "Newcomer",
+        &[("label", "2")],
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER);
+
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{coll}", fx.org_id),
+    )
+    .await;
+    assert!(html.contains("Its number is taken"), "{html}");
+
+    // Without a number: refused with the domain's reason.
+    let undelete = format!("/items/{removed_id}/undelete");
+    let response = post_to_collection(&ctx, &browser, fx.org_id, coll, &undelete, &[]).await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert!(body_text(response).await.contains("is no longer free"));
+
+    // With a letter label: restored there.
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &undelete,
+        &[("label", ""), ("letter_label", "2a")],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1", "2", "2a", "3"]);
+}
+
+#[tokio::test]
+async fn sections_are_added_moved_and_deleted_with_their_version() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "cond").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1"]).await;
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "/sections",
+        &[("name", "Polkas"), ("starts_at", "61")],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let section = lied::domain::collection_section::list_for_collection(&ctx.pool, coll)
+        .await
+        .unwrap()
+        .remove(0);
+
+    // Two sections cannot share a start.
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        "/sections",
+        &[("name", "Waltzes"), ("starts_at", "61")],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+
+    // A stale edit is refused; a current one moves the start.
+    let path = format!("/sections/{}", section.id);
+    let stale = (section.updated_at.timestamp_millis() - 1).to_string();
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &path,
+        &[
+            ("name", "Polkas"),
+            ("starts_at", "51"),
+            ("expected_version", &stale),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::PRECONDITION_FAILED
+    );
+    let version = section.updated_at.timestamp_millis().to_string();
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &path,
+        &[
+            ("name", "Polkas & Co"),
+            ("starts_at", "51"),
+            ("expected_version", &version),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let moved = lied::domain::collection_section::find_by_id(&ctx.pool, section.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((moved.name.as_str(), moved.starts_at), ("Polkas & Co", 51));
+
+    // Delete needs the current version too.
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &format!("{path}/delete"),
+        &[("expected_version", &version)],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::PRECONDITION_FAILED
+    );
+    let version = moved.updated_at.timestamp_millis().to_string();
+    let response = post_to_collection(
+        &ctx,
+        &browser,
+        fx.org_id,
+        coll,
+        &format!("{path}/delete"),
+        &[("expected_version", &version)],
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert!(
+        lied::domain::collection_section::list_for_collection(&ctx.pool, coll)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(audit_count(&ctx.pool, "collection_section.create").await, 1);
+    assert_eq!(audit_count(&ctx.pool, "collection_section.update").await, 1);
+    assert_eq!(audit_count(&ctx.pool, "collection_section.delete").await, 1);
+
+    // A program has no sections UI, and its Remove buttons sit in the rows
+    // (pointing at forms outside the reorder form).
+    let program = create_collection(&ctx, &browser, fx.org_id, "Spring Concert", "program").await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Overture").await;
+    add_piece(&ctx, &browser, fx.org_id, program, arr).await;
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{program}", fx.org_id),
+    )
+    .await;
+    assert!(!html.contains("Add section"), "{html}");
+    let item = items(&ctx, program).await[0].item.id;
+    assert!(
+        html.contains(&format!("form=\"remove-{item}\""))
+            && html.contains(&format!("id=\"remove-{item}\"")),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn a_musician_reaches_none_of_the_numbering_screens() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let arch = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &arch, fx.org_id, &["1"]).await;
+    let item = items(&ctx, coll).await[0].item.id;
+
+    let musician = Browser::login(&ctx.app, "mus").await;
+    let base = format!("/admin/orgs/{}/collections/{coll}", fx.org_id);
+    let (status, _) = load_page(&ctx.app, &musician, &format!("{base}/renumber")).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    let token = session_csrf(&ctx.app, &musician, "/admin").await;
+    for (path, fields) in [
+        (
+            format!("{base}/sections"),
+            vec![("name", "X"), ("starts_at", "5")],
+        ),
+        (format!("{base}/items/{item}/relabel"), vec![("label", "2")]),
+        (format!("{base}/renumber"), vec![("preview_token", "x")]),
+    ] {
+        let response = post_form(&ctx.app, &musician, &path, &fields, &token).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "{path}"
+        );
+    }
+    assert_eq!(labels(&items(&ctx, coll).await), vec!["1"]);
+}
+
+/// A piece's Move dropdown offers what *that piece* may take: its own number
+/// does not count against it. Before, every row reused the add-piece
+/// choices, so the highest piece was offered "highest + 1", which the
+/// domain then refused (moving 3 to 4 in 1, 2, 3 would invent a gap).
+#[tokio::test]
+async fn the_move_dropdown_offers_only_numbers_the_piece_may_take() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let coll = standing_with(&ctx, &browser, fx.org_id, &["1", "2", "3"]).await;
+    let live = items(&ctx, coll).await;
+    let highest = live
+        .iter()
+        .find(|v| v.item.label == "3")
+        .expect("piece 3")
+        .item
+        .id;
+    let lowest = live
+        .iter()
+        .find(|v| v.item.label == "1")
+        .expect("piece 1")
+        .item
+        .id;
+
+    let (_, html) = load_page(
+        &ctx.app,
+        &browser,
+        &format!("/admin/orgs/{}/collections/{coll}", fx.org_id),
+    )
+    .await;
+    let move_form = |id: uuid::Uuid| -> String {
+        let start = html
+            .find(&format!("{id}/relabel"))
+            .unwrap_or_else(|| panic!("a Move form for {id}: {html}"));
+        let end = start + html[start..].find("</form>").expect("form end");
+        html[start..end].to_string()
+    };
+    assert!(
+        !move_form(highest).contains("value=\"4\""),
+        "piece 3 may not move to 4: {}",
+        move_form(highest)
+    );
+    assert!(
+        move_form(lowest).contains("value=\"4\""),
+        "piece 1 may move to the end: {}",
+        move_form(lowest)
+    );
 }

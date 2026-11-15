@@ -1474,7 +1474,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 - Arrangement / Work / Voice / Tag management: full CRUD with provenance, licensing, edition status (`active` / `archived`), difficulty + `difficulty_ratings`, duration.
 - File management: upload / replace / soft-delete score and voice files (all four formats; images accepted as-is per UC-11), surfacing each file's `format` / `mime_type` and `derived_from` provenance — the format-transparency requirement from Supported Formats. Conversion **actions** stay deferred (phase 3+).
-- Program & standing-collection building: create/edit, add/remove items, reorder by index, the consult-and-update flow (closes admin-UI issue #27).
+- Program & standing-collection building: create/edit, add/remove items, reorder a program by ▲/▼, the consult-and-update flow (closes admin-UI issue #27). For standing collections (#104): adding by label from the domain's choices (gaps, each section's next number, a letter label), gaps shown as free rows, relabel and swap per row, sections, restore under a new label when the old one is taken, and Renumber with a preview of only the numbers that change.
 - Part-assignment screens: assign / reassign / unassign per `(item, voice)`; set `notifiedAt` / `acknowledgedAt` manually; list assignments.
 - Coverage dashboard: per-collection / per-item voice coverage (assigned vs rehearsed) for staff; a principal reaches a read-only, section-scoped slice of the same screen (the one non-staff console surface).
 - Rich archive-search UI over the new FTS/facets — the conductor's UC-2 planning surface.

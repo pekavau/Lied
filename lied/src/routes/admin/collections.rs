@@ -29,6 +29,7 @@ use crate::listing::{self, check_if_match, SortDirection};
 use crate::routes::admin::arrangements::{
     audit_ctx, blank_to_none, csrf_token, require_found, scoped_arrangement,
 };
+use crate::routes::admin::collection_pieces;
 use crate::routes::admin::console::{self, ConsoleCtx, Section};
 use crate::routes::admin::layout;
 use crate::routes::admin::members::{field, multi, parse_ids};
@@ -37,6 +38,7 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(super::collection_pieces::router())
         .route(
             "/orgs/:org_id/collections",
             get(collections_page).post(create_collection),
@@ -121,7 +123,7 @@ fn width_select(current: i16) -> maud::Markup {
 
 /// A numbering refusal as a console page. Messages come from the domain
 /// error, so the console and `/v1` explain a refusal the same way.
-fn item_error_page(
+pub(super) fn item_error_page(
     ctx: &ConsoleCtx,
     err: collection_item::CollectionItemError,
     what: &str,
@@ -200,12 +202,12 @@ async fn scoped_collection_including_deleted(
 /// An error page rendered inside the *Collections* section, so the nav keeps
 /// highlighting where the user actually is. (`arrangements::error_page` is the
 /// same helper hard-wired to the catalog section.)
-fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
+pub(super) fn error_page(ctx: &ConsoleCtx, status: StatusCode, message: &str) -> Response {
     console::error_page(ctx, Section::Collections, status, message)
 }
 
 /// The console URL of a collection's detail screen.
-fn detail_url(org_id: Uuid, collection_id: Uuid) -> String {
+pub(super) fn detail_url(org_id: Uuid, collection_id: Uuid) -> String {
     format!("/admin/orgs/{org_id}/collections/{collection_id}")
 }
 
@@ -416,20 +418,36 @@ async fn collection_detail_page(
     };
     let standing =
         collection_item::Kind::parse(&c.collection_type) == collection_item::Kind::Standing;
-    // The label a new piece gets unless the form says otherwise: the
-    // highest number + 1 (#104 turns this into a choice of the gaps and the
-    // sections' next numbers too).
-    let suggested_label = if standing {
+    // What a new piece may be numbered: the domain's choices, rendered by
+    // `collection_pieces` (#104). A program has none.
+    let choices = if standing {
         match collection_item::label_choices(&state.db, collection_id).await {
-            Ok(choices) => choices.suggested.map(|l| l.to_string()),
+            Ok(choices) => Some(choices),
             Err(error) => {
                 tracing::error!(?error, "failed to compute the label choices");
                 None
             }
         }
-        .unwrap_or_default()
     } else {
-        String::new()
+        None
+    };
+    // What each piece may be moved to: the same rule, with its own number
+    // not counting against it.
+    let move_choices = if standing {
+        match collection_item::move_choices(&state.db, collection_id).await {
+            Ok(choices) => choices,
+            Err(error) => {
+                tracing::error!(?error, "failed to compute the move choices");
+                Default::default()
+            }
+        }
+    } else {
+        Default::default()
+    };
+    let empty_choices = collection_item::LabelChoices {
+        suggested: None,
+        gaps: Vec::new(),
+        sections: Vec::new(),
     };
     let sections = if standing {
         collection_section::list_for_collection(&state.db, collection_id)
@@ -456,6 +474,13 @@ async fn collection_detail_page(
             label { "Piece numbers " (width_select(c.number_width)) }
             button type="submit" { "Save" }
         }
+        @if c.number_width == 3 {
+            p class="muted" {
+                "Switching to 4 digits renames every piece's WebDAV folder ("
+                code { "007-…" } " becomes " code { "0007-…" }
+                "); a tablet that linked a folder has to find it again."
+            }
+        }
 
         h2 { "Pieces" }
         // A program's numbers follow its order; a standing collection's are
@@ -464,84 +489,26 @@ async fn collection_detail_page(
         @if standing {
             p class="muted" {
                 "The numbers match the players' folders: a removed piece leaves "
-                "its number free until another piece takes it."
-            }
-            @if !sections.is_empty() {
-                p {
-                    "Sections: "
-                    @for (i, section) in sections.iter().enumerate() {
-                        @if i > 0 { " · " }
-                        (section.name) " from " (section.starts_at)
-                    }
+                "its number free until another piece takes it. "
+                a href=(format!("{}/renumber", detail_url(org_id, collection_id))) {
+                    "Renumber…"
                 }
             }
+            (collection_pieces::standing_table(
+                org_id,
+                collection_id,
+                &token,
+                &items,
+                &sections,
+                choices.as_ref().unwrap_or(&empty_choices),
+                &move_choices,
+            ))
         } @else {
             p class="muted" {
                 "Use ▲/▼ to rearrange. Pieces are renumbered from 1 on every move, "
                 "so the numbers always follow the running order."
             }
-        }
-        // ONE form for the whole table: every row contributes a hidden `order`
-        // value (the sequence as rendered), and each ▲/▼ is a submit button
-        // naming the row to move. A browser submits only the clicked button, so
-        // the handler receives the order plus one directive. The submitted
-        // order also acts as a concurrency snapshot — if someone else has since
-        // added or removed a piece it is no longer a permutation of the live
-        // set, and the domain's reorder refuses it.
-        form method="post" action=(format!("{items_base}/reorder")) {
-            (layout::csrf_field(&token))
-            table {
-                thead {
-                    tr {
-                        th { "#" }
-                        @if !sections.is_empty() { th { "Section" } }
-                        th { "Piece" } th { "Order" } th {}
-                    }
-                }
-                tbody {
-                    @for (pos, view) in items.iter().enumerate() {
-                        tr {
-                            td { (view.item.label) }
-                            @if !sections.is_empty() {
-                                td {
-                                    @if let Some(section) = &view.item.section {
-                                        (section.name)
-                                    }
-                                }
-                            }
-                            td {
-                                @if view.arrangement_removed {
-                                    span class="muted" { "[removed] " (view.arrangement_slug) }
-                                } @else {
-                                    (view.arrangement_title)
-                                    " "
-                                    span class="muted" { "(" (view.arrangement_slug) ")" }
-                                }
-                            }
-                            td {
-                                input type="hidden" name="order" value=(view.item.id);
-                                @if !standing && pos > 0 {
-                                    button type="submit" name="move"
-                                           value=(format!("up:{}", view.item.id)) { "▲" }
-                                }
-                                @if !standing && pos + 1 < items.len() {
-                                    button type="submit" name="move"
-                                           value=(format!("down:{}", view.item.id)) { "▼" }
-                                }
-                            }
-                            td {
-                                a href=(format!("{items_base}/{}/assignments", view.item.id)) {
-                                    "Parts"
-                                }
-                                " · "
-                                a href=(format!("/admin/orgs/{org_id}/coverage/{collection_id}")) {
-                                    "Coverage"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            (collection_pieces::program_table(org_id, collection_id, &token, &items))
         }
         @if items.is_empty() { p class="muted" { "No pieces yet." } }
         @if !items.is_empty() {
@@ -549,27 +516,8 @@ async fn collection_detail_page(
                 a href=(format!("{}/bulk-assign", detail_url(org_id, collection_id))) {
                     "Assign a player to one part across the whole collection →"
                 }
-            }
-        }
-
-        // Removing a piece is its own form: it must not ride the reorder form's
-        // submit, and a urlencoded POST carries its CSRF token in the body.
-        @if !items.is_empty() {
-            p class="muted" { "Remove a piece:" }
-            @for view in &items {
-                form class="inline" method="post"
-                     action=(format!("{items_base}/{}/delete", view.item.id)) {
-                    (layout::csrf_field(&token))
-                    button type="submit" {
-                        "Remove " (view.item.label) ". "
-                        @if view.arrangement_removed {
-                            (view.arrangement_slug)
-                        } @else {
-                            (view.arrangement_title)
-                        }
-                    }
-                }
-                " "
+                " · "
+                a href=(format!("/admin/orgs/{org_id}/coverage/{collection_id}")) { "Coverage" }
             }
         }
 
@@ -589,10 +537,19 @@ async fn collection_detail_page(
                         }
                     }
                 }
+                " "
                 @if standing {
                     label {
                         "Number "
-                        input type="text" name="label" value=(suggested_label) size="5";
+                        (collection_pieces::add_label_select(
+                            choices.as_ref().unwrap_or(&empty_choices),
+                        ))
+                    }
+                    " "
+                    label class="muted" {
+                        "or a letter label "
+                        input type="text" name="letter_label" size="5" placeholder="12a"
+                              aria-label="Letter label, e.g. 12a";
                     }
                 } @else {
                     label {
@@ -600,8 +557,13 @@ async fn collection_detail_page(
                         input type="number" name="position" min="1" max=(next_position) value=(next_position);
                     }
                 }
+                " "
                 button type="submit" { "Add piece" }
             }
+        }
+
+        @if standing {
+            (collection_pieces::sections_panel(org_id, collection_id, &token, &sections))
         }
 
         @if !removed.is_empty() {
@@ -611,20 +573,14 @@ async fn collection_detail_page(
                     "Showing the " (removed.len()) " most recently removed of " (removed_total) "."
                 }
             }
-            @for view in &removed {
-                form class="inline" method="post"
-                     action=(format!("{items_base}/{}/undelete", view.item.id)) {
-                    (layout::csrf_field(&token))
-                    span { (view.item.label) ". " (view.arrangement_title) " " }
-                    @if standing {
-                        // Only needed when its old number has been taken.
-                        input type="text" name="label" size="5" placeholder=(view.item.label)
-                              aria-label="Number to restore it under";
-                    }
-                    button type="submit" { "Restore" }
-                }
-                br;
-            }
+            (collection_pieces::removed_list(
+                org_id,
+                collection_id,
+                &token,
+                &removed,
+                &items,
+                choices.as_ref(),
+            ))
         }
 
         form class="inline" method="post"
@@ -961,7 +917,7 @@ fn apply_move(order: &mut [Uuid], directive: &str) -> bool {
 
 /// Fetch a live item, confirming it belongs to this collection — an item id
 /// from another collection (or org) must 404 rather than resolve.
-async fn scoped_item(
+pub(super) async fn scoped_item(
     state: &AppState,
     collection_id: Uuid,
     item_id: Uuid,
@@ -1047,9 +1003,7 @@ async fn add_item(
         },
         None => None,
     };
-    let label = field(&pairs, "label")
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let label = super::collection_pieces::submitted_label(&pairs);
 
     match collection_item::create(
         &state.db,
@@ -1210,9 +1164,7 @@ async fn undelete_item(
     ) {
         return response;
     }
-    let label = field(&pairs, "label")
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let label = super::collection_pieces::submitted_label(&pairs);
     match collection_item::restore(&state.db, collection_id, item_id, label).await {
         Ok(_) => {
             audit(

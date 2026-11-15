@@ -27,7 +27,7 @@
 //! still shown, so a broken reference is visible rather than silently
 //! missing.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -694,6 +694,28 @@ pub async fn label_choices(
     let numbering = numbering_of(&mut tx, collection_id, locked.number_width, &slots).await?;
     tx.rollback().await?;
     Ok(numbering.choices())
+}
+
+/// The choices for moving each live piece of a standing collection, keyed by
+/// item id: like [`label_choices`], except that the piece's own label does
+/// not count against it ([`Numbering::without`]). Without that, the highest
+/// piece would be offered "highest + 1", which [`move_item`] then refuses.
+pub async fn move_choices(
+    pool: &PgPool,
+    collection_id: Uuid,
+) -> Result<HashMap<Uuid, LabelChoices>, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if locked.kind != Kind::Standing {
+        return Err(CollectionItemError::NotStanding);
+    }
+    let slots = live_slots(&mut tx, collection_id).await?;
+    let numbering = numbering_of(&mut tx, collection_id, locked.number_width, &slots).await?;
+    tx.rollback().await?;
+    Ok(slots
+        .iter()
+        .map(|slot| (slot.id, numbering.without(&slot.label).choices()))
+        .collect())
 }
 
 /// Sort a standing collection's slots by label, the order its positions
