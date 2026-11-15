@@ -650,7 +650,7 @@ Canonical directory tree (also the public contract for external tools mounting t
     collections/
         <collection-slug>/                  ← read-only computed view; paths assembled
             <label>-<arrangement-slug>/        from CollectionItems + PartAssignments
-                ...
+                ...                            (label zero-padded to 3 digits: 007-, 012a-)
 
 /users/<user-slug>/
     library/                                ← personal/private files (solo practice)
@@ -671,7 +671,7 @@ trumpet in the spring concert, which opens with the Radetzky March):
                             trumpet-1-breaths.pdf    ← Anna's marked-up copy
     collections/
         spring-concert-2027/
-            1-radetzky-march/                        ← piece 1 of the program
+            001-radetzky-march/                      ← piece 1 of the program
                 voices/
                     trumpet-in-bb-1/
                         trumpet-1.pdf
@@ -983,7 +983,7 @@ One arrangement in a collection, under its piece number.
 |---|---|---|
 | `collection_id`, `arrangement_id` | FK | One live item per arrangement per collection: a piece appears once, never under two numbers (it confuses players mid-performance). |
 | `position` | int | Running order, 1..n, always dense; maintained by the server. |
-| `label` | text | The number players are called by, `^[1-9][0-9]{0,5}[a-z]?$`: `12`, or `12a` for a piece slipped in later. Stored lowercase. In a program it is always `position` as text. *(not yet built: today a single `index` int.)* |
+| `label` | text | The number players are called by, 1–999 with an optional letter, `^[1-9][0-9]{0,2}[a-z]?$`: `12`, or `12a` for a piece slipped in later. Stored lowercase. In a program it is always `position` as text. *(not yet built: today a single `index` int.)* |
 
 Audit fields, soft-deletable. Clients **display `label` and order by
 `position`**, whatever the collection's type. How the two are maintained is
@@ -1031,6 +1031,12 @@ The type of a collection decides what its numbers mean.
   its start onward then fall into it, and no number changes. When a section's
   next number would collide with the following section's start, the section
   is full: the choices are a gap, a letter label, or a Renumber.
+- **WebDAV pads numbers to three digits** (`007-radetzky-march`,
+  `012a-…`), in programs and standing collections alike, so that file
+  browsers that sort plainly still list the pieces in order. The width is
+  fixed, so a collection growing past 99 pieces never renames its folders.
+  That is why labels stop at 999. The console and the app show the label as
+  entered (`7`, `12a`).
 - **Standing positions follow the labels.** A standing collection's
   `position` is the labels' natural order (`12` < `12a` < `13`), recomputed
   on every write; it is never set directly.
