@@ -2050,15 +2050,11 @@ async fn undelete_tag(
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     // Fetch the tag (including soft-deleted) to verify org scope and gather
-    // audit fields. `tag::find_by_id` filters deleted rows, so we query directly.
-    let row = sqlx::query!(
-        r#"SELECT organization_id, name, kind FROM tag WHERE id = $1"#,
-        id,
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(AppError::Database)?
-    .ok_or(AppError::NotFound)?;
+    // audit fields.
+    let row = tag::find_by_id_including_deleted(&state.db, id)
+        .await
+        .map_err(AppError::Database)?
+        .ok_or(AppError::NotFound)?;
     if row.organization_id != org_id {
         return Err(AppError::NotFound);
     }

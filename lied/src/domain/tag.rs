@@ -127,6 +127,32 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Tag>, sqlx::Er
     Ok(row.map(Row::into_tag))
 }
 
+/// Look up a tag by id, including soft-deleted rows — used by undelete,
+/// which must find the very row [`find_by_id`] hides.
+pub async fn find_by_id_including_deleted(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<Tag>, sqlx::Error> {
+    let row = sqlx::query_as!(
+        Row,
+        r#"
+        SELECT
+            id, organization_id, name, kind,
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>",
+            created_by,
+            deleted_at as "deleted_at: DateTime<Utc>"
+        FROM tag
+        WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(Row::into_tag))
+}
+
 /// The soft-deleted tags of an organization, most-recently-deleted first —
 /// backs the admin console's "restore" list (tags have no detail page to reach
 /// undelete from, unlike arrangements/voices).
