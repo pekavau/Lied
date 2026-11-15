@@ -121,4 +121,3 @@ HTTP.
 the API, run `just openapi` and commit the result; `openapi_snapshot_is_current`
 fails until you do, and the diff is what reviewers read to see the contract
 change. Then `just check`.
-

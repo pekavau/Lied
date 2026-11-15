@@ -1,0 +1,2 @@
+# The committed /v1 contract is compared byte for byte (issue #75); keep LF everywhere.
+docs/openapi.json text eol=lf
