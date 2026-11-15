@@ -60,6 +60,10 @@ pub enum FileError {
     /// file's content (see [`undelete`]).
     #[error("a newer file has taken this file's storage slot")]
     Superseded,
+    /// The voice (or, for a full-score file, the arrangement's score) already
+    /// holds `limit` live files: `LIED_MAX_FILES_PER_VOICE` (#45).
+    #[error("this voice already holds the maximum of {limit} files")]
+    TooManyFiles { limit: u32 },
 }
 
 /// Map a MIME type to the coarse `format` routing key and the canonical file
@@ -243,9 +247,80 @@ fn map_write_error(err: sqlx::Error) -> FileError {
     FileError::Database(err)
 }
 
+/// Lock the bucket a file lives in (its voice, or for a full-score file,
+/// `voice_id = None`, its arrangement) and count the bucket's live files.
+///
+/// The lock makes "count, then add one" a single step per bucket, so two
+/// concurrent uploads cannot both pass the check at `limit - 1`. It is
+/// `FOR NO KEY UPDATE`, which the file insert's foreign-key check
+/// (`KEY SHARE`) does not conflict with. Soft-deleted rows do not count:
+/// every replace leaves one behind, and a much-revised voice must not run
+/// out of room.
+async fn lock_bucket_and_count_live(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    arrangement_id: Uuid,
+    voice_id: Option<Uuid>,
+) -> Result<i64, sqlx::Error> {
+    match voice_id {
+        Some(voice_id) => {
+            sqlx::query_scalar!(
+                r#"SELECT id FROM voice WHERE id = $1 FOR NO KEY UPDATE"#,
+                voice_id
+            )
+            .fetch_optional(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query_scalar!(
+                r#"SELECT id FROM arrangement WHERE id = $1 FOR NO KEY UPDATE"#,
+                arrangement_id
+            )
+            .fetch_optional(&mut **tx)
+            .await?;
+        }
+    }
+    sqlx::query_scalar!(
+        r#"
+        SELECT count(*) AS "count!" FROM file
+        WHERE arrangement_id = $1 AND voice_id IS NOT DISTINCT FROM $2
+          AND deleted_at IS NULL
+        "#,
+        arrangement_id,
+        voice_id,
+    )
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Refuse a write that would take a bucket past `max_files` live files.
+async fn check_room(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    arrangement_id: Uuid,
+    voice_id: Option<Uuid>,
+    max_files: u32,
+) -> Result<(), FileError> {
+    let live = lock_bucket_and_count_live(tx, arrangement_id, voice_id).await?;
+    if live >= i64::from(max_files) {
+        return Err(FileError::TooManyFiles { limit: max_files });
+    }
+    Ok(())
+}
+
 /// Insert a file row. Maps the unique-index violation (live duplicate
 /// `(arrangement, voice, name, format)`) to [`FileError::Duplicate`].
-pub async fn create(pool: &PgPool, id: Uuid, new: NewFile<'_>) -> Result<File, FileError> {
+///
+/// `max_files` is `LIED_MAX_FILES_PER_VOICE`: a voice that already holds
+/// that many live files refuses a new one with [`FileError::TooManyFiles`].
+/// An arrangement's full score is capped the same way. A [`replace`] is
+/// exempt, because it swaps one live file for another.
+pub async fn create(
+    pool: &PgPool,
+    id: Uuid,
+    new: NewFile<'_>,
+    max_files: u32,
+) -> Result<File, FileError> {
+    let mut tx = pool.begin().await?;
+    check_room(&mut tx, new.arrangement_id, new.voice_id, max_files).await?;
     let row = sqlx::query_as!(
         File,
         r#"
@@ -272,9 +347,10 @@ pub async fn create(pool: &PgPool, id: Uuid, new: NewFile<'_>) -> Result<File, F
         new.conversion_quality,
         new.created_by,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_write_error)?;
+    tx.commit().await?;
 
     Ok(row)
 }
@@ -560,7 +636,19 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 /// newer upload — the partial unique index rejects the restore, surfaced as
 /// [`FileError::Duplicate`] (the caller shows a "a current file already holds
 /// that name/format" message). Returns `false` if no soft-deleted row matched.
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
+///
+/// Restoring adds a live file, so it is capped like [`create`]: a full
+/// bucket refuses it with [`FileError::TooManyFiles`].
+pub async fn undelete(pool: &PgPool, id: Uuid, max_files: u32) -> Result<bool, FileError> {
+    let Some(target) = find_by_id_including_deleted(pool, id).await? else {
+        return Ok(false); // no such file
+    };
+    if target.deleted_at.is_none() {
+        return Ok(false); // already live
+    }
+    let mut tx = pool.begin().await?;
+    check_room(&mut tx, target.arrangement_id, target.voice_id, max_files).await?;
+
     // The object at the derived key belongs to whichever file was written to
     // that `(arrangement, voice, name, format)` slot most recently. If a newer
     // file (live or since-deleted) took the slot, restoring THIS older row
@@ -593,9 +681,10 @@ pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, FileError> {
         "#,
         id,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(map_write_error)?;
+    tx.commit().await?;
     if res.rows_affected() > 0 {
         return Ok(true);
     }

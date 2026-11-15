@@ -1161,9 +1161,18 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
                     "file.replace"
                 }
                 None => {
-                    file::create(&fs.state.db, new_id, new)
-                        .await
-                        .map_err(|_| FsError::GeneralFailure)?;
+                    file::create(
+                        &fs.state.db,
+                        new_id,
+                        new,
+                        fs.state.config.max_files_per_voice,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        // A full voice: 507, WebDAV's "no room here" (#45).
+                        file::FileError::TooManyFiles { .. } => FsError::InsufficientStorage,
+                        _ => FsError::GeneralFailure,
+                    })?;
                     "file.create"
                 }
             };

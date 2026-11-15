@@ -48,6 +48,9 @@ pub enum UploadError {
     ReplaceTargetGone,
     #[error("upload exceeds the maximum allowed size of {limit} bytes")]
     TooLarge { limit: u64 },
+    /// `LIED_MAX_FILES_PER_VOICE` reached (#45).
+    #[error("this voice already holds the maximum of {limit} files")]
+    TooManyFiles { limit: u32 },
     #[error("database error")]
     Db(#[from] sqlx::Error),
     #[error("storage error: {0}")]
@@ -61,6 +64,7 @@ fn map_file_error(err: file::FileError) -> UploadError {
             UploadError::ReplaceTargetGone
         }
         file::FileError::UnsupportedMime => UploadError::StoredMimeUnknown("unknown".to_string()),
+        file::FileError::TooManyFiles { limit } => UploadError::TooManyFiles { limit },
         file::FileError::Database(e) => UploadError::Db(e),
     }
 }
@@ -112,6 +116,7 @@ pub async fn store_upload(
             conversion_quality: None,
             created_by,
         },
+        state.config.max_files_per_voice,
     )
     .await
     .map_err(map_file_error)?;

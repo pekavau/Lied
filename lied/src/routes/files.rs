@@ -158,6 +158,10 @@ fn upload_error_to_app_error(err: file_service::UploadError) -> AppError {
         E::TooLarge { limit } => AppError::PayloadTooLarge(format!(
             "upload exceeds the maximum allowed size of {limit} bytes"
         )),
+        // A count, not a payload size: 409 (the voice's state), not 413.
+        E::TooManyFiles { limit } => AppError::Conflict(format!(
+            "this voice already holds the maximum of {limit} files; delete one or replace an existing file"
+        )),
         E::Db(e) => AppError::Database(e),
         E::Storage(message) => {
             AppError::Internal(anyhow::anyhow!("object storage error: {message}"))
@@ -272,6 +276,9 @@ async fn do_upload(
 /// carries a recognised `Content-Type` (see the format table in docs/design.md).
 /// The file is streamed directly to MinIO — server memory per upload is a
 /// fixed chunk buffer, not proportional to file size.
+///
+/// An arrangement whose full score already holds `LIED_MAX_FILES_PER_VOICE`
+/// live files refuses a new one with `409`; replace an existing file instead.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/files",
@@ -308,6 +315,9 @@ async fn upload_score_file(
 ///
 /// The request body must be `multipart/form-data` with a single part that
 /// carries a recognised `Content-Type`.
+///
+/// A voice that already holds `LIED_MAX_FILES_PER_VOICE` live files refuses a
+/// new one with `409`; replace an existing file instead.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",

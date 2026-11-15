@@ -3048,7 +3048,7 @@
           "files"
         ],
         "summary": "Upload a full-score file",
-        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type` (see the format table in docs/design.md).\nThe file is streamed directly to MinIO — server memory per upload is a\nfixed chunk buffer, not proportional to file size.",
+        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type` (see the format table in docs/design.md).\nThe file is streamed directly to MinIO — server memory per upload is a\nfixed chunk buffer, not proportional to file size.\n\nAn arrangement whose full score already holds `LIED_MAX_FILES_PER_VOICE`\nlive files refuses a new one with `409`; replace an existing file instead.",
         "operationId": "upload_score_file",
         "parameters": [
           {
@@ -5192,7 +5192,7 @@
           "files"
         ],
         "summary": "Upload a voice file",
-        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type`.",
+        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type`.\n\nA voice that already holds `LIED_MAX_FILES_PER_VOICE` live files refuses a\nnew one with `409`; replace an existing file instead.",
         "operationId": "upload_voice_file",
         "parameters": [
           {

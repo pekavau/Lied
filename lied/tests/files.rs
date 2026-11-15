@@ -38,6 +38,10 @@ struct Ctx {
 
 impl Ctx {
     async fn new(max_upload_bytes: u64) -> Self {
+        Self::build(max_upload_bytes, 50).await
+    }
+
+    async fn build(max_upload_bytes: u64, max_files_per_voice: u32) -> Self {
         // --- Postgres ---
         let pg = Postgres::default()
             .with_tag("16-alpine")
@@ -74,7 +78,7 @@ impl Ctx {
         let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
         let endpoint = format!("http://127.0.0.1:{minio_port}");
 
-        let config = test_config(endpoint, max_upload_bytes);
+        let config = test_config(endpoint, max_upload_bytes, max_files_per_voice);
         let state = test_state(pool.clone(), config);
 
         // Create the bucket the app will write to.
@@ -97,7 +101,7 @@ impl Ctx {
     }
 }
 
-fn test_config(s3_endpoint: String, max_upload_bytes: u64) -> AppConfig {
+fn test_config(s3_endpoint: String, max_upload_bytes: u64, max_files_per_voice: u32) -> AppConfig {
     AppConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url: Secret::from("postgres://unused/unused".to_string()),
@@ -110,7 +114,7 @@ fn test_config(s3_endpoint: String, max_upload_bytes: u64) -> AppConfig {
         jwt_lifetime_days: 30,
         max_upload_bytes,
         max_request_bytes: 256 * 1024,
-        max_files_per_voice: 50,
+        max_files_per_voice,
         max_arrangements_per_org: None,
         max_page_size: 200,
         default_page_size: 50,
@@ -673,4 +677,104 @@ async fn an_unsatisfiable_range_returns_416() {
         .unwrap();
     let resp = ctx.app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+/// `LIED_MAX_FILES_PER_VOICE` on `/v1` (#45), at a low configured ceiling.
+/// The full score is capped like a voice; each bucket counts on its own; a
+/// replace at the ceiling succeeds; a soft-deleted file frees its place.
+#[tokio::test]
+async fn a_full_score_or_voice_refuses_new_files_with_409() {
+    let ctx = Ctx::build(200 * 1024 * 1024, 2).await;
+    let (org_id, token) = seed_org_archivist(&ctx.state, "Org", "arch").await;
+    let arr_id = seed_arrangement(&ctx.state, org_id, "Suite").await;
+    let voice_id = seed_voice(&ctx.state, arr_id, "Flute 1").await;
+    let score = format!("/v1/orgs/{org_id}/arrangements/{arr_id}/files");
+    let voice = format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}/files");
+    let send = |request: axum::http::Request<axum::body::Body>| {
+        let app = ctx.app.clone();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+    let upload =
+        |uri: &str, name: &str| multipart_upload(uri, &token, name, "application/pdf", PDF);
+
+    let first = send(upload(&score, "a.pdf")).await;
+    assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+    let a = body_json(first).await["id"].as_str().unwrap().to_string();
+    let second = send(upload(&score, "b.pdf")).await;
+    assert_eq!(second.status(), axum::http::StatusCode::CREATED);
+    let b = body_json(second).await["id"].as_str().unwrap().to_string();
+
+    let refused = send(upload(&score, "c.pdf")).await;
+    assert_eq!(refused.status(), axum::http::StatusCode::CONFLICT);
+    let problem = body_json(refused).await;
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .contains("maximum of 2 files"),
+        "{problem}"
+    );
+    assert_eq!(audit_count(&ctx.pool, "file.create").await, 2);
+
+    // Another bucket is not affected by the full score.
+    let in_voice = send(upload(&voice, "part.pdf")).await;
+    assert_eq!(in_voice.status(), axum::http::StatusCode::CREATED);
+
+    // A replace at the ceiling is an identity swap and goes through.
+    let (mut parts, body) = upload(&format!("{score}/{a}"), "a.pdf").into_parts();
+    parts.method = axum::http::Method::PUT;
+    let replaced = send(axum::http::Request::from_parts(parts, body)).await;
+    assert_eq!(replaced.status(), axum::http::StatusCode::OK);
+
+    // Soft-deleting b frees its place.
+    let delete = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(format!("{score}/{b}"))
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        send(delete).await.status(),
+        axum::http::StatusCode::NO_CONTENT
+    );
+    let after = send(upload(&score, "c.pdf")).await;
+    assert_eq!(after.status(), axum::http::StatusCode::CREATED);
+}
+
+/// Concurrent creates cannot overshoot the ceiling: the count and the insert
+/// are one step per voice (#45).
+#[tokio::test]
+async fn concurrent_creates_stop_at_the_ceiling() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, _) = seed_org_archivist(&ctx.state, "Org", "arch").await;
+    let arr_id = seed_arrangement(&ctx.state, org_id, "Suite").await;
+    let voice_id = seed_voice(&ctx.state, arr_id, "Flute 1").await;
+    let names: Vec<String> = (0..6).map(|n| format!("part-{n}")).collect();
+    let creates = names.iter().map(|name| {
+        lied::domain::file::create(
+            &ctx.pool,
+            Uuid::now_v7(),
+            lied::domain::file::NewFile {
+                arrangement_id: arr_id,
+                voice_id: Some(voice_id),
+                name,
+                format: "pdf",
+                mime_type: "application/pdf",
+                derived_from_file_id: None,
+                conversion_quality: None,
+                created_by: None,
+            },
+            2,
+        )
+    });
+    let results = futures_util::future::join_all(creates).await;
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        2,
+        "{results:?}"
+    );
+    assert!(results.iter().all(|r| matches!(
+        r,
+        Ok(_) | Err(lied::domain::file::FileError::TooManyFiles { limit: 2 })
+    )));
 }
