@@ -17,10 +17,10 @@ change fits the current phase before you build it.
 git clone https://github.com/pekavau/Lied.git
 cd Lied
 cp .env.example .env
-just dev          # Postgres + MinIO + app with hot reload
+just dev          # Postgres + RustFS + app with hot reload
 ```
 
-The integration tests spin up ephemeral Postgres + MinIO with
+The integration tests spin up ephemeral Postgres + RustFS with
 [`testcontainers`](https://github.com/testcontainers/testcontainers-rs), so a
 running Docker daemon is required to run the full suite. For compile-time SQL
 checking you'll want a database reachable at `DATABASE_URL`

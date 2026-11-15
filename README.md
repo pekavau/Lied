@@ -79,12 +79,13 @@ Lied (Rust + axum)              ← serves every interface from one binary
     └── REST API + admin UI     ← music-aware: search, collections, part
         │                         assignment, annotations
         ├── PostgreSQL          ← structured metadata + audit log
-        └── MinIO (S3-compatible) ← file storage
+        └── RustFS (S3-compatible) ← file storage
 ```
 
 WebDAV and REST are complementary: WebDAV is a filesystem view of the files;
-REST is the music-aware layer on top. MinIO speaks the S3 API, so it can be
-swapped for any S3-compatible store without code changes.
+REST is the music-aware layer on top. The compose stack ships RustFS; Lied
+only speaks plain S3 to it, so any S3-compatible store with bucket
+versioning works without code changes.
 
 The full design rationale — data model, authorization, non-functional posture,
 and the phased delivery plan — lives in [`docs/design.md`](docs/design.md), which is the
@@ -94,7 +95,7 @@ change a `/v1` endpoint is in [`docs/api-guidelines.md`](docs/api-guidelines.md)
 ### Tech stack
 
 Rust · [axum](https://github.com/tokio-rs/axum) · [sqlx](https://github.com/launchbadge/sqlx)
-(compile-time-checked SQL, no ORM) · PostgreSQL · MinIO ·
+(compile-time-checked SQL, no ORM) · PostgreSQL · [RustFS](https://rustfs.com) ·
 [dav-server](https://crates.io/crates/dav-server) · HTMX + [maud](https://maud.lang.rs/)
 for the admin UI · [utoipa](https://github.com/juhaku/utoipa) for OpenAPI ·
 packaged as a distroless Docker image.
@@ -110,7 +111,7 @@ cp .env.example .env        # adjust secrets before any non-local use
 docker compose up
 ```
 
-This starts Postgres, MinIO, and the app; on startup the app applies any
+This starts Postgres, RustFS (object storage), and the app; on startup the app applies any
 pending schema migrations and creates its storage bucket if it is missing.
 Then create the first system administrator (you'll be prompted for a password if you
 omit `--password`):
@@ -135,7 +136,7 @@ Once it's up:
 | OpenAPI spec | `http://localhost:8080/openapi.json` |
 | WebDAV (org tree) | `http://localhost:8080/orgs/<org-slug>/…` |
 | WebDAV (personal) | `http://localhost:8080/users/<user-slug>/library/` |
-| MinIO console | `http://localhost:9001` |
+| RustFS console | `http://localhost:9001` |
 
 Musicians authenticate to WebDAV with a per-device **app password**, which
 any logged-in user creates on the admin UI's **App passwords** page
@@ -174,9 +175,10 @@ All configuration is via environment variables (each secret `X` also accepts
 |---|---|---|
 | `LIED_BIND_ADDR` | `0.0.0.0:8080` | Listen address |
 | `LIED_DATABASE_URL` | — | Postgres connection string |
-| `LIED_S3_ENDPOINT` | `http://localhost:9000` | S3-compatible endpoint (MinIO) |
+| `LIED_S3_ENDPOINT` | `http://localhost:9000` | S3-compatible endpoint (RustFS in the compose stack) |
 | `LIED_S3_BUCKET` | `lied` | Bucket for stored files; created on startup if missing |
-| `LIED_S3_ACCESS_KEY_ID` / `LIED_S3_SECRET_ACCESS_KEY` | — | Object-storage credentials |
+| `LIED_S3_ACCESS_KEY_ID` / `LIED_S3_SECRET_ACCESS_KEY` | `rustfsadmin` | Object-storage credentials; change them for any real deployment |
+| `LIED_S3_VERSION_RETENTION_DAYS` | `30` | Days an overwritten or deleted file's previous content is kept (`0`: forever) |
 | `LIED_JWT_SIGNING_KEY` | — | HS256 secret for bearer tokens (use `_FILE`/`_CMD` in prod) |
 | `LIED_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
 | `LIED_MAX_UPLOAD_BYTES` | `200 MB` | Single-file upload ceiling |
@@ -198,6 +200,13 @@ S3-compatible store.
   before the server listens (safe with several instances starting at once),
   and the bucket is created if missing. An instance that finds a migration it
   doesn't know — an older image against a newer database — refuses to start.
+- **Bucket versioning** is switched on at startup, so overwriting or deleting
+  a file keeps its previous content. A lifecycle rule removes those old
+  versions after `LIED_S3_VERSION_RETENTION_DAYS` (30 by default; `0` keeps
+  them forever). **Lied owns the bucket's lifecycle configuration**: it is
+  rewritten on every start, so a rule you add by hand is replaced. Recovering
+  an old version is an operator task for now (any S3 client that lists object
+  versions); there is no history screen yet.
 - **Secrets** (`LIED_DATABASE_URL`, `LIED_JWT_SIGNING_KEY`, the S3 keys) should
   not sit in plain environment variables: each also reads `<NAME>_FILE` (a
   path, the Docker/Kubernetes secrets convention) or `<NAME>_CMD` (a command
@@ -218,14 +227,25 @@ would leave silent dead bytes.
 
 With the compose stack, `just backup` does both into `./backup/`:
 `postgres-<timestamp>.dump` (`pg_dump --format=custom`) and
-`minio-<timestamp>/` (`mc mirror` of the MinIO server). Run it from cron. To restore,
-stop the app, then:
+`storage-<timestamp>/` (an `rclone copy` of the bucket). Run it from cron.
+The storage copy holds the **current** version of each file only, not the
+old versions bucket versioning keeps. To restore, stop the app, then:
 
 ```bash
 docker compose exec -T postgres pg_restore --clean --if-exists \
   -U lied -d lied < backup/postgres-<timestamp>.dump
-# then mirror backup/minio-<timestamp>/ back into the bucket with `mc mirror`
+docker run --rm --network lied_default \
+  -e RCLONE_CONFIG_LIED_TYPE=s3 -e RCLONE_CONFIG_LIED_PROVIDER=Other \
+  -e RCLONE_CONFIG_LIED_ENDPOINT=http://storage:9000 \
+  -e RCLONE_CONFIG_LIED_ACCESS_KEY_ID=rustfsadmin \
+  -e RCLONE_CONFIG_LIED_SECRET_ACCESS_KEY=rustfsadmin \
+  -e RCLONE_CONFIG_LIED_FORCE_PATH_STYLE=true \
+  -v "$(pwd)/backup/storage-<timestamp>:/backup:ro" \
+  rclone/rclone:1.76.0 copy /backup lied:lied
 ```
+
+(Use your own credentials and bucket name in place of `rustfsadmin` and
+`lied`.)
 
 Back up the `.env` / secrets files too. Sessions and rate-limit state are
 not worth keeping: after a restore users log in again. This is best effort,
@@ -246,7 +266,7 @@ just prepare   # refresh the .sqlx offline query cache after SQL changes
 
 Every pull request must pass the CI gates: `fmt --check`, `clippy -D warnings`,
 `test --all`, `cargo deny check`, `sqlx prepare --check`, and a Docker image
-build. Integration tests run against ephemeral Postgres + MinIO via
+build. Integration tests run against ephemeral Postgres + RustFS via
 `testcontainers`, so a working Docker daemon is required to run the full suite.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow and the quality bar.

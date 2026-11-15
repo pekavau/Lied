@@ -228,7 +228,7 @@ flowchart LR
     admin --> domain
     v1 --> domain
     domain --> pg[("PostgreSQL<br>metadata, audit log")]
-    domain --> s3[("MinIO / any S3<br>file contents")]
+    domain --> s3[("RustFS / any S3<br>file contents")]
 ```
 
 WebDAV is the open, filesystem-shaped way in; the console and `/v1` carry the
@@ -239,7 +239,7 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 - WebDAV and REST are complementary, not competing. WebDAV is a filesystem view of the files; REST is the music-aware layer on top. Both can be served from the same backend simultaneously.
 - WebDAV gives musicians immediate access via OS-native mounting or any compatible app, with no lock-in to this project.
 - REST enables the features WebDAV has no concept of: metadata search, collection management, part distribution, annotation storage, conversion triggering.
-- MinIO is S3-compatible, meaning every language ecosystem has mature client libraries for it, and it can be swapped for any S3-compatible service without changing application code.
+- Object storage is spoken to as plain S3, so the store we ship (RustFS, see *Tech stack*) can be swapped for any S3-compatible service with bucket versioning without changing application code.
 
 ### Auth & access
 
@@ -1220,7 +1220,7 @@ Attaching and detaching are real inserts and deletes.
 - **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `VoiceInstrument.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (a voice's instruments ∩ `Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument *(not yet built)* requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
 
 #### Lifecycle, existence, audit
-- **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) *(not yet built)* removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints *(not yet built)* but never surfaced via WebDAV. File undelete is *(console only)*; the other soft-deleted entities have a `/v1` `…/undelete`.
+- **DB is source of truth for existence; bucket versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the stored object remains. Undelete clears `deleted_at` — no storage operation. **Versioning is on** (#59): startup enables it on the bucket, so overwriting an object (a replaced part, an app saving over a personal annotation) or deleting one keeps the previous content as a noncurrent version, and a lifecycle rule expires noncurrent versions `LIED_S3_VERSION_RETENTION_DAYS` (default 30; `0` keeps them forever) after they were superseded. Lied owns the bucket's lifecycle configuration and rewrites it on every start. Nothing in Lied reads the versions yet: `File` rows do not record their object version id, so recovery is an operator task with an S3 client; recording the version and a history/restore endpoint and console view are #117. Hard delete (admin-only) *(not yet built)* removes both the DB row and all object versions. Version history is never surfaced via WebDAV. File undelete is *(console only)*; the other soft-deleted entities have a `/v1` `…/undelete`.
 - **Soft delete** via `deleted_at` on Arrangement, Voice, File, Collection, CollectionItem, Tag.
 - **Soft-delete cascade: hide-with-references.** A soft-delete sets `deleted_at` on the targeted entity only — never on its descendants. Queries that join parent → child filter `WHERE parent.deleted_at IS NULL AND child.deleted_at IS NULL`, so a soft-deleted parent makes its subtree invisible *through it* without changing the children's own state. Undelete just clears the parent's `deleted_at` and the subtree reappears automatically. CollectionItems / PartAssignments that reference a soft-deleted target remain in the collection but render as "[removed]" with the slug shown — broken references are surfaced, not silently dropped. Soft-cascade and block-on-references were both rejected: soft-cascade makes undelete ambiguous (was the child already deleted before, or only by cascade?); block-on-references creates bad UX ("can't delete until you remove from 7 collections").
 - **Audit fields.** `created_at`, `updated_at`, `created_by` (user FK, nullable for system) on Arrangement, Voice, File, Collection, CollectionItem, GlobalAnnotation.
@@ -1327,9 +1327,9 @@ Anything that stands in for "external system that could be swapped" (session sto
 - **Configurable limits.** Whenever a limit is imposed (max upload size, rate-limit window, per-org storage cap, conversion job timeout, etc.) it MUST be documented and configurable. Hardcoded limits are not acceptable.
 - **Phase 1 backup posture (minimum bar).** The README documents:
   - **Postgres:** `pg_dump --format=custom` to a host-mounted volume on a cron schedule; `pg_restore --clean` for recovery.
-  - **MinIO:** `mc mirror` to a second MinIO instance or host directory on the same schedule; reverse mirror for recovery.
-  - **Ordering:** dump **Postgres first, then MinIO**; restore in the same order. The DB is the authority for existence, so the safe failure mode is a DB reference to a not-yet-mirrored file (a detectable 404) rather than a MinIO object with no DB row (dead bytes, non-corrupting). This is best-effort, not a consistent snapshot — acceptable at this posture; true snapshot coordination is a later runbook item (deferred).
-  - **Required volume mounts** in `docker-compose.yml`: Postgres data dir, MinIO data dir, backup target dir, all host-mounted.
+  - **Object storage:** `rclone copy` of the bucket to a host directory on the same schedule (`just backup`, pinned `rclone/rclone` image); copying back for recovery. A backup holds the **current** version of each object only, not the noncurrent versions bucket versioning keeps: versioning covers mistakes, the backup covers losing the disk.
+  - **Ordering:** dump **Postgres first, then object storage**; restore in the same order. The DB is the authority for existence, so the safe failure mode is a DB reference to a not-yet-copied file (a detectable 404) rather than an object with no DB row (dead bytes, non-corrupting). This is best-effort, not a consistent snapshot — acceptable at this posture; true snapshot coordination is a later runbook item (deferred).
+  - **Required volume mounts** in `docker-compose.yml`: Postgres data dir, object-storage data dir, backup target dir, all host-mounted.
   - **Back up:** those three volumes plus the `.env` / secrets files.
   - **OK to lose on restore:** in-memory rate-limit state (acceptable), session cookies (users re-login).
   - A `just backup` target wraps the two commands against the docker-compose volumes.
@@ -1342,6 +1342,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 |---|---|---|---|
 | Max single file upload | `LIED_MAX_UPLOAD_BYTES` | 200 MB | Covers 99.9th-percentile orchestral PDFs; anything larger is almost always a mistake or needs splitting |
 | Max non-upload request body | `LIED_MAX_REQUEST_BYTES` | 256 KB | JSON / form bodies; prevents bomb attacks |
+| Old file versions kept | `LIED_S3_VERSION_RETENTION_DAYS` | 30 days | Bucket versioning keeps an overwritten or deleted object's previous content; a lifecycle rule expires it after this many days. `0` keeps old versions forever. Lied owns the bucket's lifecycle configuration. |
 | Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached. Counts live files per voice, and per arrangement for full-score files. A new upload or a restore into a full one is refused: `409` on `/v1` and in the console, `507 Insufficient Storage` over WebDAV, where a new file is refused as the PUT opens, before its body is sent. Replacing a file is exempt, and soft-deleted files do not count. |
 | Max arrangements per org | `LIED_MAX_ARRANGEMENTS_PER_ORG` | unset (no limit) | Reserved for SaaS-mode quotas later |
 | Max list page size | `LIED_MAX_PAGE_SIZE` | 200 (default 50) | Offset/limit pagination ceiling (see HTTP & REST API conventions) |
@@ -1397,7 +1398,8 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 - **`sqlx`** (`postgres` feature) — async DB driver with compile-time-checked SQL against a real database. SQL is hand-written; no ORM. **Offline mode**: `.sqlx/` (the prepared-query cache produced by `cargo sqlx prepare`) is committed to the repo; `SQLX_OFFLINE=true` is set in CI and in the Docker builder stage so builds are hermetic and need no DB. A CI gate runs `cargo sqlx prepare --check` against the dev DB to catch out-of-sync caches.
 - **`sqlx-cli`** — migrations as plain `.sql` files in `/migrations`, embedded in the binary at build time (`lied::state::MIGRATOR`; `lied/build.rs` rebuilds when one is added) and **applied on startup** by `AppState::connect`, before the server listens or `create-admin` runs (issue #87). sqlx's advisory lock makes concurrent starts safe; a database carrying a migration the binary doesn't know, or an edited one, fails startup. `just migrate` (sqlx-cli) remains for development.
 - **`dav-server`** — WebDAV crate; mounted under `/orgs/...` and `/users/<user>/library/...`.
-- **`aws-sdk-s3`** — official AWS SDK; speaks MinIO natively. Startup creates `LIED_S3_BUCKET` if `HeadBucket` says it is missing (issue #91) and leaves an existing one alone; storage unreachable at boot is logged, not fatal (`/readyz` reports it).
+- **`aws-sdk-s3`** — official AWS SDK; speaks to any S3-compatible store. Startup creates `LIED_S3_BUCKET` if `HeadBucket` says it is missing (issue #91) and leaves an existing one alone, then turns versioning on and sets the version-retention lifecycle rule (#59); storage unreachable at boot is logged, not fatal (`/readyz` reports it).
+- **RustFS** — the object store the compose stack and the integration tests run, pinned to an exact `1.0.x` tag (#59). Chosen for: Apache-2.0, bucket versioning and lifecycle rules (both checked by `startup_turns_versioning_on_and_sets_the_version_retention`), pinnable releases, and a single-container setup. It replaced a Chainguard build of MinIO that could not be pinned after the upstream MinIO images were withdrawn. Silo (the pgsty fork of MinIO, AGPL-3.0) was the alternative: a longer-proven storage engine but a single-organisation fork; with no installs to migrate, RustFS was preferred. Because Lied speaks plain S3, switching later means copying the bucket once and changing the image.
 - **`argon2`** — password hashing for local accounts.
 - **`tower-sessions`** — session cookies for the web client. Backend: **Postgres-backed store** (`tower-sessions-sqlx-store`); the `sessions` table is added via our `/migrations` directory. Chosen over in-memory because the NFR section says scaling must not be precluded; chosen over Redis to avoid a second service. Each authenticated request reads one row — negligible at our scale; if it ever becomes hot, swap to a Redis-backed store (see Infrastructure pluggability rule in NFR posture).
 - **`jsonwebtoken`** — bearer tokens for programmatic REST clients. **Algorithm: HS256** (symmetric); Lied is the only issuer and verifier, so asymmetric is wasted complexity. The signing secret is 32 random bytes managed via the secrets layer with the hot-rotation flow already specced (new key written, old key honored for a grace window). Every token carries a **`kid` header** naming the signing key; during the rotation grace window both keys live in the verifier's keyring and the verifier selects by `kid` rather than trial-verifying against each (which would be wasteful and ambiguous in logs). New tokens are signed with the newest key. Token lifetime: **30 days, configurable.** Claims: `sub` (user id), `org` (active org id, nullable for system-admin operations), `iat`, `exp`, `jti` (id for future revocation listing). If federation ever needs external verification, switching to ES256 is a contained migration (accept both during cutover, retire HS256).
@@ -1418,11 +1420,11 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 
 ### Build / packaging
 - **Multi-stage `Dockerfile`** — builder runs `cargo build --release`; final image is `gcr.io/distroless/cc-debian12` (~20MB, distro-agnostic).
-- **`docker-compose.yml`** for dev: Postgres + MinIO + the app, with hot reload via `cargo watch`.
+- **`docker-compose.yml`** for dev: Postgres + RustFS (service `storage`) + the app, with hot reload via `cargo watch`.
 
 ### Testing
 - **`cargo test`** native runner.
-- **`testcontainers`** for ephemeral Postgres + MinIO in integration tests; no fixture pollution between tests.
+- **`testcontainers`** for ephemeral Postgres + RustFS in integration tests (the pinned image is in `lied/tests/common`); no fixture pollution between tests.
 - **Snapshots:** the `/v1` contract is pinned by the committed `docs/openapi.json` (`openapi_snapshot_is_current`). `insta` is a dev-dependency for response-shape snapshots, but no test uses it yet.
 
 ### Deferred (see Phase cuts)
