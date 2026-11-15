@@ -10,12 +10,14 @@
 //! `SameSite=Lax` on the session cookie is a backstop, not the primary
 //! defense, per CLAUDE.md.
 //!
-//! The middleware is mounted only on the `/admin` tree. `/v1` enforces the
-//! same token through [`verify_header`], called where the auth path is
+//! [`csrf_middleware`] is mounted only on the `/admin` tree. `/v1` enforces
+//! the same token through [`verify_header`], called where the auth path is
 //! actually known: `BearerOrSession` when it resolves the user from the
-//! session cookie, and `POST /v1/tokens` when it mints from a session
-//! (issue #72). Bearer-token requests are exempt (not cookie-auth, so not
-//! CSRF-able).
+//! session cookie, and the `SessionCsrf` guard on `POST /v1/tokens`
+//! (issue #72); [`v1_csrf_cookie_middleware`] hands `/v1` cookie clients the
+//! readable cookie. Bearer-token requests are exempt (not cookie-auth, so not
+//! CSRF-able). Both trees share [`is_state_changing`] and one constant-time
+//! token comparison.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -62,9 +64,11 @@ pub async fn ensure_token(session: &Session) -> Result<String, tower_sessions::s
     Ok(token)
 }
 
-/// Whether `method` changes state, so a cookie-authenticated `/v1` request
-/// using it must carry the CSRF token. Everything except `GET`/`HEAD`/
-/// `OPTIONS`/`TRACE` counts, so an unusual method cannot pass as "safe".
+/// Whether `method` changes state, so a cookie-authenticated request using
+/// it must carry the CSRF token — in both the `/admin` and the `/v1` tree.
+/// Only `GET`/`HEAD`/`OPTIONS`/`TRACE` are safe; every other method,
+/// including ones nobody routes (`PROPPATCH`, `FOO`), counts, so an unusual
+/// method cannot pass as "safe".
 pub fn is_state_changing(method: &Method) -> bool {
     !matches!(
         *method,
@@ -72,23 +76,79 @@ pub fn is_state_changing(method: &Method) -> bool {
     )
 }
 
+/// Whether a presented token equals the session's, compared in constant
+/// time so response timing reveals nothing about how much of a guess was
+/// right. Every carrier in both trees (header, form field, query) goes
+/// through here.
+fn token_matches(expected: &str, presented: Option<&str>) -> bool {
+    use subtle::ConstantTimeEq;
+    presented.is_some_and(|presented| bool::from(expected.as_bytes().ct_eq(presented.as_bytes())))
+}
+
+/// Whether the `HX-CSRF` header carries the session's token — the one
+/// carrier both trees accept.
+fn header_matches(expected: &str, headers: &HeaderMap) -> bool {
+    token_matches(
+        expected,
+        headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok()),
+    )
+}
+
 /// The `/v1` half of the double-submit check (issue #72): the `HX-CSRF`
 /// header must equal the token stored in `session`. Only the header is
 /// accepted — `/v1` is a JSON API, so there is no form field to read, and
 /// the URL-borne token the admin multipart forms use is deliberately not
-/// offered. A session with no token established fails too; the client reads
-/// the token from the `lied_csrf` cookie the console sets.
+/// offered. A session with no token established fails too; the client gets
+/// the token from the `lied_csrf` cookie, which [`v1_csrf_cookie_middleware`]
+/// sets on any cookie-authenticated `/v1` response.
 pub async fn verify_header(session: &Session, headers: &HeaderMap) -> Result<(), AppError> {
     let expected = session
         .get::<String>(CSRF_SESSION_KEY)
         .await
         .map_err(|error| AppError::Internal(anyhow::anyhow!("reading the CSRF token: {error}")))?;
-    let presented = headers.get(CSRF_HEADER_NAME).and_then(|v| v.to_str().ok());
-    match (expected, presented) {
-        (Some(expected), Some(presented)) if expected == presented => Ok(()),
+    match expected {
+        Some(expected) if header_matches(&expected, headers) => Ok(()),
         _ => {
             tracing::warn!("CSRF check failed on a cookie-authenticated /v1 write");
             Err(AppError::CsrfTokenInvalid)
+        }
+    }
+}
+
+/// `/v1` middleware handing a cookie client its CSRF token: on a request
+/// that is authenticated by a logged-in session (no `Authorization` header),
+/// make sure the session has a token and, unless the request already
+/// presents that very token in its `lied_csrf` cookie, set the cookie on the
+/// response. A client that logged in without ever loading an `/admin` page
+/// therefore needs one `/v1` request (a GET will do) before its first write.
+///
+/// It enforces nothing — the check is in `BearerOrSession`, where the auth
+/// path is decided — and a session-store failure here only means no cookie
+/// is set; the handler's own response stands.
+pub async fn v1_csrf_cookie_middleware(
+    State(state): State<AppState>,
+    session: Session,
+    request: Request,
+    next: Next,
+) -> Response {
+    let cookie_authenticated = !request.headers().contains_key(header::AUTHORIZATION)
+        && matches!(
+            crate::auth::session::current_user_id(&session).await,
+            Ok(Some(_))
+        );
+    let presented = presented_csrf_cookie(request.headers());
+    let response = next.run(request).await;
+    if !cookie_authenticated {
+        return response;
+    }
+    match ensure_token(&session).await {
+        Ok(token) if presented.as_deref() != Some(token.as_str()) => {
+            attach_csrf_cookie(response, &token, state.config.secure_cookies)
+        }
+        Ok(_) => response,
+        Err(error) => {
+            tracing::error!(%error, "failed to ensure CSRF token for a /v1 session");
+            response
         }
     }
 }
@@ -105,11 +165,12 @@ pub async fn verify_header(session: &Session, headers: &HeaderMap) -> Result<(),
 /// switches these to HTMX-driven requests).
 const CSRF_EXEMPT_PATHS: &[&str] = &["/login", "/logout"];
 
-/// Axum middleware: for state-changing methods (`POST`/`PUT`/`PATCH`/
-/// `DELETE`), require the `HX-CSRF` request header to match the session's
-/// CSRF token. Mismatched or missing → 403. For safe methods
-/// (`GET`/`HEAD`/`OPTIONS`) the request passes through, and — unless the
-/// client is already presenting one — the response carries the readable
+/// Axum middleware: for state-changing methods (see [`is_state_changing`]:
+/// anything but `GET`/`HEAD`/`OPTIONS`/`TRACE`), require the session's CSRF
+/// token in the `HX-CSRF` header, a urlencoded `csrf_token` field, or — for
+/// multipart bodies — the `csrf` query parameter. Mismatched or missing →
+/// 403. For safe methods the request passes through, and — unless the
+/// client is already presenting the current token — the response carries the readable
 /// `lied_csrf` cookie (the second half of the double-submit pair), so a
 /// later HTMX request can echo it back in `HX-CSRF`. Without this the
 /// session would hold a token the client can never read.
@@ -119,12 +180,10 @@ pub async fn csrf_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let is_state_changing = matches!(
-        request.method().as_str(),
-        "POST" | "PUT" | "PATCH" | "DELETE"
-    ) && !CSRF_EXEMPT_PATHS.contains(&request.uri().path());
+    let needs_token =
+        is_state_changing(request.method()) && !CSRF_EXEMPT_PATHS.contains(&request.uri().path());
 
-    if is_state_changing {
+    if needs_token {
         let expected = match session.get::<String>(CSRF_SESSION_KEY).await {
             Ok(Some(token)) => token,
             Ok(None) => {
@@ -142,12 +201,7 @@ pub async fn csrf_middleware(
         //      body — the server-rendered admin `<form>`s. (b) is JS-free, so
         //      it works whether or not any client-side script runs (issue #15:
         //      the script-based header was never sent in practice).
-        let header_ok = request
-            .headers()
-            .get(CSRF_HEADER_NAME)
-            .and_then(|v| v.to_str().ok())
-            == Some(expected.as_str());
-        if header_ok {
+        if header_matches(&expected, request.headers()) {
             return next.run(request).await;
         }
 
@@ -165,8 +219,7 @@ pub async fn csrf_middleware(
                     return csrf_rejection("request body unreadable or too large for CSRF check");
                 }
             };
-            let field_ok =
-                form_field(&bytes, CSRF_FORM_FIELD).as_deref() == Some(expected.as_str());
+            let field_ok = token_matches(&expected, form_field(&bytes, CSRF_FORM_FIELD).as_deref());
             let request = Request::from_parts(parts, Body::from(bytes));
             if field_ok {
                 return next.run(request).await;
@@ -184,12 +237,14 @@ pub async fn csrf_middleware(
         // carrier (it lands in history and, but for the redaction in
         // `routes::sanitized_uri`, in logs).
         if is_multipart(&request) {
-            let query_ok = request
-                .uri()
-                .query()
-                .and_then(|q| form_field(q.as_bytes(), CSRF_QUERY_PARAM))
-                .as_deref()
-                == Some(expected.as_str());
+            let query_ok = token_matches(
+                &expected,
+                request
+                    .uri()
+                    .query()
+                    .and_then(|q| form_field(q.as_bytes(), CSRF_QUERY_PARAM))
+                    .as_deref(),
+            );
             if query_ok {
                 return next.run(request).await;
             }
@@ -202,8 +257,9 @@ pub async fn csrf_middleware(
 
     // Safe method: make sure the session carries a token, then hand the
     // client the readable cookie half (only when it isn't already presenting
-    // one, to avoid a redundant `Set-Cookie` on every request).
-    let already_presented = request_carries_csrf_cookie(&request);
+    // this very token, to avoid a redundant `Set-Cookie` on every request
+    // while still replacing a stale cookie left over from an older session).
+    let presented = presented_csrf_cookie(request.headers());
     let token = match ensure_token(&session).await {
         Ok(token) => token,
         Err(error) => {
@@ -213,24 +269,23 @@ pub async fn csrf_middleware(
     };
 
     let response = next.run(request).await;
-    if already_presented {
+    if presented.as_deref() == Some(token.as_str()) {
         response
     } else {
         attach_csrf_cookie(response, &token, state.config.secure_cookies)
     }
 }
 
-/// Whether the incoming request already carries the readable `lied_csrf`
-/// cookie, so the middleware can skip re-issuing it on every safe request.
-fn request_carries_csrf_cookie(request: &Request) -> bool {
+/// The value of the readable `lied_csrf` cookie the request carries, if any,
+/// so the middlewares can skip re-issuing a cookie the client already has.
+fn presented_csrf_cookie(headers: &HeaderMap) -> Option<String> {
     let needle = format!("{CSRF_COOKIE_NAME}=");
-    request
-        .headers()
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|raw| raw.split(';'))
-        .any(|pair| pair.trim().starts_with(&needle))
+        .find_map(|pair| pair.trim().strip_prefix(&needle).map(str::to_string))
 }
 
 /// Whether the request body is an `application/x-www-form-urlencoded` form

@@ -1269,3 +1269,240 @@ async fn minting_a_token_from_the_cookie_requires_the_csrf_header() {
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
+
+/// A request to `/v1` with an arbitrary `Authorization` header value.
+fn v1_request_with_authorization(
+    uri: &str,
+    cookie: &str,
+    authorization: &str,
+    body: &str,
+) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::COOKIE, cookie)
+        .header(axum::http::header::AUTHORIZATION, authorization)
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// RFC 7235: the auth scheme is case-insensitive, so `bearer` is a bearer
+/// credential and exempt from CSRF. Any other scheme is not ours and is a
+/// 401 — never a silent fall-back to the cookie riding along with it.
+#[tokio::test]
+async fn authorization_scheme_is_case_insensitive_and_other_schemes_are_refused() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "ola", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, _csrf) = browser_login(&app, "ola", "hunter2hunter2").await;
+
+    let config = test_config();
+    let keyring = auth::jwt::Keyring::from_single_key(
+        config.jwt_signing_key.expose(),
+        config.jwt_lifetime_days,
+    );
+    let (token, _claims) = keyring.mint(admin.id, None).expect("mint token");
+
+    for scheme in ["bearer", "BEARER", "BeArEr"] {
+        let response = app
+            .clone()
+            .oneshot(v1_request_with_authorization(
+                "/v1/app-passwords",
+                &cookie,
+                &format!("{scheme} {token}"),
+                &format!(r#"{{"name":"{scheme}"}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CREATED,
+            "scheme {scheme:?} is a bearer credential"
+        );
+    }
+
+    for authorization in ["Basic b2xhOmh1bnRlcjI=", "Bearer", "garbage"] {
+        let response = app
+            .clone()
+            .oneshot(v1_request_with_authorization(
+                "/v1/app-passwords",
+                &cookie,
+                authorization,
+                r#"{"name":"nope"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "Authorization {authorization:?} must not fall back to the cookie"
+        );
+    }
+    assert_eq!(app_password_count(&db.pool).await, 3);
+}
+
+/// `/admin` uses the same method rule as `/v1`: a method outside
+/// GET/HEAD/OPTIONS/TRACE is state-changing even if nothing routes it, so it
+/// is refused for want of a token rather than passed on as "safe".
+#[tokio::test]
+async fn admin_treats_unusual_methods_as_state_changing() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "pia", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, _csrf) = browser_login(&app, "pia", "hunter2hunter2").await;
+
+    for method in ["PROPPATCH", "FOO"] {
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri("/admin")
+            .header(axum::http::header::COOKIE, &cookie)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "{method} without a token must be a CSRF rejection"
+        );
+    }
+}
+
+/// The CSRF guard on `POST /v1/tokens` runs before the JSON body is parsed:
+/// a forged HTML form POST riding the cookie is a CSRF failure (403), not an
+/// unsupported body (415).
+#[tokio::test]
+async fn forged_form_post_to_tokens_is_a_csrf_rejection() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "rex", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+    let (cookie, _csrf) = browser_login(&app, "rex", "hunter2hunter2").await;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/tokens")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .header(axum::http::header::COOKIE, &cookie)
+        .body(axum::body::Body::from("org="))
+        .unwrap();
+    let response = app.oneshot(with_peer_ip(request)).await.unwrap();
+    assert_csrf_rejection(response).await;
+}
+
+/// A client that logs in by POSTing `/admin/login` directly, without ever
+/// loading an `/admin` page, has no CSRF token. Any cookie-authenticated
+/// `/v1` response hands it one, so a GET before the first write is enough.
+#[tokio::test]
+async fn a_v1_get_hands_a_fresh_session_its_csrf_cookie() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "sam", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+
+    // Log in with a bare POST: no login page, so no token yet.
+    let login = axum::http::Request::builder()
+        .method("POST")
+        .uri("/admin/login")
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(axum::body::Body::from(
+            "username=sam&password=hunter2hunter2",
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(with_peer_ip(login)).await.unwrap();
+    assert!(response.status().is_redirection(), "login should succeed");
+    let session = set_cookie_value(&response, "lied_session").expect("session cookie");
+    let session_cookie = format!("lied_session={session}");
+
+    // The first write cannot succeed: there is no token to send.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&session_cookie),
+            None,
+            None,
+            r#"{"name":"too-early"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_csrf_rejection(response).await;
+
+    // A GET carries the readable cookie back.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "GET",
+            "/v1/instruments",
+            Some(&session_cookie),
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let csrf = set_cookie_value(&response, "lied_csrf")
+        .expect("a cookie-authenticated /v1 response sets lied_csrf");
+
+    // Presenting the current token in the cookie, nothing is re-issued.
+    let both = format!("{session_cookie}; lied_csrf={csrf}");
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "GET",
+            "/v1/instruments",
+            Some(&both),
+            None,
+            None,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(set_cookie_value(&response, "lied_csrf"), None);
+
+    // With that token the write goes through.
+    let response = app
+        .clone()
+        .oneshot(v1_request(
+            "POST",
+            "/v1/app-passwords",
+            Some(&both),
+            Some(&csrf),
+            None,
+            r#"{"name":"ipad"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+}
+
+/// Unauthenticated and bearer requests are not handed a CSRF cookie: there
+/// is no cookie session for it to protect.
+#[tokio::test]
+async fn non_cookie_v1_requests_get_no_csrf_cookie() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "tom", "hunter2hunter2").await;
+    let app = build_test_app(db.pool.clone()).await;
+
+    let config = test_config();
+    let keyring = auth::jwt::Keyring::from_single_key(
+        config.jwt_signing_key.expose(),
+        config.jwt_lifetime_days,
+    );
+    let (token, _claims) = keyring.mint(admin.id, None).expect("mint token");
+
+    for bearer in [None, Some(token.as_str())] {
+        let response = app
+            .clone()
+            .oneshot(v1_request("GET", "/v1/instruments", None, None, bearer, ""))
+            .await
+            .unwrap();
+        assert_eq!(set_cookie_value(&response, "lied_csrf"), None);
+    }
+}

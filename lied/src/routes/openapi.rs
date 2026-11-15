@@ -24,11 +24,14 @@ pub struct SecurityAddon;
 /// The `session` scheme's description: the CSRF rule a cookie client must
 /// follow is part of how the scheme is used, so it lives on the scheme.
 const SESSION_SCHEME_DESCRIPTION: &str = "Session cookie set by `/admin/login`. \
-    State-changing requests (anything but GET/HEAD/OPTIONS) authenticated by this cookie \
-    must also send the session's CSRF token, read from the `lied_csrf` cookie, in the \
-    `HX-CSRF` request header; without it they are refused with 403 \
-    (`https://lied/errors/csrf-token-invalid`). Bearer-authenticated requests need no \
-    header, and a request carrying a bearer token is authenticated by it alone.";
+    State-changing requests (anything but GET/HEAD/OPTIONS/TRACE) authenticated by this \
+    cookie must also send the session's CSRF token, read from the `lied_csrf` cookie, in \
+    the `HX-CSRF` request header; without it they are refused with 403 \
+    (`https://lied/errors/csrf-token-invalid`). Any cookie-authenticated `/v1` response \
+    sets `lied_csrf` when the client lacks the current token, so one request (a GET will \
+    do) before the first write is enough. The cookie is used only when the request has no \
+    `Authorization` header: a bearer request is authenticated by its token alone and \
+    needs no CSRF header, and any other `Authorization` scheme is a 401.";
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {

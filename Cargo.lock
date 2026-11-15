@@ -2225,6 +2225,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2 0.10.9",
  "sqlx",
+ "subtle",
  "testcontainers",
  "testcontainers-modules",
  "thiserror 2.0.21",
