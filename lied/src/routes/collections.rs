@@ -33,7 +33,7 @@ use crate::routes::openapi::{
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
 // Problem Details on a bad parameter (issue #66); see `routes::params`.
-use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
+use crate::routes::params::{ApiListQuery, ApiPath as Path};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -201,8 +201,10 @@ async fn list_collections(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<collection::Collection>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
@@ -218,8 +220,6 @@ async fn list_collections(
         collection::DEFAULT_SORT,
     )
     .map_err(AppError::Validation)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, collection::FILTER_ALLOWLIST)
         .map_err(AppError::Validation)?;
     let type_filter = filters

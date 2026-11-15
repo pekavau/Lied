@@ -331,8 +331,13 @@ where fields are wire names (`sort=createdAt:desc`, `filter[status]=active`).
   a 400.
 - Filter keys are **percent-decoded before** the `filter[…]` prefix is
   matched: a browser encodes the brackets when it submits a GET form.
+- Filters and the control parameters are decoded **in one pass, by one
+  decoder** (#69), so the same text means the same in `q` and in a filter. A
+  key without `=` has an empty value; an empty filter means no filter (a
+  browser form submits its empty fields).
 - A filter that does not parse is a 400, never silently dropped — dropping it
   would look like "nothing was excluded" while returning the unfiltered list.
+  The same filter given twice is a 400 too, as a repeated `limit` is.
 - Arrangements add free-text search and facets: see *Archive search*.
 
 **Why:** the allowlist keeps sorting and filtering from becoming

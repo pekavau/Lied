@@ -34,7 +34,7 @@ use crate::routes::openapi::{
 use crate::routes::patch::reject_blank;
 use crate::routes::RequestId;
 // Problem Details on a bad parameter (issue #66); see `routes::params`.
-use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
+use crate::routes::params::{ApiListQuery, ApiPath as Path};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -54,9 +54,8 @@ pub fn router() -> OpenApiRouter<AppState> {
 /// Raw `?limit=&offset=&sort=&filter[...]=` query params for list endpoints.
 /// `limit`/`offset` are parsed by [`crate::pagination::PageParams`]; `sort`
 /// is a plain string here (parsed by [`listing::resolve_sort`] against each
-/// endpoint's own allowlist); `filter[...]` brackets are parsed separately
-/// from the raw query string by [`listing::parse_filters`], since axum's
-/// `Query` extractor doesn't natively support bracket syntax.
+/// endpoint's own allowlist); the `filter[...]` pairs arrive next to it from
+/// [`ApiListQuery`], decoded in the same pass.
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     limit: Option<u32>,
@@ -153,8 +152,10 @@ async fn user_by_id(state: &AppState, id: Uuid) -> Result<user::User, AppError> 
 async fn list_orgs(
     auth: BearerOrSession,
     State(state): State<AppState>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<OrganizationResponse>>, AppError> {
     let _ = &auth;
     let (limit, offset) = crate::pagination::PageParams {
@@ -169,8 +170,6 @@ async fn list_orgs(
         organization::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, organization::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
     let name_filter = filters
@@ -481,8 +480,10 @@ struct CreateUserRequest {
 async fn list_users(
     auth: BearerOrSession,
     State(state): State<AppState>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<user::User>>, AppError> {
     require_system_admin(&auth.user)?;
 
@@ -495,8 +496,6 @@ async fn list_users(
     let (sort_column, sort_direction) =
         listing::resolve_sort(q.sort.as_deref(), user::SORT_ALLOWLIST, user::DEFAULT_SORT)
             .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =
         listing::resolve_filters(&raw_filters, user::FILTER_ALLOWLIST).map_err(validation_error)?;
     let username_filter = filters
@@ -805,8 +804,10 @@ async fn list_members(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<MembershipResponse>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
@@ -822,8 +823,6 @@ async fn list_members(
         membership::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, membership::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
     let role_filter = filters

@@ -12,6 +12,10 @@
 //! naming the parameter tells the client what to fix, where "not found"
 //! would send it looking for a resource that was never addressed.
 //!
+//! [`ApiListQuery`] is `ApiQuery` for list endpoints: the same control
+//! parameters plus the `filter[…]` pairs, decoded in **one** pass (#69), so a
+//! filter key or value can never decode differently from `limit` or `q`.
+//!
 //! The `/v1` route modules import these under axum's names
 //! (`use crate::routes::params::{ApiPath as Path, ApiQuery as Query}`) so a
 //! handler signature reads as usual; clippy's `disallowed-types` refuses
@@ -21,11 +25,15 @@
 use axum::extract::path::ErrorKind;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{FromRequestParts, RawPathParams};
+use std::borrow::Cow;
+
 use axum::http::request::Parts;
-use serde::de::DeserializeOwned;
+use serde::de::value::{Error as DeError, MapDeserializer};
+use serde::de::{DeserializeOwned, IntoDeserializer};
 
 use super::json::{field_error, without_value};
 use crate::error::AppError;
+use crate::listing::RawFilters;
 
 /// Path parameters, deserialized into `T`; a segment that does not parse is a
 /// 400 naming the parameter.
@@ -133,12 +141,185 @@ where
     }
 }
 
-/// Deserialize a raw query string as `T`.
+/// A list endpoint's query: the control parameters (`limit`, `offset`,
+/// `sort`, `q`, …) deserialized into `T`, and the raw `filter[…]` pairs for
+/// [`listing::resolve_filters`](crate::listing::resolve_filters).
+///
+/// Both come from one decoding pass over the query string; see
+/// [`split_query`] for the rules.
+pub(crate) struct ApiListQuery<T> {
+    pub params: T,
+    pub filters: RawFilters,
+}
+
+#[async_trait::async_trait]
+impl<T, S> FromRequestParts<S> for ApiListQuery<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, AppError> {
+        parse_list_query(parts.uri.query().unwrap_or_default())
+    }
+}
+
+/// Deserialize a raw query string as `T`. `filter[…]` keys are not passed to
+/// `T`: a plain `ApiQuery` ignores them, as it ignores any key it does not
+/// name.
 pub(crate) fn parse_query<T: DeserializeOwned>(query: &str) -> Result<T, AppError> {
+    let (controls, _filters) = split_query(query)?;
+    deserialize_pairs(controls)
+}
+
+/// [`ApiListQuery`]'s parser, separate from the extractor for unit tests.
+pub(crate) fn parse_list_query<T: DeserializeOwned>(
+    query: &str,
+) -> Result<ApiListQuery<T>, AppError> {
+    let (controls, filters) = split_query(query)?;
+    Ok(ApiListQuery {
+        params: deserialize_pairs(controls)?,
+        filters,
+    })
+}
+
+type Pair<'a> = (Cow<'a, str>, Cow<'a, str>);
+
+/// The one decoding pass every `/v1` query goes through:
+/// `application/x-www-form-urlencoded` rules (`+` is a space, `%XX`
+/// escapes, invalid UTF-8 replaced), applied to keys and values alike.
+///
+/// - Keys are decoded **before** the `filter[` prefix is matched: a browser
+///   submitting a GET form sends `filter%5Bstatus%5D`, and matching the raw
+///   key would silently drop the filter.
+/// - A key without `=` is a key with an empty value, for filters as for
+///   control parameters: `filter[status]` means `filter[status]=` (which the
+///   endpoints read as "no filter"). It is never dropped, so an unknown one
+///   still reaches the allowlist and is refused.
+/// - A filter named twice is a 400 naming it, as a duplicated control
+///   parameter is: keeping either value would silently drop the other.
+fn split_query(query: &str) -> Result<(Vec<Pair<'_>>, RawFilters), AppError> {
+    let mut controls = Vec::new();
+    let mut filters = RawFilters::new();
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        let field = key
+            .strip_prefix("filter[")
+            .and_then(|rest| rest.strip_suffix(']'));
+        match field {
+            Some(field) => {
+                if filters
+                    .insert(field.to_string(), value.into_owned())
+                    .is_some()
+                {
+                    return Err(field_error(
+                        &format!("filter[{field}]"),
+                        "given more than once",
+                        "query",
+                    ));
+                }
+            }
+            None => controls.push((key, value)),
+        }
+    }
+    Ok((controls, filters))
+}
+
+/// Deserialize already-decoded pairs as `T`, naming the key that fails.
+fn deserialize_pairs<T: DeserializeOwned>(pairs: Vec<Pair<'_>>) -> Result<T, AppError> {
     let deserializer =
-        serde_urlencoded::Deserializer::new(form_urlencoded::parse(query.as_bytes()));
+        MapDeserializer::<_, DeError>::new(pairs.into_iter().map(|(k, v)| (Part(k), Part(v))));
     serde_path_to_error::deserialize(deserializer)
         .map_err(|err| field_error(&err.path().to_string(), &err.inner().to_string(), "query"))
+}
+
+/// One decoded key or value. Strings deserialize as they are; numbers and
+/// booleans parse from their text, as a form value does (the rules of
+/// `serde_urlencoded`, which `ApiQuery` used before #69).
+struct Part<'a>(Cow<'a, str>);
+
+impl<'de> IntoDeserializer<'de, DeError> for Part<'de> {
+    type Deserializer = Self;
+
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+macro_rules! parse_from_text {
+    ($($ty:ty => $method:ident,)*) => {
+        $(
+            fn $method<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+                match self.0.parse::<$ty>() {
+                    Ok(value) => serde::Deserializer::$method(
+                        IntoDeserializer::<DeError>::into_deserializer(value),
+                        visitor,
+                    ),
+                    Err(err) => Err(serde::de::Error::custom(err)),
+                }
+            }
+        )*
+    };
+}
+
+impl<'de> serde::Deserializer<'de> for Part<'de> {
+    type Error = DeError;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        match self.0 {
+            Cow::Borrowed(text) => visitor.visit_borrowed_str(text),
+            Cow::Owned(text) => visitor.visit_string(text),
+        }
+    }
+
+    fn deserialize_option<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, DeError> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, DeError> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    /// Unit variants only, named by the value (`?status=active`).
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, DeError> {
+        serde::Deserializer::deserialize_enum(
+            IntoDeserializer::<DeError>::into_deserializer(self.0.into_owned()),
+            name,
+            variants,
+            visitor,
+        )
+    }
+
+    parse_from_text! {
+        bool => deserialize_bool,
+        u8 => deserialize_u8,
+        u16 => deserialize_u16,
+        u32 => deserialize_u32,
+        u64 => deserialize_u64,
+        i8 => deserialize_i8,
+        i16 => deserialize_i16,
+        i32 => deserialize_i32,
+        i64 => deserialize_i64,
+        f32 => deserialize_f32,
+        f64 => deserialize_f64,
+    }
+
+    serde::forward_to_deserialize_any! {
+        char str string bytes byte_buf unit unit_struct seq tuple tuple_struct
+        map struct identifier ignored_any
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +373,87 @@ mod tests {
         let q: Q = parse_query(&format!("userId={id}&limit=5&filter%5Bstatus%5D=active")).unwrap();
         assert_eq!(q.limit, Some(5));
         assert_eq!(q.user_id, id);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListQ {
+        q: Option<String>,
+        limit: Option<u32>,
+    }
+
+    fn list(query: &str) -> ApiListQuery<ListQ> {
+        match parse_list_query::<ListQ>(query) {
+            Ok(parsed) => parsed,
+            Err(err) => panic!("{query} → {err:?}"),
+        }
+    }
+
+    fn filter<'a>(parsed: &'a ApiListQuery<ListQ>, field: &str) -> Option<&'a str> {
+        parsed.filters.get(field).map(String::as_str)
+    }
+
+    /// #69: control parameters and filters go through one decoder, so the
+    /// same text decodes the same way in both: `+` is a space, `%2B` a plus,
+    /// a key without `=` an empty value, a bad escape kept, bad UTF-8
+    /// replaced. Before, `filter[…]` had its own decoder, which dropped a
+    /// key without `=` (and so an unknown one never reached the allowlist).
+    #[test]
+    fn control_parameters_and_filters_decode_alike() {
+        for (raw, decoded) in [
+            ("a+b%2Bc", "a b+c"),
+            ("%zz", "%zz"),
+            ("%FF", "\u{FFFD}"),
+            ("caf%C3%A9", "café"),
+        ] {
+            let parsed = list(&format!("q={raw}&filter[name]={raw}"));
+            assert_eq!(parsed.params.q.as_deref(), Some(decoded), "q={raw}");
+            assert_eq!(filter(&parsed, "name"), Some(decoded), "filter={raw}");
+        }
+
+        let bare = list("q&filter[name]");
+        assert_eq!(bare.params.q.as_deref(), Some(""));
+        assert_eq!(
+            filter(&bare, "name"),
+            Some(""),
+            "a filter key without `=` must not vanish"
+        );
+    }
+
+    #[test]
+    fn filter_keys_are_decoded_before_the_prefix_is_matched() {
+        // A browser GET form encodes the brackets; a hand-written URL does
+        // not. Both must reach the same filter.
+        let literal = list("filter[status]=active&limit=50");
+        let encoded = list("filter%5Bstatus%5D=active&limit=50");
+        assert_eq!(filter(&literal, "status"), Some("active"));
+        assert_eq!(literal.filters, encoded.filters);
+        assert_eq!(encoded.params.limit, Some(50));
+
+        let mixed =
+            list("filter%5BdurationMaxSeconds%5D=300&filter[tag]=a%2Cb&filter[name]=foo+bar");
+        assert_eq!(filter(&mixed, "durationMaxSeconds"), Some("300"));
+        assert_eq!(filter(&mixed, "tag"), Some("a,b"));
+        assert_eq!(filter(&mixed, "name"), Some("foo bar"));
+        assert_eq!(mixed.filters.len(), 3);
+    }
+
+    #[test]
+    fn filters_never_reach_the_control_parameters() {
+        // `filter[limit]` is a filter named `limit`, not the page size.
+        let parsed = list("filter[limit]=abc&limit=5");
+        assert_eq!(parsed.params.limit, Some(5));
+        assert_eq!(filter(&parsed, "limit"), Some("abc"));
+    }
+
+    #[test]
+    fn a_filter_given_twice_is_named() {
+        match parse_list_query::<ListQ>("filter[status]=active&filter%5Bstatus%5D=archived") {
+            Err(AppError::Validation(report)) => {
+                let fields: Vec<String> = report.iter().map(|(p, _)| p.to_string()).collect();
+                assert_eq!(fields, vec!["filter[status]".to_string()]);
+            }
+            other => panic!("expected a validation error, got {:?}", other.err()),
+        }
     }
 
     #[test]

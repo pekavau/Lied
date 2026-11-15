@@ -614,6 +614,46 @@ async fn list_orgs_rejects_unknown_filter_field_with_400() {
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
 }
 
+/// #69: filters are decoded by the same pass as the other query
+/// parameters. A filter key without `=` used to be dropped by the separate
+/// filter decoder, so an unknown one was silently ignored (200, unfiltered)
+/// instead of refused; and a filter given twice silently kept the last value.
+#[tokio::test]
+async fn list_filters_decode_like_the_other_query_parameters() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "admin", "correct horse battery staple").await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let token = mint_token(&state, admin.id);
+
+    for (uri, field) in [
+        ("/v1/orgs?filter[is_system_admin]", "filter"),
+        ("/v1/orgs?filter%5Bbogus%5D&limit=5", "filter"),
+        ("/v1/orgs?filter[name]=a&filter%5Bname%5D=b", "filter[name]"),
+    ] {
+        let request = bearer_request("GET", uri, &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+        let body = body_json(response).await;
+        assert!(body["errors"].get(field).is_some(), "{uri}: {body}");
+    }
+
+    // A known filter without `=` is an empty one, which means "no filter",
+    // as `filter[name]=` always did.
+    create_org(&db.pool, "Stadtkapelle").await;
+    let request = bearer_request("GET", "/v1/orgs?filter[name]", &token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_json(response).await["total"], 1);
+}
+
 #[tokio::test]
 async fn list_orgs_filters_by_name() {
     let db = TestDb::create_and_migrate().await;
