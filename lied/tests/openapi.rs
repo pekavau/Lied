@@ -96,6 +96,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/app-passwords/{appPasswordId}",
     // The caller (routes/me.rs)
     "/v1/me",
+    "/v1/me/parts",
     // Orgs
     "/v1/orgs",
     "/v1/orgs/{orgId}",
@@ -649,13 +650,19 @@ fn every_path_parameter_is_a_uuid() {
 #[test]
 fn sort_and_filter_docs_match_the_allowlists() {
     use lied::domain::{
-        arrangement, collection, global_annotation, membership, organization, tag, user, voice,
-        work,
+        access, arrangement, collection, global_annotation, membership, organization, tag, user,
+        voice, work,
     };
     type Sort = &'static [(&'static str, &'static str)];
     type Filter = &'static [&'static str];
     type Default = (&'static str, lied::listing::SortDirection);
     let lists: &[(&str, Sort, Filter, Default)] = &[
+        (
+            "/v1/me/parts",
+            access::PARTS_SORT_ALLOWLIST,
+            access::PARTS_FILTER_ALLOWLIST,
+            access::PARTS_DEFAULT_SORT,
+        ),
         (
             "/v1/works",
             work::SORT_ALLOWLIST,

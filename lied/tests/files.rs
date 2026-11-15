@@ -1085,3 +1085,167 @@ async fn a_guests_access_ends_with_the_assignment_or_its_collection() {
     );
     assert_eq!(guest_reads(&ctx, &guest, &uris).await, [403, 403, 403]);
 }
+
+// --- #98: GET /v1/me/parts ---
+
+async fn my_parts(ctx: &Ctx, token: &str, query: &str) -> (u16, serde_json::Value) {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(get_request(&format!("/v1/me/parts{query}"), token))
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, body_json(response).await)
+}
+
+/// The caller's parts across every ensemble, their own and those they play
+/// in as a guest; filtered and sorted by the allowlist; only live ones; and
+/// every listed part opens through the voice endpoint.
+#[tokio::test]
+async fn my_parts_list_every_live_part_across_ensembles() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (home, _) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let (away, _) = seed_org_archivist(&ctx.state, "Abendchor", "arch2").await;
+    let (anna, token) = seed_guest(&ctx.state, "anna").await;
+    let (bob, _) = seed_guest(&ctx.state, "bob").await;
+    // Anna is a musician at home, and a guest in the other ensemble.
+    membership::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        anna,
+        home,
+        membership::MembershipFields {
+            role: membership::Role::Musician,
+            instrument_ids: &[],
+            is_principal: false,
+            principal_instrument_ids: &[],
+        },
+        None,
+    )
+    .await
+    .expect("membership");
+
+    let radetzky = seed_arrangement(&ctx.state, home, "Radetzky March").await;
+    let flute = seed_voice(&ctx.state, radetzky, "Flute 1").await;
+    let (_home_collection, home_item) = seed_program_item(&ctx.state, home, radetzky).await;
+    assign(&ctx.state, home_item, flute, anna).await;
+    assign(&ctx.state, home_item, flute, bob).await; // not Anna's
+
+    let florentiner = seed_arrangement(&ctx.state, away, "Florentiner").await;
+    let clarinet = seed_voice(&ctx.state, florentiner, "Clarinet 1").await;
+    let oboe = seed_voice(&ctx.state, florentiner, "Oboe 1").await;
+    let (_concert, concert_item) = seed_program_item(&ctx.state, away, florentiner).await;
+    let concert_part = assign(&ctx.state, concert_item, clarinet, anna).await;
+    let (festival, festival_item) = seed_program_item(&ctx.state, away, florentiner).await;
+    assign(&ctx.state, festival_item, oboe, anna).await;
+
+    // Everything, in the default order: by organization name.
+    let (status, page) = my_parts(&ctx, &token, "").await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["total"], 3, "{page}");
+    let orgs: Vec<&str> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["organization"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(orgs, ["Abendchor", "Abendchor", "Stadtkapelle"]);
+    let home_row = &page["items"][2];
+    assert_eq!(home_row["organization"]["slug"], "stadtkapelle");
+    assert_eq!(home_row["collection"]["type"], "program");
+    assert_eq!(home_row["item"]["label"], "1");
+    assert_eq!(home_row["item"]["position"], 1);
+    assert_eq!(home_row["arrangement"]["title"], "Radetzky March");
+    assert_eq!(home_row["voice"]["id"], flute.to_string());
+    assert_eq!(
+        home_row["voice"]["instrumentIds"].as_array().unwrap().len(),
+        1
+    );
+    assert!(home_row["acknowledgedAt"].is_null());
+
+    // Every listed part opens through the voice endpoint, guest parts too.
+    for part in page["items"].as_array().unwrap() {
+        let uri = format!(
+            "/v1/orgs/{}/arrangements/{}/voices/{}",
+            part["organization"]["id"].as_str().unwrap(),
+            part["arrangement"]["id"].as_str().unwrap(),
+            part["voice"]["id"].as_str().unwrap()
+        );
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &token)).await,
+            200,
+            "{uri}"
+        );
+    }
+
+    // Filters.
+    let (_, only_home) = my_parts(&ctx, &token, &format!("?filter[organizationId]={home}")).await;
+    assert_eq!(only_home["total"], 1, "{only_home}");
+    let (_, only_festival) =
+        my_parts(&ctx, &token, &format!("?filter[collectionId]={festival}")).await;
+    assert_eq!(only_festival["total"], 1);
+    assert_eq!(only_festival["items"][0]["voice"]["id"], oboe.to_string());
+    lied::domain::part_assignment::update_state(
+        &ctx.state.db,
+        concert_part,
+        None,
+        lied::domain::Change::Keep,
+        lied::domain::Change::Set(Some(chrono::Utc::now())),
+    )
+    .await
+    .unwrap()
+    .expect("acknowledged");
+    let (_, acknowledged) = my_parts(&ctx, &token, "?filter[acknowledged]=true").await;
+    assert_eq!(acknowledged["total"], 1);
+    assert_eq!(
+        acknowledged["items"][0]["voice"]["id"],
+        clarinet.to_string()
+    );
+    let (_, open) = my_parts(&ctx, &token, "?filter[acknowledged]=false").await;
+    assert_eq!(open["total"], 2);
+    let (status, body) = my_parts(&ctx, &token, "?filter[acknowledged]=yes").await;
+    assert_eq!(status, 400);
+    assert!(
+        body["errors"].get("filter[acknowledged]").is_some(),
+        "{body}"
+    );
+    let (status, _) = my_parts(&ctx, &token, "?filter[bogus]=1").await;
+    assert_eq!(status, 400);
+
+    // Sort and paginate.
+    let (status, by_ack) = my_parts(&ctx, &token, "?sort=acknowledgedAt:desc").await;
+    assert_eq!(status, 200);
+    // Unset times sort last in either direction.
+    assert_eq!(by_ack["items"][0]["voice"]["id"], clarinet.to_string());
+    let (_, by_ack_asc) = my_parts(&ctx, &token, "?sort=acknowledgedAt").await;
+    assert_eq!(by_ack_asc["items"][0]["voice"]["id"], clarinet.to_string());
+    let (status, _) = my_parts(&ctx, &token, "?sort=title").await;
+    assert_eq!(status, 400);
+    let (_, first) = my_parts(&ctx, &token, "?limit=1").await;
+    assert_eq!(first["items"].as_array().unwrap().len(), 1);
+    assert_eq!(first["total"], 3);
+
+    // A deleted collection takes its parts with it.
+    assert!(
+        lied::domain::collection::soft_delete(&ctx.state.db, festival, None)
+            .await
+            .unwrap()
+    );
+    let (_, after) = my_parts(&ctx, &token, "").await;
+    assert_eq!(after["total"], 2, "{after}");
+    let rows = after["items"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{after}");
+    assert!(
+        rows.iter()
+            .all(|p| p["collection"]["id"] != festival.to_string()),
+        "{after}"
+    );
+
+    // Without credentials: 401.
+    let anonymous = axum::http::Request::builder()
+        .uri("/v1/me/parts")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(status_of(&ctx, anonymous).await, 401);
+}
