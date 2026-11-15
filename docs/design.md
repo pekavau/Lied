@@ -984,7 +984,7 @@ A named, numbered set of arrangements.
 | `name` | text | |
 | `slug` | text | Immutable, unique per organization. |
 | `type` | text | `program` (a fixed running order, for a concert) or `standing` (called by number: a Marschbuch, a Frühschoppenmappe). Decides the numbering rules; see *Collection numbering*. |
-| `number_width` | smallint, 3 or 4 | Digits in WebDAV folder names, and so the highest label (999 or 9999). Default 3; 4 for a large book (a combined fake book passes 1,000 tunes). *(not yet built)* |
+| `number_width` | smallint, 3 or 4 | Digits in WebDAV folder names, and so the highest label (999 or 9999). Default 3; 4 for a large book (a combined fake book passes 1,000 tunes). |
 
 Audit fields, soft-deletable.
 
@@ -996,7 +996,7 @@ One arrangement in a collection, under its piece number.
 |---|---|---|
 | `collection_id`, `arrangement_id` | FK | One live item per arrangement per collection: a piece appears once, never under two numbers (it confuses players mid-performance). |
 | `position` | int | Running order, 1..n, always dense; maintained by the server. |
-| `label` | text | The number players are called by, with an optional letter, `^[1-9][0-9]{0,3}[a-z]?$` and at most the collection's `number_width` digits: `12`, or `12a` for a piece slipped in later. Stored lowercase. In a program it is always `position` as text. *(not yet built: today a single `index` int.)* |
+| `label` | text | The number players are called by, with an optional letter, `^[1-9][0-9]{0,3}[a-z]?$` and at most the collection's `number_width` digits: `12`, or `12a` for a piece slipped in later. Stored lowercase. In a program it is always `position` as text. |
 
 Audit fields, soft-deletable. Clients **display `label` and order by
 `position`**, whatever the collection's type. How the two are maintained is
@@ -1017,7 +1017,7 @@ range, so piece 65 (or 65a) falls into the section covering 65. Adding a
 piece therefore never needs a section choice, and a gap belongs to a section
 too ("the next free polka number").
 
-#### Collection numbering *(not yet built)*
+#### Collection numbering
 
 The type of a collection decides what its numbers mean.
 
@@ -1034,8 +1034,11 @@ The type of a collection decides what its numbers mean.
   number; the next number after the highest in a section (the suggestion,
   overall or within the section being added to); a section's own start, while
   the section is still empty; or a letter label (`12a`) next to an existing
-  number. Any other number is refused (400). A number far past the end
-  usually means a typo, and it would leave a gap nobody chose.
+  number. Any other number is refused (400), a taken one is a 409. A number
+  far past the end usually means a typo, and it would leave a gap nobody
+  chose. A moved piece's own label does not count against it. The section
+  cases arrive with sections *(not yet built, #103)*; until then an empty
+  standing collection starts at 1.
 - **A new section can start beyond the end.** Adding "Modern" after Märsche
   and Polkas typically starts it at 101 while the polkas end at 75, so that
   more polkas fit in without breaking the order. The section's start is what
@@ -1058,19 +1061,37 @@ The type of a collection decides what its numbers mean.
   `position` is the labels' natural order (`12` < `12a` < `13`), recomputed
   on every write; it is never set directly.
 - **Renumber** assigns 1..n in the current order, drops letter suffixes and
-  moves each section's start to its first piece's new number. It is the one
-  operation that changes printed numbers, so it is a separate action, audited,
-  and previewed before it runs. It is the reprint (or re-sleeve) of the folder.
+  moves each section's start to its first piece's new number *(sections: not
+  yet built, #103)*. It is the one operation that changes printed numbers,
+  so it is a separate action, audited, and previewed before it runs:
+  `GET …/collections/{collectionId}/renumber` returns every piece's old and
+  new label plus a `previewToken` (a hash of the current pieces and labels),
+  and `POST …/renumber` applies only that token, a 409 if the collection has
+  changed since. It is the reprint (or re-sleeve) of the folder.
 - **No hand-out flag.** A folder being assembled is a standing collection
   without gaps; before the hand-out, Renumber is cheap. A stored "handed out"
   state with warnings can be added later if the explicit action proves too
   easy to press.
 - **Changing the type** carries the numbers over: program → standing keeps
-  positions as labels; standing → program closes the gaps (a renumber, with
-  the same preview).
+  positions as labels; standing → program closes the gaps, the same
+  renumber applied in the type change's transaction.
+- **One writer per collection.** Every item write (add, move, swap, remove,
+  restore, reorder, renumber) and every collection update locks the
+  collection row first (`FOR NO KEY UPDATE`), then checks the rules and
+  writes under that lock, so two editors cannot both take label 12. The
+  live-row uniqueness of `(collection_id, position)` and `(collection_id,
+  label)` is a deferred exclusion constraint, checked at commit: a swap or a
+  renumber moves pieces through each other's numbers inside one
+  transaction, which an immediate unique index would refuse midway.
 - **Sections** exist for standing collections only. A concert's parts (before
   and after the interval) would need sections anchored to pieces rather than
   numbers; deferred.
+
+**Enforced by:** the numbering tests in `tests/collections.rs` (from
+`a_standing_collection_keeps_its_gaps_and_takes_allowed_labels_only` to
+`concurrent_adds_under_one_label_let_exactly_one_through`) and
+`collection_numbering_migration_carries_old_numbers_over` in
+`tests/migrations.rs`.
 
 **Why:** a program's order *is* the concert and is rebuilt for every one, so
 automatic renumbering helps. A standing collection lives on paper in every
@@ -1158,7 +1179,7 @@ Attaching and detaching are real inserts and deletes.
   | `File` | `(arrangement_id, voice_id, name, format)` for voice files; `(arrangement_id, name, format) WHERE voice_id IS NULL` for full-score files (Postgres treats NULL as distinct, so a partial index covers the score case) |
   | `Membership` | `(user_id, organization_id)` |
   | `Collection` | `(organization_id, slug)` |
-  | `CollectionItem` | `(collection_id, position)`; `(collection_id, label)`; `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
+  | `CollectionItem` | `(collection_id, position)` and `(collection_id, label)`, as deferred exclusion constraints (see *Collection numbering*); `(collection_id, arrangement_id)` — one live entry per piece, so a collection can't list the same arrangement under two numbers |
   | `CollectionSection` | `(collection_id, starts_at)` |
   | `PartAssignment` | `(collection_item_id, voice_id, user_id)` — a part is played by as many musicians as the section has; the same person twice on one part is the mistake |
   | `Tag` | `(organization_id, name, kind)` |
