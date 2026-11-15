@@ -62,6 +62,9 @@ A few project-specific rules worth knowing up front:
   API must regenerate it with `just openapi` (CI fails otherwise), so the
   contract change is visible as a diff in review. If you change an API
   convention, change the test in `lied/tests/openapi.rs` that pins it too.
+- If your change affects what a public `.md` file says — the README's
+  quickstart, first steps, configuration or production notes, this file,
+  `SECURITY.md`, or `docs/` — update it in the same PR.
 
 ## Pull request workflow
 
