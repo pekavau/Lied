@@ -267,31 +267,234 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 
 ### HTTP & REST API conventions
 
-These govern the JSON REST tree (`/v1/...`). The HTMX admin tree returns HTML fragments and is exempt where noted.
+These govern the JSON REST tree (`/v1/...`); the HTMX console under `/admin`
+returns HTML fragments and is exempt where noted. Each rule below is stated
+first, then its details, why it is so, and what enforces it. Worked examples
+follow at the end of the section.
 
-- **Pagination.** List endpoints (arrangements, voices, files, members, …) use **offset/limit**: `GET /v1/arrangements?limit=50&offset=0`. Response is an envelope: `{ "items": [...], "total": N, "limit": L, "offset": O }`. Default `limit` = 50, max = 200 (configurable via `LIED_MAX_PAGE_SIZE`). Cursor pagination was rejected for phase 1: offset gives a cheap `total` for "page 3 of 7" UIs and the concurrent-insert inconsistency window is irrelevant at our scale. Switching to an optional cursor later is additive, not breaking. **Exception — per-collection reports** (the coverage report, the bulk-assignment preview) return every piece unpaginated: they are bounded by one collection's size, and a report split across pages cannot be read as a whole. **Also unpaginated**, each small and read as a whole: a collection's items (its running order), the tags on one arrangement, and the caller's own app passwords. `unpaginated_lists_are_named_exceptions` in `tests/openapi.rs` holds the list; any other bare-array response fails it.
-- **Optimistic concurrency.** Mutating requests use **ETags derived from `updated_at`** (millisecond epoch). GET returns `ETag: "<ms>"`; `PATCH`/`PUT`/`DELETE` MUST send `If-Match`; a stale value → **`412 Precondition Failed`**. Applies to every mutable entity carrying `updated_at` (Arrangement, Voice, Collection, CollectionItem, GlobalAnnotation, and Work, Tag, Organization, User, Membership, PartAssignment). **Files take no `If-Match`:** a `File` row is never edited in place (replace inserts a new row and soft-deletes the old), so its id is its version, and a second replace or delete of the same id finds it gone (404). HTMX forms carry the ETag in a hidden field. **The check is enforced inside the write itself** (issue #64): every domain update/delete takes the caller's version and adds `floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` to its `WHERE` (a cascade locks the row at that version first, `SELECT … FOR UPDATE`), so two writers holding one ETag cannot both pass a read-time check and both write; the loser gets 412 (or 404 if the row went away), the console its "changed by someone else" page. Console **buttons** (delete, restore, mark notified/acknowledged) carry no version and stay unconditional — only the edit forms send one. A dedicated `version` column was rejected as redundant — `updated_at` already exists everywhere and ms precision catches concurrent edits.
-- **PATCH is a partial update** (issue #23). Every `PATCH` body is its own DTO, distinct from the create body: an **omitted field is kept**; on a nullable field an explicit **`null` clears** it, while on a field the model requires `null` is the same as omitting it (a required text field may be changed but not blanked). Unknown fields are refused, as on every `/v1` body (see Error response shape). Validation runs on the **merged row** the write would leave behind, not on the patch alone — a field fine on its own can disagree with one the client did not send (a new `difficulty` against the stored ABRSM rating); likewise, narrowing a member's `instrumentIds` without restating `principalInstrumentIds` drops the instruments no longer played from the principal list. A `PATCH` that changes nothing **writes nothing** — no `updated_at` bump (the ETag stays), no audit row — and every `PATCH` response carries the new `ETag`. The OpenAPI spec declares no required property on any `PATCH` body, and a test pins that. Full-replace bodies were rejected because a client changing one field had to resend the rest, and omitting a nullable field (an arrangement's publisher, licence notes, …) erased it.
-- **Error response shape.** All `/v1` errors use **RFC 7807 Problem Details** (`application/problem+json`): `{ "type", "title", "status", "detail", "instance" }`, where `type` is a stable URI (e.g. `https://lied/errors/precondition-failed`) and `instance` carries the request-ID for log correlation (`urn:uuid:<id>`, the same id as the `x-request-id` response header, the trace span and the audit row's `request_id`; a client-sent id that is not a UUID is replaced once, up front; a task-local set by router middleware lets any `AppError` read it). The single top-level `AppError` (CLAUDE.md, Error handling) emits this. **Request bodies** go through one extractor, `ApiJson` (issue #62), never axum's `Json`, whose rejections are plain text: a non-JSON `Content-Type` → 415, a body over `LIED_MAX_REQUEST_BYTES` → 413, unparseable JSON → 400 `bad-request`, and valid JSON of the wrong shape (missing, unknown or wrong-typed field) → 400 `validation-failed` with the field's wire path in `errors`. Messages never echo the value the client sent (it may be a password). **Path and query parameters** likewise go through `ApiPath` / `ApiQuery` (issue #66): a malformed one is a 400 `validation-failed` naming it — the route's `{orgId}` or the query key — and a malformed path id is deliberately a 400, not a 404 (the request is malformed; nothing was addressed). `clippy.toml` refuses axum's own `Path`/`Query` outside the console (`disallowed-types`), so no `/v1` handler can fall back to the plain-text rejections. **Every `/v1` request body refuses unknown fields** (`deny_unknown_fields`), create bodies included, so a misspelled key is an error rather than a silently dropped value. HTMX error responses are HTML fragments, not Problem Details.
-- **CSRF.** Every cookie-authenticated state-changing request (any method but GET/HEAD/OPTIONS/TRACE — unusual and unrouted methods count as state-changing), in **both** the `/admin` and the `/v1` tree, requires a **double-submit token**: a random token bound to the session and also handed to the client in the readable `lied_csrf` cookie, which the request must echo back. Both trees share one method rule (`csrf::is_state_changing`) and one constant-time token comparison. `SameSite=Lax` on the session cookie is a backstop, not the primary defense.
-  - **`/admin`** — checked by `csrf_middleware`, which accepts the token in the `HX-CSRF` header, a `csrf_token` field of a urlencoded form, or (multipart uploads only, whose body is the streamed file) a `csrf` query parameter. `/admin/login` and `/admin/logout` are exempt. Safe requests set the `lied_csrf` cookie.
-  - **`/v1`** (issue #72) — only the `HX-CSRF` header counts; a missing or wrong token is a **403 Problem Details** (`https://lied/errors/csrf-token-invalid`). The check lives in the `BearerOrSession` extractor, where the auth path is decided, so it applies exactly when the request was authenticated by cookie, and runs before the body is parsed. `POST /v1/tokens`, which reads the session itself, takes the `SessionCsrf` guard: a logged-in session needs the header there too, while the username/password path (no session) needs none. Any cookie-authenticated `/v1` response sets the `lied_csrf` cookie when the client does not already hold the current token, so a client that logged in without loading an `/admin` page makes one request (a GET will do) before its first write. **The `Authorization` header wins:** if present, it alone decides — a `Bearer` credential (scheme case-insensitive) authenticates the request and is exempt, since a cross-site page cannot attach that header without a CORS preflight `/v1` never grants; an invalid token or any other scheme (`Basic …`) is a 401, never a fall-back to the cookie.
-- **API versioning.** JSON REST is served under a **`/v1` prefix from day 1**. The HTMX admin tree (`/admin`) is unversioned — it's server-rendered, ships with the binary, and has no external contract to break. `/v1` is the clean seam for the future federation/SaaS API.
-- **Route-tree boundary.** Four sibling trees share one composed middleware stack (request-ID, rate-limit, auth), each applied with the right extractor — no content-type sniffing:
-  - `/admin/...` → HTML fragments (HTMX; session cookie + CSRF).
-  - `/v1/...` → JSON (session cookie *or* bearer token).
-  - `/orgs/...`, `/users/.../library/...` → WebDAV (app-password auth).
-  - `/healthz`, `/readyz`, `/metrics` → infra, unauthenticated (see below).
-- **Health, readiness, metrics** (infra tree, outside `/v1`):
-  - `/healthz` — liveness; returns 200 whenever the process is up. Drives container-restart decisions.
-  - `/readyz` — readiness; checks Postgres (`SELECT 1`) and MinIO (`HeadBucket`) reachable, 503 if either is down. Drives traffic gating without triggering restarts, so a transient DB blip sheds load instead of cycling the container.
-  - `/metrics` — Prometheus format via `metrics` facade + `metrics-exporter-prometheus` (facade kept swappable for OTLP later; not coupled to axum internals). RED baseline (request rate, error rate, per-route duration histograms) plus upload/download byte counters. **Gated behind `LIED_METRICS_ENABLED` (default off)** since the endpoint is unauthenticated — an operator opts in rather than leaking operational detail from a fresh self-host.
-- **Sort & filter.** List endpoints accept `?sort=<field>:<dir>` (e.g. `sort=createdAt:desc`; fields are wire names, camelCase) and `?filter[<field>]=<value>` (e.g. `filter[status]=active`); multiple filters AND together. Each endpoint declares an **allowlist** of sortable/filterable fields with a default sort (arrangements default `title:asc`); an unknown field or direction → `400` Problem Details. Each list operation's `sort` description and `filter[…]` parameters are checked against its allowlist by `sort_and_filter_docs_match_the_allowlists` in `tests/openapi.rs`. The allowlist keeps this from becoming arbitrary-column SQL surface. The bracket syntax namespaces filters away from control params (`sort`, `limit`, `offset`, `q`) so they never collide. **Filter keys are percent-decoded before the `filter[…]` prefix is matched** — a browser encodes the brackets when it submits a GET form, and a filter that fails to parse must never be silently dropped (that reads as "nothing was excluded" while returning the unfiltered list).
+#### Route trees and versioning
 
-  **`?q=` on arrangements is full-text + fuzzy** (issue #34, replacing the phase-1 ILIKE without changing the request shape): Postgres FTS over a trigger-maintained `tsvector` spanning title, composer, arranger, tag names and instrumentation, plus `pg_trgm` matching on title and composer so a misspelling still finds the piece. The text is indexed and queried through `simple` + `unaccent`, so search is accent-insensitive in both directions and no stemmer is imposed on a deliberately multilingual catalogue. `websearch_to_tsquery` parses the user's text, which gives quoted phrases and `-exclusion` for free and never raises on punctuation. Fuzzy recall depends on `pg_trgm.similarity_threshold` (default 0.3), because only the `%` operator can use the trigram index — a test pins the shipped behaviour.
+Four sibling trees share one middleware stack (request id, rate limit, auth);
+each authenticates its own way, and no request is routed by sniffing its
+content type:
 
-  Arrangements additionally accept the faceted filters `difficultyMin`, `difficultyMax`, `durationMinSeconds`, `durationMaxSeconds`, `tag` (comma-separated ids; an arrangement must carry **all** of them) and `instrumentId`, plus a `relevance` sort. Ranges are separate min/max fields rather than a `3..6` value syntax, so each is its own allowlisted name and its own OpenAPI parameter. Bare `sort=relevance` means best-first; without a `q` it falls back to the default sort rather than erroring, so a UI that keeps the sort while the user clears the box does not 400 at them.
-- **OpenAPI exposure.** `utoipa` serves the spec at **`/openapi.json` (always available)**; a rendered UI via `utoipa-rapidoc` is mounted at **`/docs`, gated behind `LIED_DOCS_ENABLED` (default on)**. Docs default on (unlike metrics) because the API spec isn't sensitive operational data and discoverability helps the programmatic-client/federation story; an operator who wants it dark flips one flag. RapiDoc over Swagger UI keeps the binary slim (one embedded asset).
+| Tree | Serves | Authenticated by |
+|---|---|---|
+| `/admin/...` | HTML fragments (HTMX console) | session cookie + CSRF token |
+| `/v1/...` | JSON | session cookie (+ CSRF token on writes) *or* bearer token |
+| `/orgs/...`, `/users/.../library/...` | WebDAV | app password |
+| `/healthz`, `/readyz`, `/metrics` | operators | nothing (see *Health, readiness, metrics*) |
+
+JSON is served under **`/v1` from day 1**; `/admin` is unversioned.
+
+**Why:** the console ships inside the binary and has no external contract to
+break; `/v1` is the seam a future federation or hosted API grows from.
+
+#### Pagination
+
+List endpoints page by **offset/limit** and answer with an envelope:
+
+`GET …/arrangements?limit=50&offset=0` →
+`{ "items": [...], "total": N, "limit": L, "offset": O }`
+
+- `limit` defaults to 50; the ceiling is 200 (`LIED_MAX_PAGE_SIZE`).
+- **Unpaginated by design**, each bounded and read as a whole:
+  - per-collection reports (the coverage report, the bulk-assignment preview) —
+    a report split across pages cannot be read;
+  - a collection's items (its running order), the tags on one arrangement, and
+    the caller's own app passwords.
+
+**Why:** offset gives a cheap `total` for "page 3 of 7"; its weakness, rows
+shifting under concurrent inserts, does not matter at this scale. An optional
+cursor can be added later without breaking anyone.
+
+**Enforced by:** `unpaginated_lists_are_named_exceptions` (`tests/openapi.rs`)
+holds the list of exceptions; any other bare-array response fails it.
+
+#### Sort and filter
+
+List endpoints accept `?sort=<field>:<dir>` and `?filter[<field>]=<value>`,
+where fields are wire names (`sort=createdAt:desc`, `filter[status]=active`).
+
+- Several filters AND together.
+- Each endpoint declares an **allowlist** of sortable and filterable fields and
+  a default sort (arrangements: `title:asc`). An unknown field or direction is
+  a 400.
+- Filter keys are **percent-decoded before** the `filter[…]` prefix is
+  matched: a browser encodes the brackets when it submits a GET form.
+- A filter that does not parse is a 400, never silently dropped — dropping it
+  would look like "nothing was excluded" while returning the unfiltered list.
+- Arrangements add free-text search and facets: see *Archive search*.
+
+**Why:** the allowlist keeps sorting and filtering from becoming
+arbitrary-column SQL; the brackets keep filter names apart from the control
+parameters (`sort`, `limit`, `offset`, `q`).
+
+**Enforced by:** `sort_and_filter_docs_match_the_allowlists` checks each list
+operation's documented `sort` and `filter[…]` against its allowlist.
+
+#### Optimistic concurrency
+
+Every mutable entity's **ETag is its `updated_at`** in epoch milliseconds.
+`GET` returns `ETag: "<ms>"`; `PATCH`, `PUT` and `DELETE` must send it back
+in `If-Match`; a stale one is **`412 Precondition Failed`**.
+
+- Applies to every entity carrying `updated_at`: Arrangement, Voice,
+  Collection, CollectionItem, GlobalAnnotation, Work, Tag, Organization, User,
+  Membership, PartAssignment.
+- **Files take no `If-Match`.** A file is never edited in place — replacing
+  one inserts a new row and soft-deletes the old — so its id *is* its version;
+  a second replace or delete of the same id finds it gone (404).
+- **The check is part of the write**, not a read beforehand (#64): the
+  domain update or delete adds
+  `floor(extract(epoch FROM updated_at) * 1000)::bigint = $version` to its
+  `WHERE`, and a cascade first locks the row at that version
+  (`SELECT … FOR UPDATE`). Two writers holding one ETag therefore cannot both
+  succeed; the loser gets 412, or 404 if the row is gone.
+- In the console, edit forms carry the ETag in a hidden field and show "changed
+  by someone else" on a 412. Console **buttons** (delete, restore, mark
+  notified / acknowledged) carry no version and act unconditionally.
+
+**Why:** `updated_at` already exists everywhere and millisecond precision
+catches concurrent edits, so a separate `version` column would be redundant.
+
+**Enforced by:** `patch_operations_declare_precondition_412` (every `PATCH`
+documents its 412); `concurrent_writes_with_one_etag_let_exactly_one_through`
+fires several writes holding one ETag and expects exactly one to land.
+
+#### PATCH is a partial update
+
+A `PATCH` changes **only the fields it sends** (#23).
+
+- **Omitted** — kept as it is.
+- **`null` on a nullable field** — clears it. **`null` on a required field** —
+  the same as omitting it: a required text field can be changed, never
+  blanked.
+- **Unknown fields** — refused, as on every body (see *Errors*).
+- Every `PATCH` has its own body type, separate from the create body.
+- **Validation runs on the merged row** the write would leave behind, not on
+  the patch alone: a field valid by itself can disagree with one the client
+  did not send (a new `difficulty` against the stored ABRSM rating — see the
+  worked example). Likewise, narrowing a member's `instrumentIds` without
+  restating `principalInstrumentIds` drops the instruments no longer played
+  from the principal list.
+- A `PATCH` that **changes nothing writes nothing**: no `updated_at` bump (the
+  ETag stays), no audit row.
+- Every `PATCH` response carries the new `ETag`.
+
+**Why:** with full-replace bodies a client changing one field had to resend
+all the others, and leaving out a nullable one (an arrangement's publisher,
+licence notes, …) erased it.
+
+**Enforced by:** `patch_request_bodies_have_no_required_fields` (no `PATCH`
+body in the spec declares a required property); per-resource PATCH tests.
+
+#### Errors
+
+Every `/v1` error is **RFC 7807 Problem Details** (`application/problem+json`):
+`{ "type", "title", "status", "detail", "instance" }`.
+
+- `type` is a stable URI naming the error, e.g.
+  `https://lied/errors/precondition-failed`.
+- `instance` is `urn:uuid:<request id>` — the same id as the `x-request-id`
+  response header, the trace span and the audit row's `request_id`, so one id
+  finds a failure everywhere. A client-sent request id that is not a UUID is
+  replaced up front.
+- Validation errors add `errors`: `{ "<field>": ["message", …] }`, keyed by
+  the field's wire path.
+- **Messages never echo what the client sent** (it may be a password).
+- The console answers with HTML fragments instead.
+
+How a malformed request is answered:
+
+| Problem | Answer |
+|---|---|
+| Body with a non-JSON `Content-Type` | 415 |
+| Body over `LIED_MAX_REQUEST_BYTES` | 413 |
+| Body that is not valid JSON | 400 `bad-request` |
+| Valid JSON of the wrong shape: a missing, unknown or wrong-typed field | 400 `validation-failed`, naming the field |
+| Malformed path or query parameter | 400 `validation-failed`, naming it (`orgId`, the query key) |
+
+A malformed path id is deliberately **400, not 404**: the request is
+malformed, nothing was addressed. **Every body refuses unknown fields**,
+create bodies included, so a misspelled key is an error rather than a value
+silently dropped.
+
+**Why one shape:** clients handle one error format, and the request id ties a
+user's report to the logs.
+
+**Enforced by:** one `AppError` type renders every error (CLAUDE.md, Error
+handling); bodies go through the `ApiJson` extractor (#62) and parameters
+through `ApiPath` / `ApiQuery` (#66), because axum's own extractors reject in
+plain text — `clippy.toml` forbids those in `/v1`;
+`error_responses_use_problem_details_schema`,
+`operations_with_a_json_body_declare_its_rejections` and
+`operations_with_parameters_declare_400` in `tests/openapi.rs`.
+
+#### CSRF
+
+Every **cookie-authenticated** request that changes state — any method except
+GET, HEAD, OPTIONS and TRACE, so unusual and unrouted methods count too — must carry the session's **CSRF token**, in
+both `/admin` and `/v1`. The token is random, bound to the session, and handed
+to the client in the readable `lied_csrf` cookie; the request echoes it back
+(the double-submit pattern).
+
+- **In `/admin`** the token may come as the `HX-CSRF` header, a `csrf_token`
+  form field, or — for multipart uploads only, whose body is the streamed file
+  — a `csrf` query parameter. `/admin/login` and `/admin/logout` are exempt.
+  Safe requests set the `lied_csrf` cookie.
+- **In `/v1`** (#72) only the `HX-CSRF` header counts; a missing or wrong token
+  is a 403 (`https://lied/errors/csrf-token-invalid`), checked before the body
+  is parsed. A cookie-authenticated `/v1` response sets the `lied_csrf` cookie
+  when the client lacks the current token, so a client that logged in without
+  opening the console makes one request (a GET will do) before its first
+  write.
+- **`Authorization` decides when present.** A `Bearer` token (scheme
+  case-insensitive) authenticates the request and needs no CSRF token: a
+  cross-site page cannot attach that header without a CORS preflight, which
+  `/v1` never grants. An invalid token, or any other scheme (`Basic …`), is a
+  401 — never a fall-back to the cookie.
+- `POST /v1/tokens` reads the session itself: with a session it needs the
+  header too; the username/password path (no session) does not.
+
+**Why:** the cookie is sent automatically on cross-site requests, the header
+is not. `SameSite=Lax` on the session cookie is a backstop, not the defence.
+
+**Enforced by:** one method rule (`csrf::is_state_changing`) and one
+constant-time comparison for both trees; in `/v1` the check sits in the
+`BearerOrSession` extractor, where the auth path is decided, and in the
+`SessionCsrf` guard on `POST /v1/tokens`.
+
+#### Health, readiness, metrics
+
+Outside `/v1`, unauthenticated:
+
+- `/healthz` — **liveness**: 200 whenever the process is up. Drives container
+  restarts.
+- `/readyz` — **readiness**: Postgres (`SELECT 1`) and object storage
+  (`HeadBucket`) reachable, else 503. Drives traffic gating without restarts,
+  so a database blip sheds load instead of cycling the container.
+- `/metrics` — Prometheus: request rate, error rate and per-route duration
+  histograms, plus upload/download byte counters. **Off unless
+  `LIED_METRICS_ENABLED=true`**, because it is unauthenticated and a fresh
+  self-host should not leak operational detail.
+
+**Why the `metrics` facade:** it can be pointed at OTLP later and is not tied
+to axum internals.
+
+#### OpenAPI
+
+The spec is always served at **`/openapi.json`**; a rendered UI (RapiDoc) is
+at **`/docs`**, on unless `LIED_DOCS_ENABLED=false`. The committed
+`docs/openapi.json` is the same document, so a contract change shows up as a
+diff in review.
+
+**Why on by default** (unlike metrics): the spec is not sensitive, and
+discoverability helps programmatic clients. RapiDoc over Swagger UI keeps the
+binary small (one embedded asset).
+
+**Enforced by:** `openapi_snapshot_is_current`, and the convention tests in
+`tests/openapi.rs` listed in `docs/api-guidelines.md`.
 
 #### Worked examples
 
@@ -362,6 +565,60 @@ sequenceDiagram
     B->>L: PATCH, If-Match "1793642691123"
     L-->>B: 412 Precondition Failed (re-read, then retry)
 ```
+
+### Archive search
+
+The conductor's planning question — "which festive marches do we have, grade 3–5,
+under four minutes?" — is one request to the arrangements list:
+free text in `?q=`, facets as `filter[…]`, optionally best-first.
+
+```http
+GET /v1/orgs/{orgId}/arrangements?q=festive+march&filter[difficultyMin]=3&filter[difficultyMax]=5&filter[durationMaxSeconds]=240&sort=relevance
+```
+
+**Free text (`?q=`)** is Postgres full-text search plus trigram fuzzy
+matching (#34, which replaced phase 1's title ILIKE without changing the
+request):
+
+- It covers **title, composer, arranger, instrumentation and tag names**.
+- **Fuzzy** matching on title and composer finds a misspelt piece ("Radeztky").
+  Its recall follows `pg_trgm.similarity_threshold` (default 0.3), because
+  only the `%` operator can use the trigram index.
+- **Accent-insensitive** in both directions (`simple` + `unaccent`), and no
+  stemmer is imposed on a deliberately multilingual catalogue.
+- The user's text is parsed by `websearch_to_tsquery`: quoted phrases and
+  `-exclusion` work, and punctuation never raises an error.
+
+**Facets** are ordinary allowlisted filters (see *Sort and filter*):
+`status`, `difficultyMin` / `difficultyMax` (the ABRSM `difficulty` column),
+`durationMinSeconds` / `durationMaxSeconds`, `tag` (comma-separated ids; an
+arrangement must carry **all** of them) and `instrumentId` (the arrangement has a live voice for
+that instrument). Ranges are separate min/max fields rather than a `3..6`
+syntax, so each is its own allowlisted name and its own OpenAPI parameter.
+
+**`sort=relevance`** orders best match first. Without a `q` it falls back to
+the default sort rather than erroring, so a UI that keeps the sort while the
+user clears the search box does not get a 400.
+
+**How the index stays current.** The searchable text spans three tables — the
+arrangement's own columns, its work's composer and its tags' names — so it
+cannot be one generated column. It is a stored `arrangement.search_vector`
+(GIN-indexed) maintained by **triggers on `arrangement`, `work`, `tag` and
+`arrangement_tag`**: renaming a composer or a tag reindexes every arrangement
+that refers to it.
+
+**Why:** combining per-table vectors at query time would be correct by
+construction but forfeit the index, making every search a sequential scan;
+the triggers are the price of the index. No external search service, so the
+footprint stays one Postgres; if volume ever outgrows it, the swap is
+mechanical.
+
+**Enforced by:** `tests/search.rs` — among others
+`renaming_a_works_composer_reindexes_its_arrangements`,
+`renaming_or_detaching_a_tag_reindexes_its_arrangements` and
+`fuzzy_matching_holds_at_the_default_threshold`.
+
+**Deferred:** cross-scale lookups on `difficulty_ratings` (phase 3+).
 
 ### WebDAV layout
 
@@ -662,8 +919,10 @@ Fields: arrangement FK, tag FK.
   - **Arrangement scoping:** annotations reach their org only through the arrangement, and a soft-deleted arrangement hides them (hide-with-references) until it is restored.
   - **Console:** an Annotations block on the arrangement screen (read for staff, add/edit for authors), plus an org-wide "most recently changed" list in the Annotations section, which is visible to authors only.
 
-#### Search & metadata
-- **Search backend.** Postgres FTS (`tsvector` + GIN) over title, composer, arranger, instrumentation description, and tag names; `pg_trgm` for fuzzy matching on title and composer. No external search service — preserves the single-Postgres self-hostable footprint. If volume ever outgrows this, swap is mechanical.
+#### Search metadata
+
+The columns the archive is searched by; how they are searched is *Archive search* (under Architecture).
+
 - **Structured search fields.** Conductor's UC-2 dimensions split into structured columns vs. tags:
   - `Work.composer` (text, nullable) — composer lives on the abstract work, not the edition. Arrangements without a Work have no composer (folk, internal compositions).
   - `Arrangement.duration_seconds` (int, nullable) — range queries.
@@ -877,7 +1136,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 **Backend — the "medium" features.** Each lands on `/v1` (JSON, with OpenAPI coverage so the contract stays complete for the future client + MCP server); the HTMX admin fragments call the same `domain/*` service functions — no logic duplication.
 
-- **Archive search (UC-2).** Implement the already-specified search design (see Data Model → Search & metadata): Postgres FTS (`tsvector` + GIN) over title, composer, arranger, instrumentation description, and tag names; `pg_trgm` fuzzy match on title and composer; tag-based filtering; faceted filters (difficulty range on the ABRSM `difficulty` column, duration range, `status`, tags, instrumentation via `Voice.instrument_id`). Surfaced on the arrangements list endpoint through the existing `?q=` / `?filter[…]=` params plus a relevance sort, all allowlist-gated per the HTTP conventions — this upgrades the phase-1 `?q=` ILIKE in place. The searchable text spans **three tables** — `Work.composer`, `Tag` names (via `ArrangementTag`), and `arrangement` columns — so the `tsvector` **cannot be a single generated column**. **Decided in #34: a stored `arrangement.search_vector` maintained by triggers** on `arrangement`, `work`, `tag`, and `arrangement_tag` — combining per-source vectors at query time is correct by construction but forfeits the index, making every search a sequential scan. The cost of that choice is the trigger set; the invariant it buys is that renaming a Work's composer or a Tag reindexes the arrangements referencing it, which is tested directly. `difficulty_ratings` cross-scale lookups remain phase 3+.
+- **Archive search (UC-2).** Full-text + fuzzy search, tag filtering and the facets (difficulty, duration, status, tags, instrumentation) with a relevance sort, on the arrangements list — replacing the phase-1 ILIKE in place. The design, including the trigger-maintained index decided in #34, is *Archive search* (under Architecture). `difficulty_ratings` cross-scale lookups remain phase 3+.
 - **Coverage check (UC-13).** A `domain/*` service + `/v1` read endpoint reporting, for a collection (and per `CollectionItem`), which required voices have a `PartAssignment` and which are "rehearsed" (`acknowledged_at` set). Two views over the one service, differing only in what counts as *required*: the **full-program** view (required = every live voice of each item) and the **principal's section** view (required = voices whose `instrument_id ∈ Membership.principal_instrument_ids`). Authorization: staff (`owner` / `archivist` / `conductor`) get the full-program view; a `musician` with `is_principal = true` may read **only** the section view, scoped to their own `principal_instrument_ids` (the one *new* non-staff-facing view phase 2 adds to `/v1`, mirrored by the console carve-out above; musicians already have phase-1 `/v1` read access to their own assignments). Pure query over existing tables — no migration.
 - **Global annotations (UC-16, authoring).** Activate the existing `GlobalAnnotation` entity: `/v1` CRUD (create / list / get / update / delete) with ETag / `If-Match`, RFC 7807 errors, and audit; author gated to `conductor` / `owner` per the permission matrix. `GlobalAnnotation` carries no `deleted_at` (Unique-constraints table), so delete here is a **hard** delete — unlike the soft-deleted entities elsewhere in phase 2. The table already existed; issue #36 added only migration 0025, a CHECK vocabulary on `type`.
 
