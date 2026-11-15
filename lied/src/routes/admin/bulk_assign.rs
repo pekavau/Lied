@@ -320,7 +320,7 @@ async fn bulk_assign_page(
                 tbody {
                     @for item in plan {
                         tr {
-                            td { (item.index) }
+                            td { (item.label) }
                             td {
                                 a href=(format!(
                                     "/admin/orgs/{org_id}/collections/{collection_id}/items/{}/assignments",

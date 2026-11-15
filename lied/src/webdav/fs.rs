@@ -324,7 +324,7 @@ impl LiedFs {
         Ok((org_id, coll_id, vis))
     }
 
-    /// Resolve an `<index>, <arr-slug>` item location to
+    /// Resolve a `<label>, <arr-slug>` item location to
     /// `(org_id, collection_id, item_id, arrangement_id, arrangement_slug,
     /// visibility)`. Enforces that a restricted user holds >=1 assignment on
     /// this specific item (stricter than the collection-level check).
@@ -332,10 +332,10 @@ impl LiedFs {
         &self,
         org: &str,
         coll: &str,
-        index: i32,
+        label: &str,
         arr_slug: &str,
     ) -> FsResult<(Uuid, Uuid, Uuid, Uuid, String, Visibility)> {
-        self.resolve_collection_item_scoped(org, coll, index, arr_slug, true)
+        self.resolve_collection_item_scoped(org, coll, label, arr_slug, true)
             .await
     }
 
@@ -348,7 +348,7 @@ impl LiedFs {
         &self,
         org: &str,
         coll: &str,
-        index: i32,
+        label: &str,
         arr_slug: &str,
         check_assignment: bool,
     ) -> FsResult<(Uuid, Uuid, Uuid, Uuid, String, Visibility)> {
@@ -358,10 +358,10 @@ impl LiedFs {
             r#"SELECT ci.id as item_id, ci.arrangement_id, a.slug as arr_slug
                FROM collection_item ci
                JOIN arrangement a ON a.id = ci.arrangement_id
-               WHERE ci.collection_id = $1 AND ci.index = $2
+               WHERE ci.collection_id = $1 AND ci.label = $2
                  AND ci.deleted_at IS NULL AND a.deleted_at IS NULL"#,
             coll_id,
-            index,
+            label,
         )
         .fetch_optional(&self.state.db)
         .await
@@ -369,7 +369,7 @@ impl LiedFs {
         let Some(row) = row else {
             return Err(FsError::NotFound);
         };
-        // The index resolved to a real item, but its arrangement slug doesn't
+        // The label resolved to a real item, but its arrangement slug doesn't
         // match the path segment (stale client cache, or a tampered path) —
         // treat as not found rather than silently serving the wrong item.
         if row.arr_slug != arr_slug {
@@ -405,12 +405,12 @@ impl LiedFs {
         &self,
         org: &str,
         coll: &str,
-        index: i32,
+        label: &str,
         arr_slug: &str,
         voice: &str,
     ) -> FsResult<(Uuid, Uuid, Uuid, Uuid, String, Uuid)> {
         let (org_id, coll_id, item_id, arr_id, arr_slug, vis) = self
-            .resolve_collection_item_scoped(org, coll, index, arr_slug, false)
+            .resolve_collection_item_scoped(org, coll, label, arr_slug, false)
             .await?;
         let voice_id = self
             .voice_id_by_slug(arr_id, voice)
@@ -602,21 +602,21 @@ impl LiedFs {
             CollectionItemDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
-                self.resolve_collection_item(org, coll, *index, arr_slug)
+                self.resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 Ok(LiedMeta::dir())
             }
             CollectionScoreDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
                 let (.., vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 if !vis.is_staff() {
                     return Err(FsError::NotFound);
@@ -626,33 +626,33 @@ impl LiedFs {
             CollectionVoicesDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
-                self.resolve_collection_item(org, coll, *index, arr_slug)
+                self.resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 Ok(LiedMeta::dir())
             }
             CollectionVoice {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 voice,
             } => {
-                self.resolve_collection_voice(org, coll, *index, arr_slug, voice)
+                self.resolve_collection_voice(org, coll, label, arr_slug, voice)
                     .await?;
                 Ok(LiedMeta::dir())
             }
             CollectionScoreFile {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 file,
             } => {
                 let (_o, _c, _i, arr_id, _arr_slug, vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 if !vis.is_staff() {
                     return Err(FsError::NotFound);
@@ -662,13 +662,13 @@ impl LiedFs {
             CollectionVoiceFile {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 voice,
                 file,
             } => {
                 let (_o, _c, _i, arr_id, _arr_slug, voice_id) = self
-                    .resolve_collection_voice(org, coll, *index, arr_slug, voice)
+                    .resolve_collection_voice(org, coll, label, arr_slug, voice)
                     .await?;
                 self.stat_org_file(arr_id, Some(voice_id), file).await
             }
@@ -907,20 +907,17 @@ impl LiedFs {
                         .await
                         .map_err(db_err)?
                 {
-                    out.push(dir_entry(
-                        format!("{}-{}", item.index, item.arrangement_slug).into_bytes(),
-                        LiedMeta::dir(),
-                    ));
+                    out.push(dir_entry(item.folder_name().into_bytes(), LiedMeta::dir()));
                 }
             }
             CollectionItemDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
                 let (.., vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 if vis.is_staff() {
                     out.push(dir_entry("score", LiedMeta::dir()));
@@ -930,11 +927,11 @@ impl LiedFs {
             CollectionScoreDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
                 let (_o, _c, _i, arr_id, arr_slug, vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 if !vis.is_staff() {
                     return Err(FsError::NotFound);
@@ -949,11 +946,11 @@ impl LiedFs {
             CollectionVoicesDir {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
             } => {
                 let (_o, _c, item_id, arr_id, _arr_slug, vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 for (_id, slug) in self.visible_item_voices(item_id, arr_id, vis).await? {
                     out.push(dir_entry(slug.into_bytes(), LiedMeta::dir()));
@@ -962,12 +959,12 @@ impl LiedFs {
             CollectionVoice {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 voice,
             } => {
                 let (_o, _c, _i, arr_id, arr_slug, voice_id) = self
-                    .resolve_collection_voice(org, coll, *index, arr_slug, voice)
+                    .resolve_collection_voice(org, coll, label, arr_slug, voice)
                     .await?;
                 for e in self
                     .file_entries(org, &arr_slug, Some(voice), arr_id, Some(voice_id))
@@ -1335,12 +1332,12 @@ impl LiedFs {
             CollectionScoreFile {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 file,
             } => {
                 let (_o, _c, _i, arr_id, arr_slug, vis) = self
-                    .resolve_collection_item(org, coll, *index, arr_slug)
+                    .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
                 if !vis.is_staff() {
                     return Err(FsError::NotFound);
@@ -1351,13 +1348,13 @@ impl LiedFs {
             CollectionVoiceFile {
                 org,
                 coll,
-                index,
+                label,
                 arr_slug,
                 voice,
                 file,
             } => {
                 let (_o, _c, _i, arr_id, arr_slug, voice_id) = self
-                    .resolve_collection_voice(org, coll, *index, arr_slug, voice)
+                    .resolve_collection_voice(org, coll, label, arr_slug, voice)
                     .await?;
                 self.org_file_key(org, &arr_slug, Some(voice), arr_id, Some(voice_id), file)
                     .await

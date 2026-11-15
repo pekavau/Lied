@@ -309,6 +309,7 @@ async fn seed_programme_named(
         name,
         &lied::domain::collection::slugify(name),
         "program",
+        3,
         None,
     )
     .await
@@ -362,9 +363,16 @@ async fn seed_programme_named(
     }
 
     let item_id = Uuid::now_v7();
-    lied::domain::collection_item::create(&state.db, item_id, collection_id, arr_id, 1, None)
-        .await
-        .expect("item");
+    lied::domain::collection_item::create(
+        &state.db,
+        item_id,
+        collection_id,
+        arr_id,
+        Default::default(),
+        None,
+    )
+    .await
+    .expect("item");
 
     (collection_id, item_id, flute_voice, flute)
 }
@@ -648,6 +656,7 @@ async fn the_dashboard_puts_the_worst_covered_programme_first() {
         "Aaa Empty Book",
         "aaa-empty-book",
         "standing",
+        3,
         None,
     )
     .await

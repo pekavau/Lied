@@ -25,7 +25,7 @@ use crate::error::AppError;
 use crate::listing::{self};
 use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
-use crate::routes::json::ApiJson;
+use crate::routes::json::{ApiJson, OptionalApiJson};
 use crate::routes::openapi::{
     CommonErrors, Conflict409, Forbidden403, JsonBodyErrors, NotFound404, Precondition412,
     Validation400,
@@ -46,9 +46,11 @@ pub fn router() -> OpenApiRouter<AppState> {
         ))
         .routes(routes!(undelete_collection))
         .routes(routes!(reorder_items))
+        .routes(routes!(preview_renumber, renumber_collection))
         .routes(routes!(list_items, add_item))
         .routes(routes!(get_item, update_item, delete_item))
         .routes(routes!(undelete_item))
+        .routes(routes!(swap_item))
         .routes(routes!(collection_coverage))
 }
 
@@ -61,42 +63,58 @@ struct ListQuery {
     sort: Option<String>,
 }
 
-/// Piece numbers are 1-based and bounded well below the reorder parking offset
-fn validate_index(index: i32) -> Result<(), AppError> {
-    if collection_item::is_valid_index(index) {
-        Ok(())
-    } else {
-        Err(AppError::field(
-            "index",
-            &format!("index must be between 1 and {}", collection_item::MAX_INDEX),
-        ))
-    }
-}
-
 fn collection_error_to_app_error(err: collection::CollectionError) -> AppError {
     match err {
         collection::CollectionError::DuplicateSlug => {
             AppError::Conflict("a collection with this name already exists".into())
         }
+        err @ collection::CollectionError::LabelsTooWide { .. } => {
+            AppError::Conflict(err.to_string())
+        }
         collection::CollectionError::Database(e) => AppError::Database(e),
     }
 }
 
-fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppError {
-    match err {
-        collection_item::CollectionItemError::DuplicateIndex => {
-            AppError::Conflict("an item already exists at this index".into())
+fn validate_number_width(width: Option<i16>) -> Result<(), AppError> {
+    match width {
+        Some(width) if !collection::is_valid_number_width(width) => {
+            Err(AppError::field("numberWidth", "numberWidth must be 3 or 4"))
         }
-        collection_item::CollectionItemError::UnknownReference => {
+        _ => Ok(()),
+    }
+}
+
+/// How a numbering refusal reaches the client: a field error (400) when the
+/// request itself is wrong, a conflict (409) when the collection's current
+/// state stands in the way.
+fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppError {
+    use collection_item::{CollectionItemError as E, LabelRefusal};
+    match err {
+        E::Database(e) => AppError::Database(e),
+        E::CollectionGone => AppError::NotFound,
+        E::UnknownReference => {
             AppError::Conflict("the referenced arrangement does not exist".into())
         }
-        collection_item::CollectionItemError::InvalidReorder => {
+        E::InvalidReorder => {
             AppError::Conflict("orderedIds must be exactly the collection's current items".into())
         }
-        collection_item::CollectionItemError::DuplicateArrangement => {
+        E::DuplicateArrangement => {
             AppError::Conflict("this arrangement is already an item in the collection".into())
         }
-        collection_item::CollectionItemError::Database(e) => AppError::Database(e),
+        err @ E::WrongField { field, .. } => AppError::field(field, &err.to_string()),
+        err @ E::InvalidPosition { .. } => AppError::field("position", &err.to_string()),
+        err @ E::InvalidLabel => AppError::field("label", &err.to_string()),
+        err @ E::LabelRefused {
+            refusal: LabelRefusal::Taken,
+            ..
+        } => AppError::Conflict(err.to_string()),
+        err @ E::LabelRefused { .. } => AppError::field("label", &err.to_string()),
+        err @ E::SameItem => AppError::field("withItemId", &err.to_string()),
+        err @ (E::LabelNeeded { .. }
+        | E::CollectionFull
+        | E::NotStanding
+        | E::NotProgram
+        | E::StaleRenumber) => AppError::Conflict(err.to_string()),
     }
 }
 
@@ -158,9 +176,14 @@ async fn find_item_scoped(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateCollectionRequest {
     name: String,
-    /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
+    /// `program` (a concert: numbers are positions) or `standing` (a
+    /// Marschbuch: numbers are labels that keep their gaps).
     #[serde(rename = "type")]
     collection_type: String,
+    /// Digits in the WebDAV folder names, and so the highest label: `3`
+    /// (up to 999, the default) or `4` (up to 9999, for a large book).
+    #[serde(default)]
+    number_width: Option<i16>,
 }
 
 /// Request body for `PATCH …/collections/{collectionId}`: a partial update; an omitted
@@ -169,9 +192,13 @@ struct CreateCollectionRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateCollectionRequest {
     name: Option<String>,
-    /// `program` (fixed concert sequence) or `standing` (flexible repertoire).
+    /// `program` or `standing`. Program → standing keeps the numbers as
+    /// labels; standing → program closes the gaps.
     #[serde(rename = "type")]
     collection_type: Option<String>,
+    /// `3` or `4`. Widening renames every WebDAV folder; narrowing is a 409
+    /// while a label would not fit.
+    number_width: Option<i16>,
 }
 
 /// List an organization's collections (requires org membership).
@@ -283,6 +310,7 @@ async fn create_collection(
             "type must be `program` or `standing`",
         ));
     }
+    validate_number_width(body.number_width)?;
 
     let id = Uuid::now_v7();
     let slug = collection::slugify(&body.name);
@@ -293,6 +321,7 @@ async fn create_collection(
         &body.name,
         &slug,
         &body.collection_type,
+        body.number_width.unwrap_or(3),
         Some(auth.user.id),
     )
     .await
@@ -308,7 +337,12 @@ async fn create_collection(
         "collection.create",
         "collection",
         Some(created.id),
-        serde_json::json!({ "name": created.name, "slug": created.slug, "type": created.collection_type }),
+        serde_json::json!({
+            "name": created.name,
+            "slug": created.slug,
+            "type": created.collection_type,
+            "numberWidth": created.number_width,
+        }),
     )
     .await;
 
@@ -351,7 +385,12 @@ async fn get_collection(
     Ok(etag_response(found, updated_at))
 }
 
-/// Update a collection's name/type (owner/archivist/conductor; requires `If-Match`).
+/// Update a collection's name, type or number width (owner/archivist/conductor;
+/// requires `If-Match`).
+///
+/// Changing the type from `standing` to `program` closes the gaps in the
+/// numbering (a program's labels are its positions). Narrowing `numberWidth`
+/// is a 409 while a piece's label would not fit.
 #[utoipa::path(
     patch,
     path = "/orgs/{orgId}/collections/{collectionId}",
@@ -401,11 +440,16 @@ async fn update_collection(
             "type must be `program` or `standing`",
         ));
     }
+    validate_number_width(body.number_width)?;
     let name = body.name.unwrap_or_else(|| current.name.clone());
     let collection_type = body
         .collection_type
         .unwrap_or_else(|| current.collection_type.clone());
-    if name == current.name && collection_type == current.collection_type {
+    let number_width = body.number_width.unwrap_or(current.number_width);
+    if name == current.name
+        && collection_type == current.collection_type
+        && number_width == current.number_width
+    {
         let updated_at = current.updated_at;
         return Ok(etag_response(current, updated_at));
     }
@@ -414,8 +458,11 @@ async fn update_collection(
         &state.db,
         id,
         Some(listing::version_of(current.updated_at)),
-        &name,
-        &collection_type,
+        collection::CollectionFields {
+            name: &name,
+            collection_type: &collection_type,
+            number_width,
+        },
     )
     .await
     .map_err(collection_error_to_app_error)?
@@ -434,8 +481,16 @@ async fn update_collection(
         "collection",
         Some(id),
         serde_json::json!({
-            "before": { "name": current.name, "type": current.collection_type },
-            "after": { "name": updated.name, "type": updated.collection_type },
+            "before": {
+                "name": current.name,
+                "type": current.collection_type,
+                "numberWidth": current.number_width,
+            },
+            "after": {
+                "name": updated.name,
+                "type": updated.collection_type,
+                "numberWidth": updated.number_width,
+            },
         }),
     )
     .await;
@@ -558,11 +613,14 @@ async fn undelete_collection(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReorderRequest {
-    /// The item IDs in their new order; reassigned indices `1..=n`.
+    /// The item IDs in their new order; reassigned positions `1..=n`.
     ordered_ids: Vec<Uuid>,
 }
 
-/// Reorder a collection's items (owner/archivist/conductor).
+/// Reorder a program's items (owner/archivist/conductor).
+///
+/// Programs only: a standing collection's order follows its labels, so it
+/// answers 409; relabel, swap or renumber its pieces instead.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/collections/{collectionId}/reorder",
@@ -617,9 +675,9 @@ async fn reorder_items(
 
 // ── CollectionItem ─────────────────────────────────────────────────────────
 
-/// List a collection's items in index order (requires org membership). A
-/// soft-deleted arrangement is surfaced with `arrangementRemoved: true` and its
-/// slug, not dropped (hide-with-references).
+/// List a collection's items in position order (requires org membership).
+/// Display each item's `label`. A soft-deleted arrangement is surfaced with
+/// `arrangementRemoved: true` and its slug, not dropped (hide-with-references).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}/items",
@@ -631,7 +689,7 @@ async fn reorder_items(
     ),
     security(("bearer" = []), ("session" = [])),
     responses(
-        (status = 200, description = "Items in index order",
+        (status = 200, description = "Items in position order",
             body = Vec<collection_item::CollectionItemView>),
         CommonErrors,
         Validation400,
@@ -655,10 +713,20 @@ async fn list_items(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateItemRequest {
     arrangement_id: Uuid,
-    index: i32,
+    /// Programs only: where the piece goes, 1..n+1 (default: the end); the
+    /// pieces from there on move down one.
+    position: Option<i32>,
+    /// Standing collections only: the piece's number, `12` or `12a`. Must
+    /// be a free number below the highest, the highest + 1 (the default),
+    /// or a letter after a number in use; anything else is a 400, a taken
+    /// label a 409.
+    label: Option<String>,
 }
 
-/// Add an arrangement to a collection at an index (owner/archivist/conductor).
+/// Add an arrangement to a collection (owner/archivist/conductor).
+///
+/// A program takes an optional `position`, a standing collection an optional
+/// `label`; sending the other one is a 400 naming it.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/collections/{collectionId}/items",
@@ -690,7 +758,6 @@ async fn add_item(
 ) -> Result<axum::response::Response, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, id).await?;
-    validate_index(body.index)?;
 
     // The arrangement must live in the same org (else 404, not a leaked FK).
     let arr = crate::domain::arrangement::find_by_id(&state.db, body.arrangement_id).await?;
@@ -705,7 +772,10 @@ async fn add_item(
         item_id,
         id,
         body.arrangement_id,
-        body.index,
+        collection_item::Placement {
+            position: body.position,
+            label: body.label.as_deref(),
+        },
         Some(auth.user.id),
     )
     .await
@@ -721,7 +791,12 @@ async fn add_item(
         "collection_item.create",
         "collection_item",
         Some(created.id),
-        serde_json::json!({ "collectionId": id, "arrangementId": body.arrangement_id, "index": body.index }),
+        serde_json::json!({
+            "collectionId": id,
+            "arrangementId": body.arrangement_id,
+            "position": created.position,
+            "label": created.label,
+        }),
     )
     .await;
 
@@ -765,15 +840,22 @@ async fn get_item(
     Ok(etag_response(item, updated_at))
 }
 
-/// Request body for moving an item to a new index: a partial update like
-/// every `PATCH`, so `{}` (or the item's current index) changes nothing.
+/// Request body for moving an item: a partial update like every `PATCH`, so
+/// `{}` (or the item's current place) changes nothing.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateItemRequest {
-    index: Option<i32>,
+    /// Programs only: the new position, 1..n; the pieces in between shift.
+    position: Option<i32>,
+    /// Standing collections only: the new label, under the same rule as
+    /// adding (the piece's own current label does not count against it).
+    label: Option<String>,
 }
 
-/// Move a collection item to a new index (owner/archivist/conductor; requires `If-Match`).
+/// Move a collection item (owner/archivist/conductor; requires `If-Match`).
+///
+/// A program's item moves to a `position`; a standing collection's item to
+/// a `label`. Nothing else in a standing collection changes number.
 #[utoipa::path(
     patch,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
@@ -811,20 +893,20 @@ async fn update_item(
     let current = find_item_scoped(&state, org_id, collection_id, item_id, false).await?;
     listing::check_if_match(if_match_header(&headers), current.updated_at)
         .map_err(|_| AppError::PreconditionFailed)?;
-    let index = match body.index {
-        Some(index) if index != current.index => index,
-        _ => {
-            let updated_at = current.updated_at;
-            return Ok(etag_response(current, updated_at));
-        }
-    };
-    validate_index(index)?;
+    if body.position.is_none() && body.label.is_none() {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(current, updated_at));
+    }
 
-    let Some(updated) = collection_item::update_index(
+    let Some(updated) = collection_item::move_item(
         &state.db,
+        collection_id,
         item_id,
         Some(listing::version_of(current.updated_at)),
-        index,
+        collection_item::Placement {
+            position: body.position,
+            label: body.label.as_deref(),
+        },
     )
     .await
     .map_err(item_error_to_app_error)?
@@ -838,6 +920,11 @@ async fn update_item(
         ))
         .await);
     };
+    if updated.updated_at == current.updated_at {
+        // Moved to where it already was: nothing written, nothing audited.
+        let updated_at = updated.updated_at;
+        return Ok(etag_response(updated, updated_at));
+    }
 
     audit(
         &state.db,
@@ -849,7 +936,10 @@ async fn update_item(
         "collection_item.update",
         "collection_item",
         Some(item_id),
-        serde_json::json!({ "before": { "index": current.index }, "after": { "index": updated.index } }),
+        serde_json::json!({
+            "before": { "position": current.position, "label": current.label },
+            "after": { "position": updated.position, "label": updated.label },
+        }),
     )
     .await;
 
@@ -858,6 +948,9 @@ async fn update_item(
 }
 
 /// Remove a collection item (owner/archivist/conductor; requires `If-Match`).
+///
+/// In a program the gap closes; in a standing collection it stays, and the
+/// other pieces keep their labels.
 #[utoipa::path(
     delete,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
@@ -920,14 +1013,28 @@ async fn delete_item(
         "collection_item.soft_delete",
         "collection_item",
         Some(item_id),
-        serde_json::json!({ "collectionId": collection_id, "index": current.index }),
+        serde_json::json!({ "collectionId": collection_id, "label": current.label }),
     )
     .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Optional request body for restoring a removed item.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UndeleteItemRequest {
+    /// Standing collections only: the label to restore the piece under when
+    /// its old one is taken, under the same rule as adding.
+    label: Option<String>,
+}
+
 /// Restore a removed collection item (owner/archivist/conductor).
+///
+/// A program's piece returns to its old position (the end, if the program
+/// has shrunk). A standing collection's piece returns under its old label
+/// if that is free; otherwise send a `label`, or get a 409 saying one is
+/// needed. The body is optional.
 #[utoipa::path(
     post,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete",
@@ -939,9 +1046,11 @@ async fn delete_item(
         ("itemId"       = Uuid, Path, description = "Item ID"),
     ),
     security(("bearer" = []), ("session" = [])),
+    request_body(content = Option<UndeleteItemRequest>, description = "Optional; only for a standing collection's taken label"),
     responses(
         (status = 204, description = "Item restored"),
         CommonErrors,
+        JsonBodyErrors,
         Validation400,
         Forbidden403,
         NotFound404,
@@ -953,11 +1062,13 @@ async fn undelete_item(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    OptionalApiJson(body): OptionalApiJson<UndeleteItemRequest>,
 ) -> Result<StatusCode, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
-    let current = find_item_scoped(&state, org_id, collection_id, item_id, true).await?;
+    find_item_scoped(&state, org_id, collection_id, item_id, true).await?;
+    let label = body.and_then(|b| b.label);
 
-    let restored = collection_item::restore(&state.db, collection_id, item_id)
+    let restored = collection_item::restore(&state.db, collection_id, item_id, label.as_deref())
         .await
         .map_err(item_error_to_app_error)?;
     if !restored {
@@ -974,11 +1085,187 @@ async fn undelete_item(
         "collection_item.undelete",
         "collection_item",
         Some(item_id),
-        serde_json::json!({ "collectionId": collection_id, "index": current.index }),
+        serde_json::json!({ "collectionId": collection_id, "label": label }),
     )
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request body for swapping two pieces.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SwapItemRequest {
+    /// The other piece, in the same collection.
+    with_item_id: Uuid,
+}
+
+/// Swap two pieces (owner/archivist/conductor): their positions in a
+/// program, their labels in a standing collection.
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/swap",
+    tag = "collections",
+    summary = "Swap two collection items",
+    params(
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
+        ("itemId"       = Uuid, Path, description = "Item ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = SwapItemRequest,
+    responses(
+        (status = 204, description = "Items swapped"),
+        CommonErrors,
+        JsonBodyErrors,
+        Validation400,
+        Forbidden403,
+        NotFound404,
+    )
+)]
+async fn swap_item(
+    auth: BearerOrSession,
+    State(state): State<AppState>,
+    RequestId(request_id): RequestId,
+    Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
+    ApiJson(body): ApiJson<SwapItemRequest>,
+) -> Result<StatusCode, AppError> {
+    require_collection_editor_v1(&state, &auth, org_id).await?;
+    find_collection_scoped(&state, org_id, collection_id).await?;
+
+    if !collection_item::swap(&state.db, collection_id, item_id, body.with_item_id)
+        .await
+        .map_err(item_error_to_app_error)?
+    {
+        return Err(AppError::NotFound);
+    }
+
+    audit(
+        &state.db,
+        &AuditContext {
+            actor_user_id: Some(auth.user.id),
+            org_id: Some(org_id),
+            request_id: Some(request_id),
+        },
+        "collection_item.swap",
+        "collection_item",
+        Some(item_id),
+        serde_json::json!({ "collectionId": collection_id, "withItemId": body.with_item_id }),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Preview a renumber of a standing collection (owner/archivist/conductor):
+/// every piece's label now and after (1..n in the current order, letters
+/// dropped), and the token that applies exactly this.
+///
+/// A program is always numbered 1..n, so it answers 409.
+#[utoipa::path(
+    get,
+    path = "/orgs/{orgId}/collections/{collectionId}/renumber",
+    tag = "collections",
+    summary = "Preview a renumber",
+    params(
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    responses(
+        (status = 200, description = "What a renumber would change",
+            body = collection_item::RenumberPreview),
+        CommonErrors,
+        Validation400,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+    )
+)]
+async fn preview_renumber(
+    auth: BearerOrSession,
+    State(state): State<AppState>,
+    Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<collection_item::RenumberPreview>, AppError> {
+    require_collection_editor_v1(&state, &auth, org_id).await?;
+    find_collection_scoped(&state, org_id, collection_id).await?;
+    let preview = collection_item::renumber_preview(&state.db, collection_id)
+        .await
+        .map_err(item_error_to_app_error)?;
+    Ok(Json(preview))
+}
+
+/// Request body for applying a renumber.
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenumberCollectionRequest {
+    /// `previewToken` from `GET …/renumber`.
+    preview_token: String,
+}
+
+/// The changes a renumber made.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RenumberResult {
+    /// Every piece, in order, with its label before and after.
+    changes: Vec<collection_item::RenumberChange>,
+}
+
+/// Renumber a standing collection (owner/archivist/conductor): labels 1..n
+/// in the current order, closing every gap and dropping letters.
+///
+/// This changes the numbers printed in the players' folders, so it applies
+/// only the preview the client showed: a `previewToken` from a collection
+/// that has changed since is a 409, and the client previews again.
+#[utoipa::path(
+    post,
+    path = "/orgs/{orgId}/collections/{collectionId}/renumber",
+    tag = "collections",
+    summary = "Renumber a standing collection",
+    params(
+        ("orgId"        = Uuid, Path, description = "Organization ID"),
+        ("collectionId" = Uuid, Path, description = "Collection ID"),
+    ),
+    security(("bearer" = []), ("session" = [])),
+    request_body = RenumberCollectionRequest,
+    responses(
+        (status = 200, description = "Renumbered", body = RenumberResult),
+        CommonErrors,
+        JsonBodyErrors,
+        Validation400,
+        Forbidden403,
+        NotFound404,
+        Conflict409,
+    )
+)]
+async fn renumber_collection(
+    auth: BearerOrSession,
+    State(state): State<AppState>,
+    RequestId(request_id): RequestId,
+    Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
+    ApiJson(body): ApiJson<RenumberCollectionRequest>,
+) -> Result<Json<RenumberResult>, AppError> {
+    require_collection_editor_v1(&state, &auth, org_id).await?;
+    find_collection_scoped(&state, org_id, collection_id).await?;
+    let changes = collection_item::renumber(&state.db, collection_id, &body.preview_token)
+        .await
+        .map_err(item_error_to_app_error)?;
+
+    audit(
+        &state.db,
+        &AuditContext {
+            actor_user_id: Some(auth.user.id),
+            org_id: Some(org_id),
+            request_id: Some(request_id),
+        },
+        "collection.renumber",
+        "collection",
+        Some(collection_id),
+        serde_json::json!({ "changes": changes }),
+    )
+    .await;
+
+    Ok(Json(RenumberResult { changes }))
 }
 
 /// Coverage for a collection: which required voices are assigned, and which are

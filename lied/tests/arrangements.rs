@@ -1586,12 +1586,18 @@ async fn every_guarded_write_refuses_a_stale_version() {
         "Spring",
         "spring",
         "program",
+        3,
         None,
     )
     .await
     .unwrap();
+    let coll_fields = |name| collection::CollectionFields {
+        name,
+        collection_type: "program",
+        number_width: 3,
+    };
     assert!(
-        collection::update(pool, c.id, stale(c.updated_at), "X", "program")
+        collection::update(pool, c.id, stale(c.updated_at), coll_fields("X"))
             .await
             .unwrap()
             .is_none()
@@ -1600,26 +1606,36 @@ async fn every_guarded_write_refuses_a_stale_version() {
         pool,
         c.id,
         Some(version(c.updated_at)),
-        "Spring Gala",
-        "program",
+        coll_fields("Spring Gala"),
     )
     .await
     .unwrap()
     .unwrap();
 
-    let item = collection_item::create(pool, Uuid::now_v7(), c.id, arr.id, 1, None)
-        .await
-        .unwrap();
+    let item =
+        collection_item::create(pool, Uuid::now_v7(), c.id, arr.id, Default::default(), None)
+            .await
+            .unwrap();
+    let to_first = collection_item::Placement {
+        position: Some(1),
+        label: None,
+    };
     assert!(
-        collection_item::update_index(pool, item.id, stale(item.updated_at), 1)
+        collection_item::move_item(pool, c.id, item.id, stale(item.updated_at), to_first)
             .await
             .unwrap()
             .is_none()
     );
-    let item = collection_item::update_index(pool, item.id, Some(version(item.updated_at)), 1)
-        .await
-        .unwrap()
-        .unwrap();
+    let item = collection_item::move_item(
+        pool,
+        c.id,
+        item.id,
+        Some(version(item.updated_at)),
+        to_first,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     let pa = part_assignment::assign(pool, Uuid::now_v7(), item.id, v.id, player.id, None)
         .await

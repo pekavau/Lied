@@ -8,7 +8,7 @@
 //!
 //! Three trees:
 //! - `/orgs/<org>/arrangements/<arr>/{score,voices/<voice>/{<file>,annotations/<user>/<file>}}`
-//! - `/orgs/<org>/collections/<coll>/<index>-<arr>/{score,voices/<voice>/<file>}` —
+//! - `/orgs/<org>/collections/<coll>/<label>-<arr>/{score,voices/<voice>/<file>}` —
 //!   a read-only computed view assembled from `CollectionItem`s +
 //!   `PartAssignment`s (issue #10). No annotations subtree here: annotations
 //!   are addressed via the arrangements tree only.
@@ -23,22 +23,23 @@ const VOICES: &str = "voices";
 const ANNOTATIONS: &str = "annotations";
 const LIBRARY: &str = "library";
 
-/// Split a collections item directory segment (`<index>-<arrangement-slug>`,
-/// e.g. `1-bolero`) into `(index, arrangement_slug)`. Splits on the *first* `-`
-/// only, since the index is always a plain non-negative integer with no `-` of
-/// its own (this exactly inverts the `<index>-<slug>` construction the
-/// filesystem layer uses when listing a collection) — the arrangement slug may
-/// itself contain further hyphens. Returns `None` if the segment doesn't have
-/// the `<digits>-<rest>` shape, which the caller maps to `404 Not Found`.
-fn split_item_segment(seg: &str) -> Option<(i32, &str)> {
+/// Split a collections item directory segment (`<label>-<arrangement-slug>`,
+/// e.g. `007-bolero` or `012a-la-mer`) into `(label, arrangement_slug)`.
+/// Splits on the *first* `-` only: a label never contains one, an
+/// arrangement slug may. The label is normalised (zero padding dropped,
+/// lowercase) to the form stored on the item, so `007`, `7` and `07` all
+/// name piece 7; the listing always shows the padded form. Returns `None`
+/// if the segment doesn't have the `<label>-<rest>` shape, which the caller
+/// maps to `404 Not Found`.
+fn split_item_segment(seg: &str) -> Option<(String, &str)> {
     let dash = seg.find('-')?;
-    let (idx_str, rest) = seg.split_at(dash);
-    let index: i32 = idx_str.parse().ok()?;
+    let (label_str, rest) = seg.split_at(dash);
+    let label = crate::domain::collection_item::Label::parse_padded(label_str)?;
     let arr_slug = &rest[1..];
     if arr_slug.is_empty() {
         return None;
     }
-    Some((index, arr_slug))
+    Some((label.to_string(), arr_slug))
 }
 
 /// A WebDAV path resolved to its position in the entity tree. Every variant is
@@ -108,52 +109,52 @@ pub enum ResolvedPath {
     CollectionsRoot { org: String },
     /// `/orgs/<org>/collections/<coll>`
     Collection { org: String, coll: String },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>` — the `<index>-<arr-slug>`
-    /// segment is split here into its numeric `index` and candidate
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>` — the `<label>-<arr-slug>`
+    /// segment is split here into its normalised `label` and candidate
     /// `arr_slug`; the filesystem layer resolves both against the live
-    /// `CollectionItem` (the index locates the item, the slug is verified
+    /// `CollectionItem` (the label locates the item, the slug is verified
     /// against it).
     CollectionItemDir {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
     },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/score`
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>/score`
     CollectionScoreDir {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
     },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/score/<file>`
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>/score/<file>`
     CollectionScoreFile {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
         file: String,
     },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices`
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>/voices`
     CollectionVoicesDir {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
     },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices/<voice>`
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>/voices/<voice>`
     CollectionVoice {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
         voice: String,
     },
-    /// `/orgs/<org>/collections/<coll>/<index>-<arr>/voices/<voice>/<file>`
+    /// `/orgs/<org>/collections/<coll>/<label>-<arr>/voices/<voice>/<file>`
     CollectionVoiceFile {
         org: String,
         coll: String,
-        index: i32,
+        label: String,
         arr_slug: String,
         voice: String,
         file: String,
@@ -275,58 +276,58 @@ impl ResolvedPath {
                 coll: (*coll).to_string(),
             }),
             ["orgs", org, COLLECTIONS, coll, item] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionItemDir {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                 })
             }
             ["orgs", org, COLLECTIONS, coll, item, SCORE] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionScoreDir {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                 })
             }
             ["orgs", org, COLLECTIONS, coll, item, SCORE, file] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionScoreFile {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                     file: (*file).to_string(),
                 })
             }
             ["orgs", org, COLLECTIONS, coll, item, VOICES] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionVoicesDir {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                 })
             }
             ["orgs", org, COLLECTIONS, coll, item, VOICES, voice] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionVoice {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                     voice: (*voice).to_string(),
                 })
             }
             ["orgs", org, COLLECTIONS, coll, item, VOICES, voice, file] => {
-                let (index, arr_slug) = split_item_segment(item)?;
+                let (label, arr_slug) = split_item_segment(item)?;
                 Some(CollectionVoiceFile {
                     org: (*org).to_string(),
                     coll: (*coll).to_string(),
-                    index,
+                    label,
                     arr_slug: arr_slug.to_string(),
                     voice: (*voice).to_string(),
                     file: (*file).to_string(),
@@ -510,7 +511,7 @@ mod tests {
             Some(CollectionItemDir {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into()
             })
         );
@@ -519,7 +520,7 @@ mod tests {
             Some(CollectionScoreDir {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into()
             })
         );
@@ -528,7 +529,7 @@ mod tests {
             Some(CollectionScoreFile {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into(),
                 file: "full.pdf".into()
             })
@@ -538,7 +539,7 @@ mod tests {
             Some(CollectionVoicesDir {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into()
             })
         );
@@ -547,7 +548,7 @@ mod tests {
             Some(CollectionVoice {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into(),
                 voice: "flute-1".into()
             })
@@ -557,7 +558,7 @@ mod tests {
             Some(CollectionVoiceFile {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 1,
+                label: "1".into(),
                 arr_slug: "bolero".into(),
                 voice: "flute-1".into(),
                 file: "part.pdf".into()
@@ -578,10 +579,41 @@ mod tests {
             Some(CollectionItemDir {
                 org: "acme".into(),
                 coll: "spring-2026".into(),
-                index: 12,
+                label: "12".into(),
                 arr_slug: "la-mer".into()
             })
         );
+    }
+
+    #[test]
+    fn collection_item_labels_are_padded_lettered_and_normalised() {
+        // The listing pads to the collection's width (#102); a client may
+        // also send the bare label. Both name the same item.
+        for (segment, label, slug) in [
+            ("007-bolero", "7", "bolero"),
+            ("7-bolero", "7", "bolero"),
+            ("0007-bolero", "7", "bolero"),
+            ("012a-la-mer", "12a", "la-mer"),
+            ("012A-la-mer", "12a", "la-mer"),
+        ] {
+            assert_eq!(
+                p(&format!("/orgs/acme/collections/book/{segment}")),
+                Some(CollectionItemDir {
+                    org: "acme".into(),
+                    coll: "book".into(),
+                    label: label.into(),
+                    arr_slug: slug.into()
+                }),
+                "{segment}"
+            );
+        }
+        for bad in ["000-bolero", "12ab-x", "a1-x", "10000-x"] {
+            assert_eq!(
+                p(&format!("/orgs/acme/collections/book/{bad}")),
+                None,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

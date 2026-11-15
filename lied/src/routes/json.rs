@@ -51,6 +51,38 @@ impl<T: DeserializeOwned> FromRequest<AppState> for ApiJson<T> {
     }
 }
 
+/// An optional JSON request body: `None` when the request carries no body
+/// at all (no `Content-Type`, nothing sent); otherwise exactly [`ApiJson`]'s
+/// rules, so a malformed body is still a Problem Details error rather than
+/// silently treated as absent.
+pub(crate) struct OptionalApiJson<T>(pub Option<T>);
+
+#[async_trait::async_trait]
+impl<T: DeserializeOwned> FromRequest<AppState> for OptionalApiJson<T> {
+    type Rejection = AppError;
+
+    async fn from_request(request: Request, state: &AppState) -> Result<Self, AppError> {
+        if request.headers().contains_key(CONTENT_TYPE) {
+            return ApiJson::from_request(request, state)
+                .await
+                .map(|ApiJson(value)| OptionalApiJson(Some(value)));
+        }
+        let limit = usize::try_from(state.config.max_request_bytes).unwrap_or(usize::MAX);
+        let body = http_body_util::Limited::new(request.into_body(), limit);
+        let bytes = http_body_util::BodyExt::collect(body)
+            .await
+            .map_err(|err| read_error(&*err, limit))?
+            .to_bytes();
+        if bytes.is_empty() {
+            Ok(OptionalApiJson(None))
+        } else {
+            Err(AppError::UnsupportedMediaType(
+                "the request body must be JSON (`Content-Type: application/json`)".to_string(),
+            ))
+        }
+    }
+}
+
 /// `application/json`, or any `+json` media type, ignoring parameters such as
 /// `charset`.
 fn is_json(headers: &HeaderMap) -> bool {

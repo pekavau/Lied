@@ -316,18 +316,31 @@ pub async fn visible_collection_slugs(
 }
 
 /// A live collection item as seen through the WebDAV collections tree: its id,
-/// index, and its arrangement's slug (the item's WebDAV directory name is
-/// `<index>-<arrangementSlug>`). An item whose arrangement is soft-deleted is
+/// label (with the collection's number width), and its arrangement's slug (the item's
+/// WebDAV directory name is [`VisibleCollectionItem::folder_name`]). An item whose arrangement is soft-deleted is
 /// excluded — unlike the REST hide-with-references view (docs/design.md
 /// `CollectionItemView::arrangement_removed`), there is no meaningful
 /// directory to show for a filesystem view with no live files behind it.
 pub struct VisibleCollectionItem {
     pub id: Uuid,
-    pub index: i32,
+    pub label: String,
+    /// The collection's `number_width`, which the folder name is padded to.
+    pub number_width: i16,
     pub arrangement_slug: String,
 }
 
-/// Live items in a collection, in index order, visible to the user: staff see
+impl VisibleCollectionItem {
+    /// The item's WebDAV directory name: `<padded label>-<arrangement slug>`.
+    pub fn folder_name(&self) -> String {
+        crate::domain::collection_item::folder_name(
+            &self.label,
+            self.number_width,
+            &self.arrangement_slug,
+        )
+    }
+}
+
+/// Live items in a collection, in position order, visible to the user: staff see
 /// all; a restricted user sees only items they hold >=1 assignment on.
 pub async fn visible_collection_items(
     pool: &PgPool,
@@ -337,11 +350,12 @@ pub async fn visible_collection_items(
 ) -> Result<Vec<VisibleCollectionItem>, sqlx::Error> {
     if visibility.is_staff() {
         let rows = sqlx::query!(
-            r#"SELECT ci.id, ci.index, a.slug as arrangement_slug
+            r#"SELECT ci.id, ci.label, c.number_width, a.slug as arrangement_slug
                FROM collection_item ci
+               JOIN collection c ON c.id = ci.collection_id
                JOIN arrangement a ON a.id = ci.arrangement_id
                WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL
-               ORDER BY ci.index ASC, ci.id ASC"#,
+               ORDER BY ci.position ASC, ci.id ASC"#,
             collection_id,
         )
         .fetch_all(pool)
@@ -350,21 +364,23 @@ pub async fn visible_collection_items(
             .into_iter()
             .map(|r| VisibleCollectionItem {
                 id: r.id,
-                index: r.index,
+                label: r.label,
+                number_width: r.number_width,
                 arrangement_slug: r.arrangement_slug,
             })
             .collect())
     } else {
         let rows = sqlx::query!(
-            r#"SELECT DISTINCT ci.id, ci.index, a.slug as arrangement_slug
+            r#"SELECT DISTINCT ci.id, ci.position, ci.label, c.number_width, a.slug as arrangement_slug
                FROM collection_item ci
+               JOIN collection c ON c.id = ci.collection_id
                JOIN arrangement a ON a.id = ci.arrangement_id
                JOIN part_assignment pa ON pa.collection_item_id = ci.id
                JOIN voice v ON v.id = pa.voice_id
                WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND a.deleted_at IS NULL
                  AND v.deleted_at IS NULL
                  AND pa.user_id = $2
-               ORDER BY ci.index ASC, ci.id ASC"#,
+               ORDER BY ci.position ASC, ci.id ASC"#,
             collection_id,
             user_id,
         )
@@ -374,7 +390,8 @@ pub async fn visible_collection_items(
             .into_iter()
             .map(|r| VisibleCollectionItem {
                 id: r.id,
-                index: r.index,
+                label: r.label,
+                number_width: r.number_width,
                 arrangement_slug: r.arrangement_slug,
             })
             .collect())

@@ -1,21 +1,43 @@
-//! CollectionItem: an arrangement within a collection at a local index number
-//! (docs/design.md Entities: CollectionItem). Issue #9.
+//! CollectionItem: an arrangement within a collection (docs/design.md
+//! Entities: CollectionItem, and *Collection numbering*). Issues #9, #102.
 //!
-//! **Hide-with-references.** An item whose arrangement has been soft-deleted is
-//! *not* dropped from the collection — it is surfaced as "removed" (the
-//! [`CollectionItemView::arrangement_removed`] flag) with the arrangement slug
-//! still shown, so a broken reference is visible rather than silently missing
-//! (docs/design.md soft-delete cascade).
+//! Every item has a **position** (the running order, dense 1..n over the live
+//! items, maintained here) and a **label** (the number players are called
+//! by). What the label means depends on the collection's type:
 //!
-//! **Unique index.** `(collection_id, index)` is unique among live rows; a
-//! clash maps to [`CollectionItemError::DuplicateIndex`]. [`reorder`] reassigns
-//! a whole collection's indices atomically.
+//! - a **program** is a concert: its numbers are positions, so its labels are
+//!   always the positions as text, and adding, removing and reordering
+//!   renumber freely;
+//! - a **standing** collection (a Marschbuch, a Frühschoppenmappe) lives on
+//!   paper in every player's folder: its labels (`12`, `12a`) are the pieces'
+//!   identities, a removed piece leaves a gap, and only an explicit
+//!   [`renumber`] closes the gaps. Its positions follow the labels' natural
+//!   order ([`Label`]'s `Ord`), recomputed on every write.
+//!
+//! **One writer per collection.** Every write runs in one transaction that
+//! first locks the collection row ([`lock_collection`]); the rules (which
+//! label is free, which position exists) are checked and the rows written
+//! under that lock. The live-row uniqueness of `(collection_id, position)`
+//! and `(collection_id, label)` is a deferred exclusion constraint, checked
+//! at commit, so a write may move items through each other's numbers.
+//!
+//! **Hide-with-references.** An item whose arrangement has been soft-deleted
+//! is *not* dropped from the collection; it is surfaced as "removed"
+//! ([`CollectionItemView::arrangement_removed`]) with the arrangement slug
+//! still shown, so a broken reference is visible rather than silently
+//! missing.
+
+use std::collections::BTreeSet;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+type Tx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
 /// Wire representation of a `collection_item` row.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -24,7 +46,11 @@ pub struct CollectionItem {
     pub id: Uuid,
     pub collection_id: Uuid,
     pub arrangement_id: Uuid,
-    pub index: i32,
+    /// Running order, 1..n over the live items; order a list by it.
+    pub position: i32,
+    /// The number players are called by: `12`, or `12a` for a piece slipped
+    /// in later. In a program it is always `position` as text. Display it.
+    pub label: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by: Option<Uuid>,
@@ -45,33 +71,212 @@ pub struct CollectionItemView {
     pub arrangement_removed: bool,
 }
 
-/// Highest allowed piece number.
-///
-/// [`reorder`] parks every index at `index + INDEX_PARK_OFFSET` to clear the
-/// unique `(collection_id, index)` space before renumbering, so an index near
-/// `i32::MAX` would overflow Postgres `integer` mid-transaction. Capping well
-/// below that keeps the arithmetic safe, and a collection with a million pieces
-/// is not a thing.
-pub const MAX_INDEX: i32 = 999_999;
+// ── Labels ──────────────────────────────────────────────────────────────────
 
-/// The offset [`reorder`] parks indices at. Must exceed any legal index so the
-/// parked values cannot collide with un-parked ones.
-const INDEX_PARK_OFFSET: i32 = 1_000_000;
-
-/// Whether `index` is a usable piece number: positive and within [`MAX_INDEX`].
-/// Both write surfaces validate through this — the console form and `/v1` had
-/// drifted, and the console's missing cap turned into a 500 on the next
-/// reorder.
-pub fn is_valid_index(index: i32) -> bool {
-    (1..=MAX_INDEX).contains(&index)
+/// A piece number in a standing collection: 1–9999 with an optional
+/// lowercase letter (`12`, `12a`). Ordered naturally: by number, then the
+/// plain number before its letters (`12` < `12a` < `12b` < `13`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Label {
+    number: u16,
+    letter: Option<char>,
 }
+
+/// The largest number any label can carry (four digits); a collection's
+/// `number_width` may cap it lower.
+const MAX_LABEL_NUMBER: u16 = 9999;
+
+impl Label {
+    /// Parse a label as a client writes it: digits without a leading zero,
+    /// then at most one letter, case-insensitive (`12A` is `12a`).
+    pub fn parse(text: &str) -> Option<Label> {
+        let text = text.trim();
+        let (digits, letter) = match text.char_indices().last() {
+            Some((i, c)) if c.is_ascii_alphabetic() => (&text[..i], Some(c.to_ascii_lowercase())),
+            _ => (text, None),
+        };
+        if digits.is_empty()
+            || digits.len() > 4
+            || digits.starts_with('0')
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let number: u16 = digits.parse().ok()?;
+        Some(Label { number, letter })
+    }
+
+    /// Parse a label as it appears in a WebDAV folder name: zero-padded
+    /// (`007`, `012a`). Unpadded is accepted too.
+    pub fn parse_padded(text: &str) -> Option<Label> {
+        let trimmed = text.trim_start_matches('0');
+        Label::parse(trimmed)
+    }
+
+    /// The plain number `n`.
+    pub fn plain(number: u16) -> Label {
+        Label {
+            number,
+            letter: None,
+        }
+    }
+
+    pub fn number(&self) -> u16 {
+        self.number
+    }
+
+    pub fn letter(&self) -> Option<char> {
+        self.letter
+    }
+
+    /// Whether the number fits `width` digits.
+    pub fn fits(&self, width: i16) -> bool {
+        self.number <= max_number(width)
+    }
+
+    /// Zero-padded to `width` digits, for a WebDAV folder name (`007`,
+    /// `012a`, `0007`).
+    pub fn padded(&self, width: i16) -> String {
+        let width = usize::try_from(width).unwrap_or(3);
+        match self.letter {
+            Some(letter) => format!("{:0width$}{letter}", self.number),
+            None => format!("{:0width$}", self.number),
+        }
+    }
+}
+
+impl fmt::Display for Label {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.letter {
+            Some(letter) => write!(f, "{}{letter}", self.number),
+            None => write!(f, "{}", self.number),
+        }
+    }
+}
+
+/// The highest number a collection of `width` digits can label.
+pub fn max_number(width: i16) -> u16 {
+    match width {
+        3 => 999,
+        _ => MAX_LABEL_NUMBER,
+    }
+}
+
+/// The WebDAV folder name of an item: its label padded to the collection's
+/// width, then the arrangement slug (`007-radetzky-march`). A label that does
+/// not parse (cannot happen: the column has a format CHECK) is used as is.
+pub fn folder_name(label: &str, width: i16, arrangement_slug: &str) -> String {
+    let label = Label::parse(label).map_or_else(|| label.to_string(), |l| l.padded(width));
+    format!("{label}-{arrangement_slug}")
+}
+
+/// Why a label cannot be used for a piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelRefusal {
+    /// A live piece already has it.
+    Taken,
+    /// Its number has more digits than the collection's `number_width`.
+    TooWide,
+    /// Not one of the allowed labels: a number past the end, or a letter
+    /// next to a number nobody has.
+    NotAllowed,
+}
+
+/// The numbering of a standing collection's live pieces, and the rule for
+/// which label a piece may take (docs/design.md, *Which labels a new piece
+/// may take*). #103 extends it with sections.
+#[derive(Debug, Clone)]
+pub struct Numbering {
+    labels: BTreeSet<Label>,
+    width: i16,
+}
+
+/// The labels a new piece can choose from, for a form to offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelChoices {
+    /// Highest number + 1 (or `1` in an empty collection); `None` when that
+    /// no longer fits the collection's width.
+    pub suggested: Option<Label>,
+    /// Free numbers below the highest one, ascending.
+    pub gaps: Vec<Label>,
+}
+
+impl Numbering {
+    pub fn new(labels: impl IntoIterator<Item = Label>, width: i16) -> Self {
+        Numbering {
+            labels: labels.into_iter().collect(),
+            width,
+        }
+    }
+
+    /// The same numbering without `label`: for moving a piece, which must
+    /// not count its own current label against itself.
+    pub fn without(&self, label: &Label) -> Self {
+        let mut labels = self.labels.clone();
+        labels.remove(label);
+        Numbering {
+            labels,
+            width: self.width,
+        }
+    }
+
+    fn highest_number(&self) -> u16 {
+        self.labels.iter().map(Label::number).max().unwrap_or(0)
+    }
+
+    fn number_in_use(&self, number: u16) -> bool {
+        self.labels.iter().any(|l| l.number == number)
+    }
+
+    /// Whether `candidate` may be given to a piece:
+    /// - a free plain number below the highest one (a gap), or the highest
+    ///   + 1 (`1` in an empty collection);
+    /// - a free letter label `Na` whose number `N` some live piece carries
+    ///   (`12b` needs a `12` or `12a`, not both).
+    ///
+    /// Everything else is refused: a number far past the end is usually a
+    /// typo, and would leave a gap nobody chose.
+    pub fn check(&self, candidate: Label) -> Result<(), LabelRefusal> {
+        if !candidate.fits(self.width) {
+            return Err(LabelRefusal::TooWide);
+        }
+        if self.labels.contains(&candidate) {
+            return Err(LabelRefusal::Taken);
+        }
+        let allowed = match candidate.letter {
+            None => candidate.number <= self.highest_number() + 1,
+            Some(_) => self.number_in_use(candidate.number),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(LabelRefusal::NotAllowed)
+        }
+    }
+
+    /// The suggestion and the gaps, for a form.
+    pub fn choices(&self) -> LabelChoices {
+        let highest = self.highest_number();
+        let next = Label::plain(highest + 1);
+        LabelChoices {
+            suggested: next.fits(self.width).then_some(next),
+            gaps: (1..highest)
+                .map(Label::plain)
+                .filter(|l| !self.labels.contains(l))
+                .collect(),
+        }
+    }
+}
+
+// ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(thiserror::Error, Debug)]
 pub enum CollectionItemError {
     #[error("database error")]
     Database(#[from] sqlx::Error),
-    #[error("an item already exists at this index in the collection")]
-    DuplicateIndex,
+    /// The collection does not exist or is soft-deleted.
+    #[error("the collection does not exist")]
+    CollectionGone,
     #[error("the referenced collection or arrangement does not exist")]
     UnknownReference,
     #[error("the item order must be exactly the collection's current live items")]
@@ -81,13 +286,56 @@ pub enum CollectionItemError {
     /// arrangement — would list the same music under two numbers.
     #[error("this arrangement is already in the collection")]
     DuplicateArrangement,
+    /// A field that the collection's type does not use: `label` on a
+    /// program, `position` on a standing collection.
+    #[error("{field} does not apply to a {collection_type} collection")]
+    WrongField {
+        field: &'static str,
+        collection_type: &'static str,
+    },
+    /// A position outside `1..=max`.
+    #[error("position must be between 1 and {max}")]
+    InvalidPosition { max: i32 },
+    /// Not a label: digits without a leading zero, then at most one letter.
+    #[error("a label is a number from 1 to 9999, optionally followed by one letter (12, 12a)")]
+    InvalidLabel,
+    /// A well-formed label the rule refuses (see [`Numbering::check`]).
+    #[error("label {label} is not allowed: {}", refusal_text(*refusal))]
+    LabelRefused { label: Label, refusal: LabelRefusal },
+    /// Restoring a piece whose old label is taken (or no longer fits) needs
+    /// a label chosen.
+    #[error("label {old} is no longer free; choose a label to restore this piece under")]
+    LabelNeeded { old: String },
+    /// No room for another piece at the collection's number width.
+    #[error("the collection is full at its number width; widen it or renumber")]
+    CollectionFull,
+    /// Renumber is for standing collections; a program is always dense.
+    #[error("only a standing collection can be renumbered")]
+    NotStanding,
+    /// Reorder is for programs; a standing collection's order follows its
+    /// labels.
+    #[error("a standing collection's order follows its labels; relabel, swap or renumber instead")]
+    NotProgram,
+    /// The collection changed between the renumber preview and the apply.
+    #[error("the collection changed since the preview; preview the renumber again")]
+    StaleRenumber,
+    /// A swap of a piece with itself.
+    #[error("a piece cannot be swapped with itself")]
+    SameItem,
+}
+
+fn refusal_text(refusal: LabelRefusal) -> &'static str {
+    match refusal {
+        LabelRefusal::Taken => "another piece has it",
+        LabelRefusal::TooWide => "it has more digits than the collection's number width",
+        LabelRefusal::NotAllowed => {
+            "choose a free number below the highest, the highest + 1, or a letter after an existing number"
+        }
+    }
 }
 
 fn map_write_error(err: sqlx::Error) -> CollectionItemError {
     if let sqlx::Error::Database(ref db_err) = err {
-        if db_err.constraint() == Some("collection_item_collection_id_index_key") {
-            return CollectionItemError::DuplicateIndex;
-        }
         if db_err.constraint() == Some("collection_item_collection_id_arrangement_id_key") {
             return CollectionItemError::DuplicateArrangement;
         }
@@ -98,39 +346,166 @@ fn map_write_error(err: sqlx::Error) -> CollectionItemError {
     CollectionItemError::Database(err)
 }
 
-/// Add an arrangement to a collection at `index`.
-pub async fn create(
-    pool: &PgPool,
-    id: Uuid,
+// ── The collection lock and the layout ─────────────────────────────────────
+
+/// A collection's type, as it decides the numbering rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Program,
+    Standing,
+}
+
+impl Kind {
+    pub fn parse(collection_type: &str) -> Kind {
+        if collection_type == "standing" {
+            Kind::Standing
+        } else {
+            Kind::Program
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Program => "program",
+            Kind::Standing => "standing",
+        }
+    }
+}
+
+/// What a write needs to know about the collection it holds the lock on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Locked {
+    pub kind: Kind,
+    pub number_width: i16,
+}
+
+/// Lock a live collection's row for an item write, so writes to one
+/// collection run one at a time. `FOR NO KEY UPDATE` still lets other rows
+/// insert references to the collection.
+pub(crate) async fn lock_collection(
+    tx: &mut Tx<'_>,
     collection_id: Uuid,
-    arrangement_id: Uuid,
-    index: i32,
-    created_by: Option<Uuid>,
-) -> Result<CollectionItem, CollectionItemError> {
-    let row = sqlx::query_as!(
+) -> Result<Locked, CollectionItemError> {
+    let row = sqlx::query!(
+        r#"SELECT type as "collection_type!", number_width FROM collection
+           WHERE id = $1 AND deleted_at IS NULL
+           FOR NO KEY UPDATE"#,
+        collection_id,
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(CollectionItemError::CollectionGone)?;
+    Ok(Locked {
+        kind: Kind::parse(&row.collection_type),
+        number_width: row.number_width,
+    })
+}
+
+/// One live item as the layout code sees it.
+#[derive(Debug, Clone)]
+struct Slot {
+    id: Uuid,
+    label: Label,
+}
+
+/// The live items in position order.
+async fn live_slots(tx: &mut Tx<'_>, collection_id: Uuid) -> Result<Vec<Slot>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"SELECT id, label FROM collection_item
+           WHERE collection_id = $1 AND deleted_at IS NULL
+           ORDER BY position ASC, id ASC"#,
+        collection_id,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Slot {
+            id: r.id,
+            // The column's CHECK keeps every label parseable.
+            label: Label::parse(&r.label).unwrap_or(Label::plain(MAX_LABEL_NUMBER)),
+        })
+        .collect())
+}
+
+/// Write positions 1..n in `order`, with labels: a program's are the
+/// positions; a standing collection's are the slots' own. Rows already at
+/// their place are left alone (their `updated_at`, and so their ETag, stays).
+async fn write_layout(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+    kind: Kind,
+    order: &[Slot],
+) -> Result<(), CollectionItemError> {
+    for (index, slot) in order.iter().enumerate() {
+        let position = i32::try_from(index + 1).unwrap_or(i32::MAX);
+        let label = match kind {
+            Kind::Program => position.to_string(),
+            Kind::Standing => slot.label.to_string(),
+        };
+        sqlx::query!(
+            r#"UPDATE collection_item SET position = $2, label = $3, updated_at = now()
+               WHERE id = $1 AND collection_id = $4 AND deleted_at IS NULL
+                 AND (position <> $2 OR label <> $3)"#,
+            slot.id,
+            position,
+            label,
+            collection_id,
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(map_write_error)?;
+    }
+    Ok(())
+}
+
+/// Sort a standing collection's slots by label, the order its positions
+/// follow.
+fn by_label(mut slots: Vec<Slot>) -> Vec<Slot> {
+    slots.sort_by_key(|s| s.label);
+    slots
+}
+
+/// Commit, mapping a constraint checked at commit (the deferred uniqueness
+/// backstop) like any other write error.
+async fn commit(tx: Tx<'_>) -> Result<(), CollectionItemError> {
+    tx.commit().await.map_err(map_write_error)
+}
+
+fn parse_label(text: &str) -> Result<Label, CollectionItemError> {
+    Label::parse(text).ok_or(CollectionItemError::InvalidLabel)
+}
+
+fn refused(label: Label, refusal: LabelRefusal) -> CollectionItemError {
+    CollectionItemError::LabelRefused { label, refusal }
+}
+
+/// Whether a program of `count` items still fits its width (its labels are
+/// its positions).
+fn program_fits(count: usize, width: i16) -> bool {
+    count <= usize::from(max_number(width))
+}
+
+async fn fetch_item(tx: &mut Tx<'_>, id: Uuid) -> Result<CollectionItem, sqlx::Error> {
+    sqlx::query_as!(
         CollectionItem,
         r#"
-        INSERT INTO collection_item (id, collection_id, arrangement_id, index, created_by)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING
-            id, collection_id, arrangement_id, index,
+        SELECT
+            id, collection_id, arrangement_id, position, label,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
             deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item
+        WHERE id = $1
         "#,
         id,
-        collection_id,
-        arrangement_id,
-        index,
-        created_by,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(map_write_error)?;
-
-    Ok(row)
 }
+
+// ── Reads ───────────────────────────────────────────────────────────────────
 
 /// Look up a live item by id (soft-deleted hidden).
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<CollectionItem>, sqlx::Error> {
@@ -138,7 +513,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<CollectionItem
         CollectionItem,
         r#"
         SELECT
-            id, collection_id, arrangement_id, index,
+            id, collection_id, arrangement_id, position, label,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -161,7 +536,7 @@ pub async fn find_by_id_including_deleted(
         CollectionItem,
         r#"
         SELECT
-            id, collection_id, arrangement_id, index,
+            id, collection_id, arrangement_id, position, label,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -175,17 +550,15 @@ pub async fn find_by_id_including_deleted(
     .await
 }
 
-/// List a collection's live items in index order, each with its arrangement's
-/// display info (surfacing soft-deleted arrangements as removed). Items are
-/// hidden if the collection itself is soft-deleted.
+/// List a collection's live items in position order, each with its
+/// arrangement's display info (surfacing soft-deleted arrangements as
+/// removed). Items are hidden if the collection itself is soft-deleted.
 ///
 /// **Deliberately unpaginated.** Every caller needs the whole set to be
 /// correct, not merely complete: the console renders one reorder form over all
 /// rows and submits their ids as the new order, and the domain's [`reorder`]
 /// rejects anything that is not a permutation of the live items — so a page of
-/// them would be refused by construction. The bound is the collection itself: a
-/// program is a concert and a standing collection a book, both of which are
-/// tens of entries, not thousands.
+/// them would be refused by construction. The bound is the collection itself.
 pub async fn list_for_collection(
     pool: &PgPool,
     collection_id: Uuid,
@@ -193,7 +566,7 @@ pub async fn list_for_collection(
     let rows = sqlx::query!(
         r#"
         SELECT
-            ci.id, ci.collection_id, ci.arrangement_id, ci.index,
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
             ci.created_at as "created_at: DateTime<Utc>",
             ci.updated_at as "updated_at: DateTime<Utc>",
             ci.created_by,
@@ -205,7 +578,7 @@ pub async fn list_for_collection(
         JOIN collection c ON c.id = ci.collection_id
         JOIN arrangement a ON a.id = ci.arrangement_id
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
-        ORDER BY ci.index ASC, ci.id ASC
+        ORDER BY ci.position ASC, ci.id ASC
         "#,
         collection_id,
     )
@@ -219,7 +592,8 @@ pub async fn list_for_collection(
                 id: r.id,
                 collection_id: r.collection_id,
                 arrangement_id: r.arrangement_id,
-                index: r.index,
+                position: r.position,
+                label: r.label,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 created_by: r.created_by,
@@ -254,7 +628,7 @@ pub async fn list_deleted_for_collection(
     let rows = sqlx::query!(
         r#"
         SELECT
-            ci.id, ci.collection_id, ci.arrangement_id, ci.index,
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
             ci.created_at as "created_at: DateTime<Utc>",
             ci.updated_at as "updated_at: DateTime<Utc>",
             ci.created_by,
@@ -319,7 +693,8 @@ pub async fn list_deleted_for_collection(
                 id: r.id,
                 collection_id: r.collection_id,
                 arrangement_id: r.arrangement_id,
-                index: r.index,
+                position: r.position,
+                label: r.label,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 created_by: r.created_by,
@@ -334,49 +709,263 @@ pub async fn list_deleted_for_collection(
     Ok((items, total))
 }
 
-/// Move a single item to `new_index`. Maps a clash on the existing index to
-/// [`CollectionItemError::DuplicateIndex`]. Returns `None` if no live item
-/// matched.
+// ── Writes ──────────────────────────────────────────────────────────────────
+
+/// Where a new or moved piece goes. Which field applies depends on the
+/// collection's type: `position` for a program, `label` for a standing
+/// collection; giving the other is [`CollectionItemError::WrongField`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Placement<'a> {
+    pub position: Option<i32>,
+    pub label: Option<&'a str>,
+}
+
+fn check_fields(kind: Kind, placement: Placement<'_>) -> Result<(), CollectionItemError> {
+    match kind {
+        Kind::Program if placement.label.is_some() => Err(CollectionItemError::WrongField {
+            field: "label",
+            collection_type: kind.name(),
+        }),
+        Kind::Standing if placement.position.is_some() => Err(CollectionItemError::WrongField {
+            field: "position",
+            collection_type: kind.name(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn index_for_position(position: i32, max: usize) -> Result<usize, CollectionItemError> {
+    let max_i32 = i32::try_from(max).unwrap_or(i32::MAX);
+    if (1..=max_i32).contains(&position) {
+        Ok(usize::try_from(position - 1).unwrap_or(0))
+    } else {
+        Err(CollectionItemError::InvalidPosition { max: max_i32 })
+    }
+}
+
+/// Add an arrangement to a collection.
 ///
-/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
-pub async fn update_index(
+/// - Program: at `placement.position` (1..n+1, default the end); the pieces
+///   from there on move down one.
+/// - Standing: under `placement.label` (an allowed label, see
+///   [`Numbering::check`]; default highest + 1); nothing else moves.
+pub async fn create(
     pool: &PgPool,
     id: Uuid,
+    collection_id: Uuid,
+    arrangement_id: Uuid,
+    placement: Placement<'_>,
+    created_by: Option<Uuid>,
+) -> Result<CollectionItem, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    check_fields(locked.kind, placement)?;
+    let slots = live_slots(&mut tx, collection_id).await?;
+
+    let (label, order) = match locked.kind {
+        Kind::Program => {
+            if !program_fits(slots.len() + 1, locked.number_width) {
+                return Err(CollectionItemError::CollectionFull);
+            }
+            let at = match placement.position {
+                Some(position) => index_for_position(position, slots.len() + 1)?,
+                None => slots.len(),
+            };
+            let mut order = slots;
+            // The label is rewritten by `write_layout`; any value will do.
+            let label = Label::plain(1);
+            order.insert(at, Slot { id, label });
+            (label, order)
+        }
+        Kind::Standing => {
+            let numbering = Numbering::new(slots.iter().map(|s| s.label), locked.number_width);
+            let label = match placement.label {
+                Some(text) => {
+                    let label = parse_label(text)?;
+                    numbering.check(label).map_err(|r| refused(label, r))?;
+                    label
+                }
+                None => numbering
+                    .choices()
+                    .suggested
+                    .ok_or(CollectionItemError::CollectionFull)?,
+            };
+            let mut order = slots;
+            order.push(Slot { id, label });
+            (label, by_label(order))
+        }
+    };
+
+    // Inserted at the end; `write_layout` then gives every piece its place
+    // (the uniqueness check waits for the commit).
+    let end = i32::try_from(order.len()).unwrap_or(i32::MAX);
+    sqlx::query!(
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, position, label, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6)"#,
+        id,
+        collection_id,
+        arrangement_id,
+        end,
+        label.to_string(),
+        created_by,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_write_error)?;
+    write_layout(&mut tx, collection_id, locked.kind, &order).await?;
+    let created = fetch_item(&mut tx, id).await?;
+    commit(tx).await?;
+    Ok(created)
+}
+
+/// Lock a live item of the collection at the caller's version, under the
+/// collection lock. `None`: no such live item, or a stale version.
+async fn lock_item(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+    item_id: Uuid,
     expected_version: Option<i64>,
-    new_index: i32,
-) -> Result<Option<CollectionItem>, CollectionItemError> {
-    let row = sqlx::query_as!(
+) -> Result<Option<CollectionItem>, sqlx::Error> {
+    sqlx::query_as!(
         CollectionItem,
         r#"
-        UPDATE collection_item
-        SET index = $2, updated_at = now()
-        WHERE id = $1 AND deleted_at IS NULL
-          AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
-        RETURNING
-            id, collection_id, arrangement_id, index,
+        SELECT
+            id, collection_id, arrangement_id, position, label,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
             deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item
+        WHERE id = $1 AND collection_id = $2 AND deleted_at IS NULL
+          AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
+        FOR UPDATE
         "#,
-        id,
-        new_index,
+        item_id,
+        collection_id,
         expected_version,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(map_write_error)?;
-
-    Ok(row)
 }
 
-/// Reassign a whole collection's indices to `1..=n` in the order given by
-/// `ordered_ids`, atomically. `ordered_ids` must be *exactly* a permutation of
-/// the collection's current live item ids — no missing, extra, foreign, or
-/// duplicate ids — else [`CollectionItemError::InvalidReorder`] and the
-/// transaction rolls back (a partial list would otherwise silently corrupt the
-/// order). Indices are parked out of range first so the per-row updates never
-/// transiently collide on the unique `(collection_id, index)` index.
+/// Move a piece.
+///
+/// - Program: to `placement.position` (1..n); the pieces in between shift by
+///   one.
+/// - Standing: to `placement.label`, an allowed label (its own current label
+///   does not count against it); nothing else moves.
+///
+/// Moving a piece to where it already is writes nothing. Returns `None` if
+/// no live item matched at `expected_version`.
+///
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
+pub async fn move_item(
+    pool: &PgPool,
+    collection_id: Uuid,
+    item_id: Uuid,
+    expected_version: Option<i64>,
+    placement: Placement<'_>,
+) -> Result<Option<CollectionItem>, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    check_fields(locked.kind, placement)?;
+    let Some(current) = lock_item(&mut tx, collection_id, item_id, expected_version).await? else {
+        return Ok(None);
+    };
+    let slots = live_slots(&mut tx, collection_id).await?;
+
+    let order = match locked.kind {
+        Kind::Program => {
+            let Some(position) = placement.position else {
+                return Ok(Some(current));
+            };
+            let to = index_for_position(position, slots.len())?;
+            if position == current.position {
+                return Ok(Some(current));
+            }
+            let mut order: Vec<Slot> = slots;
+            let from = order.iter().position(|s| s.id == item_id).unwrap_or(0);
+            let slot = order.remove(from);
+            order.insert(to, slot);
+            order
+        }
+        Kind::Standing => {
+            let Some(text) = placement.label else {
+                return Ok(Some(current));
+            };
+            let label = parse_label(text)?;
+            let own = Label::parse(&current.label).unwrap_or(Label::plain(MAX_LABEL_NUMBER));
+            if label == own {
+                return Ok(Some(current));
+            }
+            let numbering =
+                Numbering::new(slots.iter().map(|s| s.label), locked.number_width).without(&own);
+            numbering.check(label).map_err(|r| refused(label, r))?;
+            let order = slots
+                .into_iter()
+                .map(|s| {
+                    if s.id == item_id {
+                        Slot { id: s.id, label }
+                    } else {
+                        s
+                    }
+                })
+                .collect();
+            by_label(order)
+        }
+    };
+    write_layout(&mut tx, collection_id, locked.kind, &order).await?;
+    let moved = fetch_item(&mut tx, item_id).await?;
+    commit(tx).await?;
+    Ok(Some(moved))
+}
+
+/// Swap two pieces: their positions in a program, their labels in a standing
+/// collection. Returns `false` if either is not a live item of the
+/// collection.
+pub async fn swap(
+    pool: &PgPool,
+    collection_id: Uuid,
+    item_id: Uuid,
+    with_item_id: Uuid,
+) -> Result<bool, CollectionItemError> {
+    if item_id == with_item_id {
+        return Err(CollectionItemError::SameItem);
+    }
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    let mut slots = live_slots(&mut tx, collection_id).await?;
+    let (Some(a), Some(b)) = (
+        slots.iter().position(|s| s.id == item_id),
+        slots.iter().position(|s| s.id == with_item_id),
+    ) else {
+        return Ok(false);
+    };
+    let order = match locked.kind {
+        Kind::Program => {
+            slots.swap(a, b);
+            slots
+        }
+        Kind::Standing => {
+            let (label_a, label_b) = (slots[a].label, slots[b].label);
+            slots[a].label = label_b;
+            slots[b].label = label_a;
+            by_label(slots)
+        }
+    };
+    write_layout(&mut tx, collection_id, locked.kind, &order).await?;
+    commit(tx).await?;
+    Ok(true)
+}
+
+/// Reassign a program's positions to `1..=n` in the order of `ordered_ids`,
+/// atomically. `ordered_ids` must be *exactly* a permutation of the
+/// collection's current live item ids — no missing, extra, foreign, or
+/// duplicate ids — else [`CollectionItemError::InvalidReorder`] (a partial
+/// list would otherwise silently corrupt the order).
+///
+/// A standing collection's order follows its labels, so it refuses with
+/// [`CollectionItemError::NotProgram`].
 pub async fn reorder(
     pool: &PgPool,
     collection_id: Uuid,
@@ -385,137 +974,32 @@ pub async fn reorder(
     use std::collections::HashSet;
 
     let mut tx = pool.begin().await?;
-
-    // Lock the collection's live items and confirm `ordered_ids` is a
-    // permutation of them before touching any index.
-    let live: Vec<Uuid> = sqlx::query_scalar!(
-        r#"SELECT id FROM collection_item
-           WHERE collection_id = $1 AND deleted_at IS NULL
-           FOR UPDATE"#,
-        collection_id,
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-
-    let live_set: HashSet<Uuid> = live.iter().copied().collect();
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if locked.kind != Kind::Program {
+        return Err(CollectionItemError::NotProgram);
+    }
+    let slots = live_slots(&mut tx, collection_id).await?;
+    let live_set: HashSet<Uuid> = slots.iter().map(|s| s.id).collect();
     let ordered_set: HashSet<Uuid> = ordered_ids.iter().copied().collect();
-    if ordered_ids.len() != live.len() || ordered_set != live_set {
-        // Duplicates (len mismatch after dedupe), missing, or foreign ids.
-        tx.rollback().await?;
+    if ordered_ids.len() != slots.len() || ordered_set != live_set {
         return Err(CollectionItemError::InvalidReorder);
     }
-
-    // Park every live item's index far out of range to clear the space.
-    sqlx::query!(
-        r#"UPDATE collection_item SET index = index + $2
-           WHERE collection_id = $1 AND deleted_at IS NULL"#,
-        collection_id,
-        INDEX_PARK_OFFSET,
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    for (pos, id) in ordered_ids.iter().enumerate() {
-        let new_index = (pos as i32) + 1;
-        sqlx::query!(
-            r#"UPDATE collection_item SET index = $1, updated_at = now()
-               WHERE id = $2 AND collection_id = $3 AND deleted_at IS NULL"#,
-            new_index,
-            id,
-            collection_id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_write_error)?;
-    }
-
-    tx.commit().await?;
-    Ok(())
+    let order: Vec<Slot> = ordered_ids
+        .iter()
+        .map(|id| Slot {
+            id: *id,
+            label: Label::plain(1),
+        })
+        .collect();
+    write_layout(&mut tx, collection_id, locked.kind, &order).await?;
+    commit(tx).await
 }
 
-/// Assign 1..n to `ordered_ids` inside an open transaction, parking the
-/// collection's live indices out of range first so the per-row updates never
-/// transiently collide on the unique `(collection_id, index)` index.
+/// Remove a piece. In a program the gap closes (the pieces after it move up
+/// one); in a standing collection **the gap stays**: the other labels are
+/// printed on paper and do not change. Positions stay dense either way.
 ///
-/// This is the one place piece numbers are written. Every operation that
-/// changes the running order — reorder, remove, restore — ends here, which is
-/// what keeps the numbers dense and increasing down the collection no matter
-/// which one ran.
-async fn renumber(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    collection_id: Uuid,
-    ordered_ids: &[Uuid],
-) -> Result<(), CollectionItemError> {
-    park(tx, collection_id).await?;
-    assign_order(tx, collection_id, ordered_ids).await
-}
-
-/// Move every live index of a collection out of the legal range, clearing the
-/// unique space so the subsequent per-row writes cannot transiently collide.
-/// Parked values land in `[1 + OFFSET, MAX_INDEX + OFFSET]`, which is why
-/// [`MAX_INDEX`] must stay below the offset.
-async fn park(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    collection_id: Uuid,
-) -> Result<(), CollectionItemError> {
-    sqlx::query!(
-        r#"UPDATE collection_item SET index = index + $2
-           WHERE collection_id = $1 AND deleted_at IS NULL"#,
-        collection_id,
-        INDEX_PARK_OFFSET,
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-/// Assign 1..n to already-parked rows.
-async fn assign_order(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    collection_id: Uuid,
-    ordered_ids: &[Uuid],
-) -> Result<(), CollectionItemError> {
-    for (position, id) in ordered_ids.iter().enumerate() {
-        let new_index = (position as i32) + 1;
-        sqlx::query!(
-            r#"UPDATE collection_item SET index = $1, updated_at = now()
-               WHERE id = $2 AND collection_id = $3 AND deleted_at IS NULL"#,
-            new_index,
-            id,
-            collection_id,
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(map_write_error)?;
-    }
-    Ok(())
-}
-
-/// The collection's live item ids in index order, inside a transaction.
-async fn live_ids_in_order(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    collection_id: Uuid,
-) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar!(
-        r#"SELECT id FROM collection_item
-           WHERE collection_id = $1 AND deleted_at IS NULL
-           ORDER BY index ASC, id ASC
-           FOR UPDATE"#,
-        collection_id,
-    )
-    .fetch_all(&mut **tx)
-    .await
-}
-
-/// Remove a piece and close the gap it leaves: the pieces after it shift down
-/// one, so the numbering stays dense and increasing.
-///
-/// Leaving the gap and letting the next reorder collapse it would mean the
-/// numbers shown after a removal are not the numbers the collection actually
-/// has — a standing collection is drawn from by number, so "there is no 3 any
-/// more, count on" is not a state worth rendering.
-///
-/// Returns `false` if no live item matched.
+/// Returns `false` if no live item matched at `expected_version`.
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn remove(
@@ -525,35 +1009,32 @@ pub async fn remove(
     expected_version: Option<i64>,
 ) -> Result<bool, CollectionItemError> {
     let mut tx = pool.begin().await?;
-
-    let removed = sqlx::query!(
-        r#"UPDATE collection_item SET deleted_at = now(), updated_at = now()
-           WHERE id = $1 AND collection_id = $2 AND deleted_at IS NULL
-             AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
-           RETURNING id"#,
-        item_id,
-        collection_id,
-        expected_version,
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    if removed.is_none() {
-        tx.rollback().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if lock_item(&mut tx, collection_id, item_id, expected_version)
+        .await?
+        .is_none()
+    {
         return Ok(false);
     }
-
-    let remaining = live_ids_in_order(&mut tx, collection_id).await?;
-    renumber(&mut tx, collection_id, &remaining).await?;
-    tx.commit().await?;
+    sqlx::query!(
+        r#"UPDATE collection_item SET deleted_at = now(), updated_at = now() WHERE id = $1"#,
+        item_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let remaining = live_slots(&mut tx, collection_id).await?;
+    write_layout(&mut tx, collection_id, locked.kind, &remaining).await?;
+    commit(tx).await?;
     Ok(true)
 }
 
-/// Restore a removed piece at the position it held, shifting the pieces from
-/// there on up one.
+/// Restore a removed piece.
 ///
-/// The number it had is where it belongs — restoring is undoing a removal, not
-/// appending. If the collection has since shrunk below that number the piece
-/// lands at the end instead, so the numbering stays dense.
+/// - Program: at the position it held, the pieces from there on moving down
+///   one; at the end if the collection has since shrunk below it.
+/// - Standing: under its old label if that is still free (and fits the
+///   width), else under `label`, an allowed label; with neither,
+///   [`CollectionItemError::LabelNeeded`].
 ///
 /// Refuses with [`CollectionItemError::DuplicateArrangement`] when the same
 /// arrangement has been re-added in the meantime: the collection would
@@ -564,11 +1045,20 @@ pub async fn restore(
     pool: &PgPool,
     collection_id: Uuid,
     item_id: Uuid,
+    label: Option<&str>,
 ) -> Result<bool, CollectionItemError> {
     let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    check_fields(
+        locked.kind,
+        Placement {
+            position: None,
+            label,
+        },
+    )?;
 
     let Some(target) = sqlx::query!(
-        r#"SELECT index, arrangement_id FROM collection_item
+        r#"SELECT position, label, arrangement_id FROM collection_item
            WHERE id = $1 AND collection_id = $2 AND deleted_at IS NOT NULL
            FOR UPDATE"#,
         item_id,
@@ -577,7 +1067,6 @@ pub async fn restore(
     .fetch_optional(&mut *tx)
     .await?
     else {
-        tx.rollback().await?;
         return Ok(false);
     };
 
@@ -593,66 +1082,333 @@ pub async fn restore(
     .fetch_one(&mut *tx)
     .await?;
     if clash {
-        tx.rollback().await?;
         return Err(CollectionItemError::DuplicateArrangement);
     }
 
-    let live = live_ids_in_order(&mut tx, collection_id).await?;
+    let slots = live_slots(&mut tx, collection_id).await?;
+    let (new_label, order) = match locked.kind {
+        Kind::Program => {
+            if !program_fits(slots.len() + 1, locked.number_width) {
+                return Err(CollectionItemError::CollectionFull);
+            }
+            let at = usize::try_from(target.position.max(1) - 1)
+                .unwrap_or(0)
+                .min(slots.len());
+            let mut order = slots;
+            order.insert(
+                at,
+                Slot {
+                    id: item_id,
+                    label: Label::plain(1),
+                },
+            );
+            (Label::plain(1), order)
+        }
+        Kind::Standing => {
+            let numbering = Numbering::new(slots.iter().map(|s| s.label), locked.number_width);
+            let old = Label::parse(&target.label);
+            let old_is_free = old.is_some_and(|l| {
+                !matches!(
+                    numbering.check(l),
+                    Err(LabelRefusal::Taken | LabelRefusal::TooWide)
+                )
+            });
+            let chosen = match (label, old) {
+                // The old label is an undo, not a new number: it is taken
+                // back even past the end, as long as it is free.
+                (None, Some(old)) if old_is_free => old,
+                (None, _) => {
+                    return Err(CollectionItemError::LabelNeeded {
+                        old: target.label.clone(),
+                    })
+                }
+                (Some(text), old) => {
+                    let wanted = parse_label(text)?;
+                    if old == Some(wanted) && old_is_free {
+                        wanted
+                    } else {
+                        numbering.check(wanted).map_err(|r| refused(wanted, r))?;
+                        wanted
+                    }
+                }
+            };
+            let mut order = slots;
+            order.push(Slot {
+                id: item_id,
+                label: chosen,
+            });
+            (chosen, by_label(order))
+        }
+    };
 
-    // Park the live rows BEFORE reviving this one: its old number is very
-    // likely taken by whichever piece shifted into it, and coming back at that
-    // number would violate the unique index on the spot. Parking clears the
-    // whole legal range first, and the row rejoins above the parked block —
-    // `2 * INDEX_PARK_OFFSET` is out of reach of any parked value because
-    // `MAX_INDEX < INDEX_PARK_OFFSET`.
-    park(&mut tx, collection_id).await?;
+    let end = i32::try_from(order.len()).unwrap_or(i32::MAX);
     sqlx::query!(
-        r#"UPDATE collection_item SET deleted_at = NULL, index = $2, updated_at = now()
+        r#"UPDATE collection_item SET deleted_at = NULL, position = $2, label = $3, updated_at = now()
            WHERE id = $1"#,
         item_id,
-        2 * INDEX_PARK_OFFSET,
+        end,
+        new_label.to_string(),
     )
     .execute(&mut *tx)
     .await
     .map_err(map_write_error)?;
-
-    // Its old number, clamped to the end of a collection that has since shrunk.
-    let position = (target.index.max(1) as usize - 1).min(live.len());
-    let mut order = live;
-    order.insert(position, item_id);
-    assign_order(&mut tx, collection_id, &order).await?;
-
-    tx.commit().await?;
+    write_layout(&mut tx, collection_id, locked.kind, &order).await?;
+    commit(tx).await?;
     Ok(true)
 }
 
-/// Soft-delete an item without touching the other pieces' numbers. Prefer
-/// [`remove`], which closes the gap; this stays for callers that manage the
-/// numbering themselves.
-///
-/// Returns `false` if no live row matched.
-pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query!(
-        r#"UPDATE collection_item SET deleted_at = now(), updated_at = now()
-           WHERE id = $1 AND deleted_at IS NULL"#,
-        id,
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
+// ── Renumber ────────────────────────────────────────────────────────────────
+
+/// One piece's number before and after a renumber.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RenumberChange {
+    pub item_id: Uuid,
+    pub from: String,
+    pub to: String,
 }
 
-/// Undelete an item. Can fail with [`CollectionItemError::DuplicateIndex`] if
-/// its old index was reused while it was gone. Returns `false` if no
-/// soft-deleted row matched.
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, CollectionItemError> {
-    let result = sqlx::query!(
-        r#"UPDATE collection_item SET deleted_at = NULL, updated_at = now()
-           WHERE id = $1 AND deleted_at IS NOT NULL"#,
-        id,
-    )
-    .execute(pool)
-    .await
-    .map_err(map_write_error)?;
-    Ok(result.rows_affected() > 0)
+/// What a renumber would do, and the token that applies exactly that.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RenumberPreview {
+    /// Every live piece, in order, with its label now and after the
+    /// renumber (equal where it does not change).
+    pub changes: Vec<RenumberChange>,
+    /// Pass it back to apply this preview; it no longer matches once the
+    /// collection's pieces or labels change.
+    pub preview_token: String,
+}
+
+/// The token for a collection's current pieces: a hash of every live
+/// (item id, label) in order.
+fn preview_token(slots: &[Slot]) -> String {
+    let mut hasher = Sha256::new();
+    for slot in slots {
+        hasher.update(slot.id.as_bytes());
+        hasher.update(slot.label.to_string().as_bytes());
+        hasher.update(b";");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn renumber_changes(slots: &[Slot]) -> Vec<RenumberChange> {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| RenumberChange {
+            item_id: slot.id,
+            from: slot.label.to_string(),
+            to: (index + 1).to_string(),
+        })
+        .collect()
+}
+
+/// Preview a renumber of a standing collection: 1..n in the current order,
+/// letters dropped. Programs are always dense, so they refuse with
+/// [`CollectionItemError::NotStanding`].
+pub async fn renumber_preview(
+    pool: &PgPool,
+    collection_id: Uuid,
+) -> Result<RenumberPreview, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if locked.kind != Kind::Standing {
+        return Err(CollectionItemError::NotStanding);
+    }
+    let slots = live_slots(&mut tx, collection_id).await?;
+    tx.rollback().await?;
+    Ok(RenumberPreview {
+        changes: renumber_changes(&slots),
+        preview_token: preview_token(&slots),
+    })
+}
+
+/// Apply the renumber a [`renumber_preview`] showed, if the collection has
+/// not changed since ([`CollectionItemError::StaleRenumber`] otherwise).
+/// Returns the changes made. This is the one operation that changes a
+/// standing collection's printed numbers: the re-sleeve of the folder.
+pub async fn renumber(
+    pool: &PgPool,
+    collection_id: Uuid,
+    token: &str,
+) -> Result<Vec<RenumberChange>, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if locked.kind != Kind::Standing {
+        return Err(CollectionItemError::NotStanding);
+    }
+    let slots = live_slots(&mut tx, collection_id).await?;
+    if preview_token(&slots) != token {
+        return Err(CollectionItemError::StaleRenumber);
+    }
+    let changes = renumber_changes(&slots);
+    close_gaps(&mut tx, collection_id, slots).await?;
+    commit(tx).await?;
+    Ok(changes)
+}
+
+/// Labels 1..n in the current order, inside an open transaction that holds
+/// the collection lock. Shared by [`renumber`] and a standing → program type
+/// change.
+async fn close_gaps(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+    slots: Vec<Slot>,
+) -> Result<(), CollectionItemError> {
+    let order: Vec<Slot> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| Slot {
+            id: slot.id,
+            label: Label::plain(u16::try_from(index + 1).unwrap_or(MAX_LABEL_NUMBER)),
+        })
+        .collect();
+    write_layout(tx, collection_id, Kind::Standing, &order).await
+}
+
+/// For a type or width change of a collection whose row the caller has
+/// locked: the highest label number in use (0 when empty).
+pub(crate) async fn highest_number_in(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+) -> Result<u16, sqlx::Error> {
+    Ok(live_slots(tx, collection_id)
+        .await?
+        .iter()
+        .map(|s| s.label.number())
+        .max()
+        .unwrap_or(0))
+}
+
+/// For a standing → program type change, under the caller's collection
+/// lock: close the gaps, so the labels become the positions.
+pub(crate) async fn close_gaps_for_program(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let slots = live_slots(tx, collection_id).await?;
+    close_gaps(tx, collection_id, slots)
+        .await
+        .map_err(|err| match err {
+            CollectionItemError::Database(err) => err,
+            // Rewriting positions and labels touches neither the
+            // arrangement uniqueness nor a foreign key, so only the database
+            // itself can fail here.
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn l(text: &str) -> Label {
+        Label::parse(text).unwrap_or_else(|| panic!("{text} should parse"))
+    }
+
+    fn numbering(labels: &[&str]) -> Numbering {
+        Numbering::new(labels.iter().map(|t| l(t)), 3)
+    }
+
+    #[test]
+    fn labels_parse_case_insensitively_and_strictly() {
+        assert_eq!(l("12A"), l("12a"));
+        assert_eq!(l(" 7 ").to_string(), "7");
+        for bad in ["", "0", "012", "12ab", "a", "12-a", "10000", "1.5", "-3"] {
+            assert_eq!(Label::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(Label::parse_padded("007"), Some(l("7")));
+        assert_eq!(Label::parse_padded("012a"), Some(l("12a")));
+        assert_eq!(Label::parse_padded("000"), None);
+    }
+
+    #[test]
+    fn labels_order_naturally() {
+        let mut labels = [l("13"), l("12b"), l("2"), l("12"), l("12a"), l("100")];
+        labels.sort();
+        let text: Vec<String> = labels.iter().map(Label::to_string).collect();
+        assert_eq!(text, ["2", "12", "12a", "12b", "13", "100"]);
+    }
+
+    #[test]
+    fn padded_folder_names_sort_like_the_labels() {
+        assert_eq!(l("7").padded(3), "007");
+        assert_eq!(l("12a").padded(3), "012a");
+        assert_eq!(l("7").padded(4), "0007");
+        // `-` sorts before letters, so 012- < 012a- < 013-.
+        let mut names = vec![
+            folder_name("13", 3, "c"),
+            folder_name("12a", 3, "b"),
+            folder_name("12", 3, "a"),
+        ];
+        names.sort();
+        assert_eq!(names, ["012-a", "012a-b", "013-c"]);
+    }
+
+    #[test]
+    fn allowed_labels_are_gaps_the_next_number_or_a_letter() {
+        let n = numbering(&["1", "2", "5", "9"]);
+        assert_eq!(n.check(l("3")), Ok(()), "a gap");
+        assert_eq!(n.check(l("10")), Ok(()), "the next number");
+        assert_eq!(
+            n.check(l("11")),
+            Err(LabelRefusal::NotAllowed),
+            "past the end"
+        );
+        assert_eq!(n.check(l("5")), Err(LabelRefusal::Taken));
+        assert_eq!(n.check(l("5a")), Ok(()), "a letter after a used number");
+        assert_eq!(n.check(l("5b")), Ok(()), "5b needs no 5a");
+        assert_eq!(
+            n.check(l("4a")),
+            Err(LabelRefusal::NotAllowed),
+            "4 is unused"
+        );
+        assert_eq!(n.check(l("1000")), Err(LabelRefusal::TooWide));
+    }
+
+    #[test]
+    fn an_empty_collection_starts_at_one() {
+        let n = numbering(&[]);
+        assert_eq!(n.check(l("1")), Ok(()));
+        assert_eq!(n.check(l("2")), Err(LabelRefusal::NotAllowed));
+        assert_eq!(n.check(l("1a")), Err(LabelRefusal::NotAllowed));
+        assert_eq!(
+            n.choices(),
+            LabelChoices {
+                suggested: Some(l("1")),
+                gaps: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn choices_list_the_gaps_and_the_next_number() {
+        let n = numbering(&["1", "2", "5", "5a", "9"]);
+        assert_eq!(
+            n.choices(),
+            LabelChoices {
+                suggested: Some(l("10")),
+                gaps: vec![l("3"), l("4"), l("6"), l("7"), l("8")],
+            }
+        );
+        let full = numbering(&["999"]);
+        assert_eq!(full.choices().suggested, None);
+    }
+
+    #[test]
+    fn a_moved_piece_does_not_count_against_itself() {
+        let n = numbering(&["1", "2", "3"]);
+        // Moving 3 to 4 would invent a gap at 3: refused, as removing 3 and
+        // adding it back would allow only 3.
+        assert_eq!(
+            n.without(&l("3")).check(l("4")),
+            Err(LabelRefusal::NotAllowed)
+        );
+        assert_eq!(n.without(&l("2")).check(l("2")), Ok(()));
+    }
 }

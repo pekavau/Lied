@@ -39,6 +39,9 @@ pub struct Collection {
     /// `program` | `standing`.
     #[serde(rename = "type")]
     pub collection_type: String,
+    /// Digits in the WebDAV folder names of its pieces (`007-…` or
+    /// `0007-…`), and so the highest label: 999 or 9999.
+    pub number_width: i16,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by: Option<Uuid>,
@@ -51,6 +54,14 @@ pub enum CollectionError {
     Database(#[from] sqlx::Error),
     #[error("slug already exists in this organization")]
     DuplicateSlug,
+    /// A narrower `number_width` than a live piece's label needs.
+    #[error("a piece is numbered {highest}, which does not fit {width} digits")]
+    LabelsTooWide { highest: u16, width: i16 },
+}
+
+/// The allowed `number_width` values.
+pub fn is_valid_number_width(width: i16) -> bool {
+    width == 3 || width == 4
 }
 
 fn map_write_error(err: sqlx::Error) -> CollectionError {
@@ -80,6 +91,7 @@ pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
 pub const FILTER_ALLOWLIST: &[&str] = &["type"];
 
 /// Insert a new collection row.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     pool: &PgPool,
     id: Uuid,
@@ -87,16 +99,18 @@ pub async fn create(
     name: &str,
     slug: &str,
     collection_type: &str,
+    number_width: i16,
     created_by: Option<Uuid>,
 ) -> Result<Collection, CollectionError> {
     let row = sqlx::query_as!(
         Collection,
         r#"
-        INSERT INTO collection (id, organization_id, name, slug, type, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO collection (id, organization_id, name, slug, type, number_width, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING
             id, organization_id, name, slug,
             type as "collection_type!",
+            number_width,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -107,6 +121,7 @@ pub async fn create(
         name,
         slug,
         collection_type,
+        number_width,
         created_by,
     )
     .fetch_one(pool)
@@ -124,6 +139,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Collection>, s
         SELECT
             id, organization_id, name, slug,
             type as "collection_type!",
+            number_width,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -148,6 +164,7 @@ pub async fn find_by_id_including_deleted(
         SELECT
             id, organization_id, name, slug,
             type as "collection_type!",
+            number_width,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -178,7 +195,7 @@ pub async fn list_for_org(
     let query = format!(
         r#"
         SELECT
-            id, organization_id, name, slug, type,
+            id, organization_id, name, slug, type, number_width,
             created_at, updated_at, created_by, deleted_at,
             count(*) OVER() as total
         FROM collection
@@ -223,6 +240,7 @@ pub async fn list_for_org(
                 name: row.try_get("name")?,
                 slug: row.try_get("slug")?,
                 collection_type: row.try_get("type")?,
+                number_width: row.try_get("number_width")?,
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
                 created_by: row.try_get("created_by")?,
@@ -249,6 +267,7 @@ pub async fn list_deleted_for_org(
         SELECT
             id, organization_id, name, slug,
             type as "collection_type!",
+            number_width,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -276,42 +295,90 @@ pub async fn list_deleted_for_org(
     Ok((rows, total))
 }
 
-/// Update a collection's mutable fields (`name`, `type`). `slug` is immutable.
-/// Returns `None` if no live row matched.
+/// The mutable fields of a collection, for [`update`].
+#[derive(Debug, Clone, Copy)]
+pub struct CollectionFields<'a> {
+    pub name: &'a str,
+    pub collection_type: &'a str,
+    pub number_width: i16,
+}
+
+/// Update a collection's mutable fields (`name`, `type`, `number_width`).
+/// `slug` is immutable. Returns `None` if no live row matched.
+///
+/// Runs under the same per-collection lock as every item write
+/// ([`collection_item`](crate::domain::collection_item)), because two of the
+/// fields change what the items' numbers mean:
+///
+/// - **type** program → standing keeps the numbers as labels; standing →
+///   program closes the gaps (a renumber), since a program's labels are its
+///   positions;
+/// - **number_width** may always widen; narrowing is refused
+///   ([`CollectionError::LabelsTooWide`]) while a live label would not fit.
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
 pub async fn update(
     pool: &PgPool,
     id: Uuid,
     expected_version: Option<i64>,
-    name: &str,
-    collection_type: &str,
+    fields: CollectionFields<'_>,
 ) -> Result<Option<Collection>, CollectionError> {
+    use crate::domain::collection_item;
+
+    let mut tx = pool.begin().await?;
+    let Some(current) = sqlx::query!(
+        r#"SELECT type as "collection_type!", number_width FROM collection
+           WHERE id = $1 AND deleted_at IS NULL
+             AND ($2::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $2)
+           FOR NO KEY UPDATE"#,
+        id,
+        expected_version,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    if fields.number_width < current.number_width {
+        let highest = collection_item::highest_number_in(&mut tx, id).await?;
+        if highest > collection_item::max_number(fields.number_width) {
+            return Err(CollectionError::LabelsTooWide {
+                highest,
+                width: fields.number_width,
+            });
+        }
+    }
+    if current.collection_type == "standing" && fields.collection_type == "program" {
+        collection_item::close_gaps_for_program(&mut tx, id).await?;
+    }
+
     let row = sqlx::query_as!(
         Collection,
         r#"
         UPDATE collection
-        SET name = $2, type = $3, updated_at = now()
-        WHERE id = $1 AND deleted_at IS NULL
-          AND ($4::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $4)
+        SET name = $2, type = $3, number_width = $4, updated_at = now()
+        WHERE id = $1
         RETURNING
             id, organization_id, name, slug,
             type as "collection_type!",
+            number_width,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
             deleted_at as "deleted_at: DateTime<Utc>"
         "#,
         id,
-        name,
-        collection_type,
-        expected_version,
+        fields.name,
+        fields.collection_type,
+        fields.number_width,
     )
-    .fetch_optional(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_write_error)?;
+    tx.commit().await.map_err(map_write_error)?;
 
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// Soft-delete: sets `deleted_at` on this collection only (its items are

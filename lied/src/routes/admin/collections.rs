@@ -92,7 +92,65 @@ struct CollectionForm {
     name: Option<String>,
     #[serde(rename = "type")]
     collection_type: Option<String>,
+    number_width: Option<String>,
     expected_version: Option<String>,
+}
+
+/// The submitted `number_width`: `Ok(None)` when the form left it out,
+/// `Err` for anything but 3 or 4.
+fn parse_number_width(raw: Option<&str>) -> Result<Option<i16>, ()> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<i16>() {
+            Ok(width) if collection::is_valid_number_width(width) => Ok(Some(width)),
+            _ => Err(()),
+        },
+    }
+}
+
+/// The digits select for a collection form.
+fn width_select(current: i16) -> maud::Markup {
+    html! {
+        select name="number_width" {
+            option value="3" selected[current == 3] { "3 digits (up to 999)" }
+            option value="4" selected[current == 4] { "4 digits (up to 9999)" }
+        }
+    }
+}
+
+/// A numbering refusal as a console page. Messages come from the domain
+/// error, so the console and `/v1` explain a refusal the same way.
+fn item_error_page(
+    ctx: &ConsoleCtx,
+    err: collection_item::CollectionItemError,
+    what: &str,
+) -> Response {
+    use collection_item::{CollectionItemError as E, LabelRefusal};
+    let status = match &err {
+        E::Database(error) => {
+            tracing::error!(%error, "collection item write failed");
+            return error_page(
+                ctx,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Could not {what}."),
+            );
+        }
+        E::CollectionGone | E::UnknownReference => StatusCode::NOT_FOUND,
+        E::WrongField { .. } | E::InvalidPosition { .. } | E::InvalidLabel | E::SameItem => {
+            StatusCode::BAD_REQUEST
+        }
+        E::LabelRefused {
+            refusal: LabelRefusal::Taken,
+            ..
+        } => StatusCode::CONFLICT,
+        E::LabelRefused { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::CONFLICT,
+    };
+    let mut message = err.to_string();
+    if let Some(first) = message.get(..1) {
+        message = first.to_uppercase() + &message[1..];
+    }
+    error_page(ctx, status, &format!("{message}."))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +315,7 @@ async fn collections_page(
             (layout::csrf_field(&token))
             label { "Name " input type="text" name="name" required; }
             label { "Type " (type_select(None)) }
+            label { "Piece numbers " (width_select(3)) }
             button type="submit" { "Create collection" }
         }
         p class="muted" {
@@ -343,8 +402,8 @@ async fn collection_detail_page(
     };
     let (removed, removed_total) = removed_result.unwrap_or_default();
     // Candidate pieces to add: the org's live arrangements, minus the ones
-    // already in this collection (an arrangement may appear once per index, but
-    // offering a duplicate by default is a trap rather than a feature).
+    // already in this collection (an arrangement appears at most once per
+    // collection, so offering one already present would only produce a 409).
     let present: std::collections::HashSet<Uuid> =
         items.iter().map(|i| i.item.arrangement_id).collect();
     let candidates = match candidates_result {
@@ -354,7 +413,21 @@ async fn collection_detail_page(
             Vec::new()
         }
     };
-    let next_index = items.iter().map(|i| i.item.index).max().unwrap_or(0) + 1;
+    let standing =
+        collection_item::Kind::parse(&c.collection_type) == collection_item::Kind::Standing;
+    // The label a new piece gets unless the form says otherwise: the
+    // highest number + 1 (#104 turns this into a choice of the gaps too).
+    let suggested_label = collection_item::Numbering::new(
+        items
+            .iter()
+            .filter_map(|i| collection_item::Label::parse(&i.item.label)),
+        c.number_width,
+    )
+    .choices()
+    .suggested
+    .map(|l| l.to_string())
+    .unwrap_or_default();
+    let next_position = items.len() + 1;
     let items_base = format!("{}/items", detail_url(org_id, collection_id));
 
     let body = html! {
@@ -366,17 +439,24 @@ async fn collection_detail_page(
             input type="hidden" name="expected_version" value=(c.updated_at.timestamp_millis());
             label { "Name " input type="text" name="name" value=(c.name) required; }
             label { "Type " (type_select(Some(&c.collection_type))) }
+            label { "Piece numbers " (width_select(c.number_width)) }
             button type="submit" { "Save" }
         }
 
         h2 { "Pieces" }
-        // Piece numbers follow the order, for a program and a standing
-        // collection alike: reordering renumbers from 1 so the numbers always
-        // increase down the list. A book whose numbers disagreed with its own
-        // sequence would be worse than one that renumbers.
-        p class="muted" {
-            "Use ▲/▼ to rearrange. Pieces are renumbered from 1 on every move, "
-            "so the numbers always follow the running order."
+        // A program's numbers follow its order; a standing collection's are
+        // the numbers on the paper copies and keep their gaps
+        // (docs/design.md, *Collection numbering*).
+        @if standing {
+            p class="muted" {
+                "The numbers match the players' folders: a removed piece leaves "
+                "its number free until another piece takes it."
+            }
+        } @else {
+            p class="muted" {
+                "Use ▲/▼ to rearrange. Pieces are renumbered from 1 on every move, "
+                "so the numbers always follow the running order."
+            }
         }
         // ONE form for the whole table: every row contributes a hidden `order`
         // value (the sequence as rendered), and each ▲/▼ is a submit button
@@ -392,7 +472,7 @@ async fn collection_detail_page(
                 tbody {
                     @for (pos, view) in items.iter().enumerate() {
                         tr {
-                            td { (view.item.index) }
+                            td { (view.item.label) }
                             td {
                                 @if view.arrangement_removed {
                                     span class="muted" { "[removed] " (view.arrangement_slug) }
@@ -404,11 +484,11 @@ async fn collection_detail_page(
                             }
                             td {
                                 input type="hidden" name="order" value=(view.item.id);
-                                @if pos > 0 {
+                                @if !standing && pos > 0 {
                                     button type="submit" name="move"
                                            value=(format!("up:{}", view.item.id)) { "▲" }
                                 }
-                                @if pos + 1 < items.len() {
+                                @if !standing && pos + 1 < items.len() {
                                     button type="submit" name="move"
                                            value=(format!("down:{}", view.item.id)) { "▼" }
                                 }
@@ -445,7 +525,7 @@ async fn collection_detail_page(
                      action=(format!("{items_base}/{}/delete", view.item.id)) {
                     (layout::csrf_field(&token))
                     button type="submit" {
-                        "Remove " (view.item.index) ". "
+                        "Remove " (view.item.label) ". "
                         @if view.arrangement_removed {
                             (view.arrangement_slug)
                         } @else {
@@ -473,9 +553,16 @@ async fn collection_detail_page(
                         }
                     }
                 }
-                label {
-                    "Piece number "
-                    input type="number" name="index" min="1" max=(collection_item::MAX_INDEX) value=(next_index);
+                @if standing {
+                    label {
+                        "Number "
+                        input type="text" name="label" value=(suggested_label) size="5";
+                    }
+                } @else {
+                    label {
+                        "Position "
+                        input type="number" name="position" min="1" max=(next_position) value=(next_position);
+                    }
                 }
                 button type="submit" { "Add piece" }
             }
@@ -492,7 +579,12 @@ async fn collection_detail_page(
                 form class="inline" method="post"
                      action=(format!("{items_base}/{}/undelete", view.item.id)) {
                     (layout::csrf_field(&token))
-                    span { (view.arrangement_title) " " }
+                    span { (view.item.label) ". " (view.arrangement_title) " " }
+                    @if standing {
+                        // Only needed when its old number has been taken.
+                        input type="text" name="label" size="5" placeholder=(view.item.label)
+                              aria-label="Number to restore it under";
+                    }
                     button type="submit" { "Restore" }
                 }
                 br;
@@ -539,6 +631,13 @@ async fn create_collection(
             "Choose a collection type: program or standing.",
         );
     };
+    let Ok(number_width) = parse_number_width(form.number_width.as_deref()) else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Piece numbers have 3 or 4 digits.",
+        );
+    };
     // Never empty: a name with nothing transliterable becomes
     // `collection-<hash>` (see `crate::slug`).
     let slug = collection::slugify(&name);
@@ -550,6 +649,7 @@ async fn create_collection(
         &name,
         &slug,
         &collection_type,
+        number_width.unwrap_or(3),
         Some(ctx.user().id),
     )
     .await
@@ -575,7 +675,7 @@ async fn create_collection(
             StatusCode::CONFLICT,
             "A collection with this slug already exists in this organization.",
         ),
-        Err(collection::CollectionError::Database(error)) => {
+        Err(error) => {
             tracing::error!(%error, "failed to create collection");
             error_page(
                 &ctx,
@@ -629,14 +729,26 @@ async fn update_collection(
         );
     };
 
+    let Ok(number_width) = parse_number_width(form.number_width.as_deref()) else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Piece numbers have 3 or 4 digits.",
+        );
+    };
+    let number_width = number_width.unwrap_or(current.number_width);
+
     // The slug is immutable by design (docs/design.md: renaming a slug is a separate
-    // admin operation), so only name and type move here.
+    // admin operation), so only name, type and number width move here.
     match collection::update(
         &state.db,
         collection_id,
         Some(listing::version_of(current.updated_at)),
-        &name,
-        &collection_type,
+        collection::CollectionFields {
+            name: &name,
+            collection_type: &collection_type,
+            number_width,
+        },
     )
     .await
     {
@@ -647,7 +759,11 @@ async fn update_collection(
                 "collection.update",
                 "collection",
                 Some(collection_id),
-                serde_json::json!({ "name": name, "type": collection_type }),
+                serde_json::json!({
+                    "name": name,
+                    "type": collection_type,
+                    "numberWidth": number_width,
+                }),
             )
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
@@ -668,6 +784,9 @@ async fn update_collection(
             StatusCode::CONFLICT,
             "A collection with this slug already exists in this organization.",
         ),
+        Err(err @ collection::CollectionError::LabelsTooWide { .. }) => {
+            error_page(&ctx, StatusCode::CONFLICT, &format!("Not saved: {err}."))
+        }
         Err(collection::CollectionError::Database(error)) => {
             tracing::error!(%error, "failed to update collection");
             error_page(
@@ -760,7 +879,7 @@ async fn undelete_collection(
             StatusCode::CONFLICT,
             "A live collection already holds that slug — rename it before restoring this one.",
         ),
-        Err(collection::CollectionError::Database(error)) => {
+        Err(error) => {
             tracing::error!(%error, "failed to undelete collection");
             error_page(
                 &ctx,
@@ -874,45 +993,32 @@ async fn add_item(
         return response;
     }
 
-    let index = match field(&pairs, "index")
+    let position = match field(&pairs, "position")
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
         Some(raw) => match raw.parse::<i32>() {
-            Ok(n) if collection_item::is_valid_index(n) => n,
-            _ => {
+            Ok(n) => Some(n),
+            Err(_) => {
                 return error_page(
                     &ctx,
                     StatusCode::BAD_REQUEST,
-                    &format!(
-                        "The piece number must be a whole number between 1 and {}.",
-                        collection_item::MAX_INDEX
-                    ),
+                    "The position must be a whole number.",
                 )
             }
         },
-        None => {
-            // Append: one past the highest live index.
-            match collection_item::list_for_collection(&state.db, collection_id).await {
-                Ok(items) => items.iter().map(|i| i.item.index).max().unwrap_or(0) + 1,
-                Err(error) => {
-                    tracing::error!(%error, "failed to compute the next piece number");
-                    return error_page(
-                        &ctx,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Could not add the piece.",
-                    );
-                }
-            }
-        }
+        None => None,
     };
+    let label = field(&pairs, "label")
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
 
     match collection_item::create(
         &state.db,
         Uuid::now_v7(),
         collection_id,
         arrangement_id,
-        index,
+        collection_item::Placement { position, label },
         Some(ctx.user().id),
     )
     .await
@@ -927,17 +1033,13 @@ async fn add_item(
                 serde_json::json!({
                     "collectionId": collection_id,
                     "arrangementId": arrangement_id,
-                    "index": index,
+                    "position": created.position,
+                    "label": created.label,
                 }),
             )
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
         }
-        Err(collection_item::CollectionItemError::DuplicateIndex) => error_page(
-            &ctx,
-            StatusCode::CONFLICT,
-            "Another piece already holds that number — pick a free one or reorder afterwards.",
-        ),
         Err(collection_item::CollectionItemError::DuplicateArrangement) => error_page(
             &ctx,
             StatusCode::CONFLICT,
@@ -948,14 +1050,7 @@ async fn add_item(
             StatusCode::NOT_FOUND,
             "That arrangement or collection no longer exists.",
         ),
-        Err(error) => {
-            tracing::error!(%error, "failed to add a collection item");
-            error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not add the piece.",
-            )
-        }
+        Err(error) => item_error_page(&ctx, error, "add the piece"),
     }
 }
 
@@ -1019,14 +1114,7 @@ async fn reorder_items(
             "This collection changed since the page was loaded, so the order was not saved. \
              Reload and try again.",
         ),
-        Err(error) => {
-            tracing::error!(%error, "failed to reorder collection items");
-            error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not save the new order.",
-            )
-        }
+        Err(error) => item_error_page(&ctx, error, "save the new order"),
     }
 }
 
@@ -1061,14 +1149,7 @@ async fn delete_item(
             .await;
             Redirect::to(&detail_url(org_id, collection_id)).into_response()
         }
-        Err(error) => {
-            tracing::error!(%error, "failed to remove a collection item");
-            error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not remove the piece.",
-            )
-        }
+        Err(error) => item_error_page(&ctx, error, "remove the piece"),
     }
 }
 
@@ -1077,6 +1158,7 @@ async fn undelete_item(
     auth: Option<AuthSession>,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
     RequestId(request_id): RequestId,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
     let (ctx, _) = match enter_collection(&state, auth, org_id, collection_id).await {
         Ok(pair) => pair,
@@ -1090,7 +1172,10 @@ async fn undelete_item(
     ) {
         return response;
     }
-    match collection_item::restore(&state.db, collection_id, item_id).await {
+    let label = field(&pairs, "label")
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    match collection_item::restore(&state.db, collection_id, item_id, label).await {
         Ok(_) => {
             audit(
                 &state.db,
@@ -1110,14 +1195,7 @@ async fn undelete_item(
             "That piece is already in this collection — remove the current copy first \
              if you meant to restore this one.",
         ),
-        Err(error) => {
-            tracing::error!(%error, "failed to restore a collection item");
-            error_page(
-                &ctx,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Could not restore the piece.",
-            )
-        }
+        Err(error) => item_error_page(&ctx, error, "restore the piece"),
     }
 }
 
@@ -1286,7 +1364,7 @@ async fn assignments_page(
     let body = html! {
         h2 { "Parts — " (arrangement_title) }
         p class="muted" {
-            "Piece " (item.index) " of " (c.name) ". Every live voice of the "
+            "Piece " (item.label) " of " (c.name) ". Every live voice of the "
             "arrangement is listed; assigning one grants that person access to "
             "the voice's files, whether or not they are a member of this "
             "organization."

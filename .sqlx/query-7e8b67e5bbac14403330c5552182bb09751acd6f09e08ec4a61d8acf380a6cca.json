@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE collection_item SET position = $2, label = $3, updated_at = now()\n               WHERE id = $1 AND collection_id = $4 AND deleted_at IS NULL\n                 AND (position <> $2 OR label <> $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7e8b67e5bbac14403330c5552182bb09751acd6f09e08ec4a61d8acf380a6cca"
+}

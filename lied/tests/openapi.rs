@@ -134,11 +134,13 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/orgs/{orgId}/collections/{collectionId}",
     "/v1/orgs/{orgId}/collections/{collectionId}/undelete",
     "/v1/orgs/{orgId}/collections/{collectionId}/reorder",
+    "/v1/orgs/{orgId}/collections/{collectionId}/renumber",
     // Collection items
     "/v1/orgs/{orgId}/collections/{collectionId}/items",
     "/v1/orgs/{orgId}/collections/{collectionId}/coverage",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete",
+    "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/swap",
     // Part assignments
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments",
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments/{assignmentId}",
@@ -905,7 +907,18 @@ fn request_schemas_are_named_after_their_resource() {
             else {
                 continue;
             };
-            let Some(reference) = media["schema"]["$ref"].as_str() else {
+            // An optional body (`Option<T>`) is `oneOf: [null, $ref]`; it
+            // still names its schema.
+            let named = media["schema"]["$ref"].as_str().or_else(|| {
+                let variants = media["schema"]["oneOf"].as_array()?;
+                let mut refs = variants.iter().filter_map(|v| v["$ref"].as_str());
+                let reference = refs.next()?;
+                let rest_null = variants
+                    .iter()
+                    .all(|v| v.get("$ref").is_some() || v["type"] == "null");
+                (refs.next().is_none() && rest_null).then_some(reference)
+            });
+            let Some(reference) = named else {
                 violations.push(format!(
                     "{} {path}: the request body is an inline schema; give it a named type",
                     method.to_uppercase()

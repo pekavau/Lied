@@ -422,3 +422,156 @@ async fn startup_migrates_an_empty_database_and_restarting_is_a_no_op() {
         .expect("starting against a current schema succeeds");
     assert_eq!(applied(restarted.db.clone()).await, expected);
 }
+
+/// #102 replaces `collection_item.index` with `position` + `label`. Data
+/// written before it must come through: live positions dense, labels as
+/// the old numbers (a program's equal to its positions), a number the label
+/// format cannot hold replaced by the next free ones, removed rows keeping a
+/// label to try on restore, and a wide book widened to four digits.
+#[tokio::test]
+async fn collection_numbering_migration_carries_old_numbers_over() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .expect("connect");
+
+    // Everything up to the migration before #102.
+    let mut before = sqlx::migrate!("../migrations");
+    before.migrations = before
+        .migrations
+        .iter()
+        .filter(|m| m.version < 26)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    before.run(&pool).await.expect("migrate to 25");
+
+    let org = Uuid::now_v7();
+    sqlx::query("INSERT INTO organization (id, name, slug) VALUES ($1, 'O', 'o')")
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut arrangement = 0;
+    let mut next_arrangement = || {
+        arrangement += 1;
+        arrangement
+    };
+    // (collection type, [(index, removed)])
+    let collections: [(&str, &[(i32, bool)]); 3] = [
+        ("program", &[(1, false), (3, false), (2, true)]),
+        (
+            "standing",
+            &[(2, false), (5, false), (20_000, false), (7, true)],
+        ),
+        ("standing", &[(1, false), (1200, false)]),
+    ];
+    let mut ids = Vec::new();
+    for (n, (kind, items)) in collections.iter().enumerate() {
+        let coll = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO collection (id, organization_id, name, slug, type) VALUES ($1, $2, $3, $3, $4)",
+        )
+        .bind(coll)
+        .bind(org)
+        .bind(format!("c{n}"))
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (index, removed) in items.iter() {
+            let arr = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO arrangement (id, organization_id, title, slug, status) \
+                 VALUES ($1, $2, $3, $3, 'active')",
+            )
+            .bind(arr)
+            .bind(org)
+            .bind(format!("a{}", next_arrangement()))
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO collection_item (id, collection_id, arrangement_id, index, deleted_at) \
+                 VALUES ($1, $2, $3, $4, CASE WHEN $5 THEN now() END)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(coll)
+            .bind(arr)
+            .bind(index)
+            .bind(removed)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        ids.push(coll);
+    }
+
+    sqlx::migrate!("../migrations")
+        .run(&pool)
+        .await
+        .expect("the numbering migration applies to existing data");
+
+    let rows = |coll: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (i32, String, bool)>(
+                "SELECT position, label, deleted_at IS NOT NULL FROM collection_item \
+                 WHERE collection_id = $1 ORDER BY deleted_at IS NOT NULL, position",
+            )
+            .bind(coll)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let width = |coll: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i16>("SELECT number_width FROM collection WHERE id = $1")
+                .bind(coll)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let owned = |rows: &[(i32, &str, bool)]| {
+        rows.iter()
+            .map(|(p, l, d)| (*p, l.to_string(), *d))
+            .collect::<Vec<_>>()
+    };
+
+    // The program: dense positions, labels = positions; its removed piece
+    // keeps its old number as the place to come back to.
+    assert_eq!(
+        rows(ids[0]).await,
+        owned(&[(1, "1", false), (2, "2", false), (2, "2", true)])
+    );
+    // The standing book keeps its numbers and gaps; 20000 cannot be a label
+    // and becomes the next number after the highest legal one.
+    assert_eq!(
+        rows(ids[1]).await,
+        owned(&[
+            (1, "2", false),
+            (2, "5", false),
+            (3, "6", false),
+            (7, "7", true)
+        ])
+    );
+    assert_eq!(width(ids[1]).await, 3);
+    // A book numbered past 999 gets four-digit folder names.
+    assert_eq!(
+        rows(ids[2]).await,
+        owned(&[(1, "1", false), (2, "1200", false)])
+    );
+    assert_eq!(width(ids[2]).await, 4);
+}

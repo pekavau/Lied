@@ -81,7 +81,10 @@ pub enum Outcome {
 #[serde(rename_all = "camelCase")]
 pub struct PlanItem {
     pub collection_item_id: Uuid,
-    pub index: i32,
+    /// The piece's place in the running order.
+    pub position: i32,
+    /// The piece's number, as players are called by it (`12`, `12a`).
+    pub label: String,
     pub arrangement_title: String,
     pub outcome: Outcome,
     /// The matched voice, for [`Outcome::Assign`] and [`Outcome::AlreadyHeld`].
@@ -126,7 +129,8 @@ pub struct Applied {
 #[derive(Debug, Clone)]
 struct CandidateRow {
     item_id: Uuid,
-    index: i32,
+    position: i32,
+    label: String,
     arrangement_title: String,
     arrangement_removed: bool,
     voice: Option<VoiceRef>,
@@ -148,7 +152,8 @@ pub async fn plan(
         r#"
         SELECT
             ci.id as item_id,
-            ci.index as item_index,
+            ci.position as item_position,
+            ci.label as item_label,
             a.title as arrangement_title,
             (a.deleted_at IS NOT NULL) as "arrangement_removed!",
             v.id as "voice_id?",
@@ -166,7 +171,7 @@ pub async fn plan(
         WHERE ci.collection_id = $1
           AND ci.deleted_at IS NULL
           AND c.deleted_at IS NULL
-        ORDER BY ci.index ASC, ci.id ASC, v.part_number ASC NULLS LAST, v.name ASC, v.id ASC
+        ORDER BY ci.position ASC, ci.id ASC, v.part_number ASC NULLS LAST, v.name ASC, v.id ASC
         "#,
         collection_id,
         key.instrument_id,
@@ -213,7 +218,8 @@ pub async fn plan(
         .into_iter()
         .map(|r| CandidateRow {
             item_id: r.item_id,
-            index: r.item_index,
+            position: r.item_position,
+            label: r.item_label,
             arrangement_title: r.arrangement_title,
             arrangement_removed: r.arrangement_removed,
             voice: match (r.voice_id, r.voice_name) {
@@ -255,7 +261,8 @@ fn assemble(
             let first = &group[0];
             let mut item = PlanItem {
                 collection_item_id: first.item_id,
-                index: first.index,
+                position: first.position,
+                label: first.label.clone(),
                 arrangement_title: first.arrangement_title.clone(),
                 outcome: Outcome::NoMatch,
                 voice: None,
@@ -557,7 +564,8 @@ mod tests {
     fn row(item: Uuid, index: i32, voice: Option<VoiceRef>, held: bool) -> CandidateRow {
         CandidateRow {
             item_id: item,
-            index,
+            position: index,
+            label: index.to_string(),
             arrangement_title: format!("Piece {index}"),
             arrangement_removed: false,
             voice,
@@ -715,7 +723,7 @@ mod tests {
             Some(1),
             &HashMap::new(),
         );
-        let indexes: Vec<i32> = plan.iter().map(|p| p.index).collect();
+        let indexes: Vec<i32> = plan.iter().map(|p| p.position).collect();
         assert_eq!(indexes, vec![1, 2, 3]);
         let outcomes: Vec<Outcome> = plan.iter().map(|p| p.outcome).collect();
         assert_eq!(

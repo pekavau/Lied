@@ -297,7 +297,7 @@ async fn collection_coverage(
 
         @for item in &report.items {
             h3 {
-                (item.index) ". "
+                (item.label) ". "
                 @if item.arrangement_removed {
                     span class="muted" { "[removed] " (item.arrangement_slug) }
                 } @else {

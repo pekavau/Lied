@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.index,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n        ORDER BY ci.index ASC, ci.id ASC\n        ",
+  "query": "\n        SELECT\n            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,\n            ci.created_at as \"created_at: DateTime<Utc>\",\n            ci.updated_at as \"updated_at: DateTime<Utc>\",\n            ci.created_by,\n            ci.deleted_at as \"deleted_at: DateTime<Utc>\",\n            a.slug as arrangement_slug,\n            a.title as arrangement_title,\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id\n        JOIN arrangement a ON a.id = ci.arrangement_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n        ORDER BY ci.position ASC, ci.id ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -20,41 +20,46 @@
       },
       {
         "ordinal": 3,
-        "name": "index",
+        "name": "position",
         "type_info": "Int4"
       },
       {
         "ordinal": 4,
+        "name": "label",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
         "name": "created_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "updated_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_by",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "deleted_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "arrangement_slug",
         "type_info": "Text"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "arrangement_title",
         "type_info": "Text"
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "arrangement_removed!",
         "type_info": "Bool"
       }
@@ -71,6 +76,7 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       false,
@@ -78,5 +84,5 @@
       null
     ]
   },
-  "hash": "518d8577f51a11262e3c803114cfbe3abf284ea30309ce3a304598d0f32e53e7"
+  "hash": "34ab5a930ecc94a85549812bf99156fabe3739d953f75ac9333655ca6f18158b"
 }
