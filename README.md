@@ -50,8 +50,11 @@ Two design commitments shape everything:
 - **Formats** — LilyPond, MusicXML, PDF, and images (scanned/photographed
   parts) are all first-class. The format of every file is surfaced; images are
   accepted as display-only without forced conversion.
-- **Collections** — indexed concert programs (fixed sequence) and standing
-  repertoire (drawn from by number), assembled from the archive.
+- **Collections** — concert programs (a running order that renumbers as you
+  rearrange it) and standing repertoire such as a march book (numbers that
+  match the players' paper folders: a removed piece leaves its gap, a late
+  addition can be `12a`, and only an explicit renumber closes the gaps),
+  assembled from the archive.
 - **Part distribution** — assign a voice in a program to a specific player;
   guests and substitutes get read access to their parts without joining the
   organization.
