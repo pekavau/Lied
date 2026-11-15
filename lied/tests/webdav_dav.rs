@@ -261,8 +261,8 @@ async fn assign(pool: &PgPool, org_id: Uuid, arr_id: Uuid, voice_id: Uuid, user_
     .expect("collection");
     let item = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, index)
-           VALUES ($1, $2, $3, 1)"#,
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, position, label)
+           VALUES ($1, $2, $3, 1, '1')"#,
         item,
         coll,
         arr_id,
@@ -301,8 +301,8 @@ async fn seed_collection(pool: &PgPool, org_id: Uuid, slug: &str) -> Uuid {
 async fn seed_item(pool: &PgPool, coll_id: Uuid, arr_id: Uuid, index: i32) -> Uuid {
     let id = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, index)
-           VALUES ($1, $2, $3, $4)"#,
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, position, label)
+           VALUES ($1, $2, $3, $4, ($4::integer)::text)"#,
         id,
         coll_id,
         arr_id,
@@ -840,7 +840,8 @@ async fn staff_sees_the_full_collection_tree_in_index_order_including_score() {
     assert_eq!(status.as_u16(), 207);
     assert!(String::from_utf8_lossy(&body).contains("spring"));
 
-    // Both items appear, named `<index>-<arrangement-slug>`, in index order.
+    // Both items appear, named `<label padded to 3 digits>-<arrangement-slug>`
+    // (#102), in position order.
     let (status, body) = send(
         &ctx.app,
         request(
@@ -853,10 +854,10 @@ async fn staff_sees_the_full_collection_tree_in_index_order_including_score() {
     .await;
     assert_eq!(status.as_u16(), 207);
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("1-alpha"), "item 1 present:\n{body}");
-    assert!(body.contains("2-beta"), "item 2 present:\n{body}");
-    let pos_alpha = body.find("1-alpha").unwrap();
-    let pos_beta = body.find("2-beta").unwrap();
+    assert!(body.contains("/001-alpha"), "item 1 present:\n{body}");
+    assert!(body.contains("/002-beta"), "item 2 present:\n{body}");
+    let pos_alpha = body.find("/001-alpha").unwrap();
+    let pos_beta = body.find("/002-beta").unwrap();
     assert!(
         pos_alpha < pos_beta,
         "items must be listed in index order:\n{body}"
@@ -867,7 +868,7 @@ async fn staff_sees_the_full_collection_tree_in_index_order_including_score() {
         &ctx.app,
         request(
             "PROPFIND",
-            "/orgs/acme/collections/spring/1-alpha",
+            "/orgs/acme/collections/spring/001-alpha",
             &basic(&arch),
             vec![],
         ),
@@ -905,6 +906,61 @@ async fn staff_sees_the_full_collection_tree_in_index_order_including_score() {
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(body, b"%PDF part alpha");
+
+    // A standing book with four-digit numbers and a letter label: the names
+    // pad to the collection's width, and a plain sort of the names is the
+    // order of the pieces (`0001-` < `0001a-` < `0002-`).
+    sqlx::query("UPDATE collection SET type = 'standing', number_width = 4 WHERE id = $1")
+        .bind(coll)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE collection_item SET label = CASE label WHEN '2' THEN '1a' ELSE '1' END \
+         WHERE collection_id = $1",
+    )
+    .bind(coll)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    let (status, body) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 207);
+    let body = String::from_utf8_lossy(&body);
+    let mut names: Vec<&str> = ["/0001-alpha", "/0001a-beta"]
+        .into_iter()
+        .filter(|name| body.contains(name))
+        .collect();
+    assert_eq!(names.len(), 2, "both padded to four digits:\n{body}");
+    names.sort();
+    assert_eq!(names, ["/0001-alpha", "/0001a-beta"]);
+    // Padded and unpadded paths both resolve to the piece.
+    for path in [
+        "/orgs/acme/collections/spring/0001a-beta",
+        "/orgs/acme/collections/spring/1a-beta",
+    ] {
+        let (status, _) = send(&ctx.app, request("PROPFIND", path, &basic(&arch), vec![])).await;
+        assert_eq!(status.as_u16(), 207, "{path}");
+    }
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PROPFIND",
+            "/orgs/acme/collections/spring/0002-beta",
+            &basic(&arch),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 404, "beta is 1a now, not 2");
 }
 
 #[tokio::test]

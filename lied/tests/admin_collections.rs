@@ -690,6 +690,7 @@ async fn a_collection_id_from_another_org_is_not_found() {
         "Their Concert",
         "their-concert",
         "program",
+        3,
         None,
     )
     .await
@@ -758,7 +759,7 @@ async fn add_piece(ctx: &Ctx, browser: &Browser, org_id: Uuid, coll: Uuid, arr: 
     );
 }
 
-/// The collection's live items in index order.
+/// The collection's live items in position order.
 async fn items(ctx: &Ctx, coll: Uuid) -> Vec<lied::domain::collection_item::CollectionItemView> {
     lied::domain::collection_item::list_for_collection(&ctx.pool, coll)
         .await
@@ -784,7 +785,7 @@ async fn pieces_are_added_numbered_reordered_and_removed() {
     let live = items(&ctx, coll).await;
     assert_eq!(live.len(), 3);
     assert_eq!(
-        live.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        live.iter().map(|i| i.item.position).collect::<Vec<_>>(),
         vec![1, 2, 3],
         "pieces append at the next free number"
     );
@@ -818,7 +819,10 @@ async fn pieces_are_added_numbered_reordered_and_removed() {
         "▼ moved the first piece down one slot"
     );
     assert_eq!(
-        reordered.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        reordered
+            .iter()
+            .map(|i| i.item.position)
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "reordering renumbers from 1 rather than leaving gaps"
     );
@@ -1467,11 +1471,10 @@ async fn an_item_or_assignment_from_another_collection_is_not_found() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn reordering_a_standing_collection_renumbers_it_so_the_numbers_follow_the_order() {
-    // A march book is drawn from by piece number, so the numbers have to agree
-    // with the running order: reorder the book and the numbering must reflect
-    // it, always increasing down the list. This holds for a standing collection
-    // exactly as it does for a program — there is one ordering story.
+async fn a_standing_collection_keeps_its_numbers_and_has_no_reorder_arrows() {
+    // A Marschbuch's numbers are printed in every player's folder (#102):
+    // removing a piece leaves its number free, and the order follows the
+    // numbers, so there is nothing to drag around.
     let ctx = Ctx::new().await;
     let fx = seed(&ctx.state).await;
     let browser = Browser::login(&ctx.app, "arch").await;
@@ -1482,19 +1485,36 @@ async fn reordering_a_standing_collection_renumbers_it_so_the_numbers_follow_the
         add_piece(&ctx, &browser, fx.org_id, coll, arr).await;
     }
     let live = items(&ctx, coll).await;
+    let labels: Vec<&str> = live.iter().map(|i| i.item.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["1", "2", "3"],
+        "each new piece takes the next number"
+    );
+
+    remove_piece(&ctx, &browser, fx.org_id, coll, live[1].item.id).await;
+    let after = items(&ctx, coll).await;
+    assert_eq!(
+        after
+            .iter()
+            .map(|i| (i.item.label.as_str(), i.item.position))
+            .collect::<Vec<_>>(),
+        vec![("1", 1), ("3", 2)],
+        "the gap stays; positions stay dense"
+    );
 
     let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
     assert!(
-        html.contains("value=\"down:"),
-        "a standing collection is reordered with the same arrows a program uses"
+        !html.contains("value=\"down:") && !html.contains("value=\"up:"),
+        "a standing collection offers no reorder arrows"
     );
+    // The next piece is offered the next number after the highest.
+    assert!(html.contains("name=\"label\" value=\"4\""), "{html}");
 
-    // Move the last piece to the front.
+    // A forged reorder is refused and changes nothing.
     let token = form_csrf(&html);
-    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
-    let directive = format!("up:{}", live[2].item.id);
-    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
-    fields.push(("move", &directive));
+    let order: Vec<String> = after.iter().rev().map(|i| i.item.id.to_string()).collect();
+    let fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
     let response = post_form(
         &ctx.app,
         &browser,
@@ -1503,23 +1523,14 @@ async fn reordering_a_standing_collection_renumbers_it_so_the_numbers_follow_the
         &token,
     )
     .await;
-    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
-
-    let after = items(&ctx, coll).await;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     assert_eq!(
-        after
+        items(&ctx, coll)
+            .await
             .iter()
-            .map(|i| i.arrangement_title.as_str())
+            .map(|i| i.item.label.clone())
             .collect::<Vec<_>>(),
-        vec!["Bolero", "Radetzky March", "Egmont Overture"],
-        "the third piece moved up one"
-    );
-    // The invariant: numbering reflects the new order, and increases.
-    let numbers: Vec<i32> = after.iter().map(|i| i.item.index).collect();
-    assert_eq!(numbers, vec![1, 2, 3], "the book is renumbered to match");
-    assert!(
-        numbers.windows(2).all(|w| w[0] < w[1]),
-        "piece numbers increase down the book: {numbers:?}"
+        vec!["1", "3"]
     );
 }
 
@@ -1718,12 +1729,10 @@ async fn the_reorder_audit_records_the_resulting_order() {
 }
 
 #[tokio::test]
-async fn an_out_of_range_piece_number_is_refused_before_it_can_break_reordering() {
-    // Found by hand-testing #33: the console accepted any positive i32 while
-    // `/v1` capped it at MAX_INDEX. An index near i32::MAX was therefore
-    // storable from the form, and the next reorder — which parks indices at
-    // `index + 1_000_000` to clear the unique space — overflowed Postgres
-    // `integer` and 500'd. Both surfaces now share `is_valid_index`.
+async fn an_unusable_position_is_refused_and_inserting_shifts_the_rest() {
+    // Found by hand-testing #33: the console accepted any positive i32. Since
+    // #102 a program's pieces take a position 1..n+1 (default the end), and
+    // inserting moves the pieces after it down one.
     let ctx = Ctx::new().await;
     let fx = seed(&ctx.state).await;
     let browser = Browser::login(&ctx.app, "arch").await;
@@ -1733,30 +1742,28 @@ async fn an_out_of_range_piece_number_is_refused_before_it_can_break_reordering(
 
     let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
     let token = form_csrf(&html);
-    for bad in ["2147483000", "1000000", "0", "-3"] {
+    for bad in ["2147483000", "1000000", "0", "-3", "2", "x"] {
         let response = post_form(
             &ctx.app,
             &browser,
             &format!("{detail_url}/items"),
-            &[("arrangement_id", &arr.to_string()), ("index", bad)],
+            &[("arrangement_id", &arr.to_string()), ("position", bad)],
             &token,
         )
         .await;
         assert_eq!(
             response.status(),
             axum::http::StatusCode::BAD_REQUEST,
-            "piece number {bad} must be refused"
+            "position {bad} must be refused"
         );
     }
     assert!(
         items(&ctx, coll).await.is_empty(),
-        "no piece was stored at an unusable number"
+        "no piece was stored at an unusable position"
     );
 
-    // The boundary is usable, and reordering across it still works — i.e. the
-    // cap is what keeps the park-and-renumber arithmetic in range.
     let second = seed_arrangement(&ctx.state, fx.org_id, "Egmont Overture").await;
-    for (arrangement, index) in [(arr, "999999"), (second, "1")] {
+    for arrangement in [arr, second] {
         let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
         let token = form_csrf(&html);
         let response = post_form(
@@ -1765,42 +1772,24 @@ async fn an_out_of_range_piece_number_is_refused_before_it_can_break_reordering(
             &format!("{detail_url}/items"),
             &[
                 ("arrangement_id", &arrangement.to_string()),
-                ("index", index),
+                ("position", "1"),
             ],
             &token,
         )
         .await;
         assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
     }
-
-    let live = items(&ctx, coll).await;
-    let (_, html) = load_page(&ctx.app, &browser, &detail_url).await;
-    let token = form_csrf(&html);
-    let order: Vec<String> = live.iter().map(|i| i.item.id.to_string()).collect();
-    let directive = format!("down:{}", live[0].item.id);
-    let mut fields: Vec<(&str, &str)> = order.iter().map(|id| ("order", id.as_str())).collect();
-    fields.push(("move", &directive));
-    let response = post_form(
-        &ctx.app,
-        &browser,
-        &format!("{detail_url}/items/reorder"),
-        &fields,
-        &token,
-    )
-    .await;
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::SEE_OTHER,
-        "reordering a collection holding the maximum index must not overflow"
-    );
     assert_eq!(
         items(&ctx, coll)
             .await
             .iter()
-            .map(|i| i.item.index)
+            .map(|i| (i.item.label.clone(), i.arrangement_title.clone()))
             .collect::<Vec<_>>(),
-        vec![1, 2],
-        "and it renumbers as usual"
+        vec![
+            ("1".to_string(), "Egmont Overture".to_string()),
+            ("2".to_string(), "Bolero".to_string()),
+        ],
+        "the second piece went in at the front"
     );
 }
 
@@ -1839,7 +1828,7 @@ async fn removing_a_piece_closes_the_gap_immediately() {
     }
     let live = items(&ctx, coll).await;
     assert_eq!(
-        live.iter().map(|i| i.item.index).collect::<Vec<_>>(),
+        live.iter().map(|i| i.item.position).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5]
     );
 
@@ -1849,7 +1838,7 @@ async fn removing_a_piece_closes_the_gap_immediately() {
     assert_eq!(
         after
             .iter()
-            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .map(|i| (i.item.position, i.arrangement_title.as_str()))
             .collect::<Vec<_>>(),
         vec![
             (1, "A March"),
@@ -1903,7 +1892,7 @@ async fn restoring_a_piece_puts_it_back_where_it_was() {
     assert_eq!(
         after
             .iter()
-            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .map(|i| (i.item.position, i.arrangement_title.as_str()))
             .collect::<Vec<_>>(),
         vec![
             (1, "A March"),
@@ -1948,7 +1937,7 @@ async fn a_restore_into_a_shrunken_collection_lands_at_the_end() {
     assert_eq!(
         after
             .iter()
-            .map(|i| (i.item.index, i.arrangement_title.as_str()))
+            .map(|i| (i.item.position, i.arrangement_title.as_str()))
             .collect::<Vec<_>>(),
         vec![(1, "A March"), (2, "C March")],
         "a number past the end clamps to the end rather than leaving a gap"

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT type as \"collection_type!\", number_width FROM collection\n           WHERE id = $1 AND deleted_at IS NULL\n           FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "number_width",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e83765dc7a9d8b95510743f35561172a0761df4de9d8de5d2e05ded56557447d"
+}

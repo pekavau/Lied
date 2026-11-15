@@ -154,8 +154,8 @@ async fn seed(pool: &PgPool) -> (String, Uuid, Uuid) {
     .expect("collection");
     let item = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, index)
-           VALUES ($1, $2, $3, 1)"#,
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, position, label)
+           VALUES ($1, $2, $3, 1, '1')"#,
         item,
         coll,
         a1,

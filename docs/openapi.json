@@ -6083,6 +6083,7 @@
                           "name",
                           "slug",
                           "type",
+                          "numberWidth",
                           "createdAt",
                           "updatedAt"
                         ],
@@ -6111,6 +6112,11 @@
                           },
                           "name": {
                             "type": "string"
+                          },
+                          "numberWidth": {
+                            "type": "integer",
+                            "format": "int32",
+                            "description": "Digits in the WebDAV folder names of its pieces (`007-…` or\n`0007-…`), and so the highest label: 999 or 9999."
                           },
                           "organizationId": {
                             "type": "string",
@@ -6591,6 +6597,7 @@
           "collections"
         ],
         "summary": "Update a collection",
+        "description": "Changing the type from `standing` to `program` closes the gaps in the\nnumbering (a program's labels are its positions). Narrowing `numberWidth`\nis a 409 while a piece's label would not fit.",
         "operationId": "update_collection",
         "parameters": [
           {
@@ -7200,7 +7207,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Items in index order",
+            "description": "Items in position order",
             "content": {
               "application/json": {
                 "schema": {
@@ -7287,6 +7294,7 @@
           "collections"
         ],
         "summary": "Add a collection item",
+        "description": "A program takes an optional `position`, a standing collection an optional\n`label`; sending the other one is a 400 naming it.",
         "operationId": "add_item",
         "parameters": [
           {
@@ -7573,6 +7581,7 @@
           "collections"
         ],
         "summary": "Soft-delete a collection item",
+        "description": "In a program the gap closes; in a standing collection it stays, and the\nother pieces keep their labels.",
         "operationId": "delete_item",
         "parameters": [
           {
@@ -7704,6 +7713,7 @@
           "collections"
         ],
         "summary": "Move a collection item",
+        "description": "A program's item moves to a `position`; a standing collection's item to\na `label`. Nothing else in a standing collection changes number.",
         "operationId": "update_item",
         "parameters": [
           {
@@ -8758,12 +8768,157 @@
         ]
       }
     },
+    "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/swap": {
+      "post": {
+        "tags": [
+          "collections"
+        ],
+        "summary": "Swap two collection items",
+        "operationId": "swap_item",
+        "parameters": [
+          {
+            "name": "orgId",
+            "in": "path",
+            "description": "Organization ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "collectionId",
+            "in": "path",
+            "description": "Collection ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "itemId",
+            "in": "path",
+            "description": "Item ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwapItemRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Items swapped"
+          },
+          "400": {
+            "description": "Validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds LIED_MAX_REQUEST_BYTES",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request body is not `application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{orgId}/collections/{collectionId}/items/{itemId}/undelete": {
       "post": {
         "tags": [
           "collections"
         ],
         "summary": "Undelete a collection item",
+        "description": "A program's piece returns to its old position (the end, if the program\nhas shrunk). A standing collection's piece returns under its old label\nif that is free; otherwise send a `label`, or get a 409 saying one is\nneeded. The body is optional.",
         "operationId": "undelete_item",
         "parameters": [
           {
@@ -8797,9 +8952,168 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "Optional; only for a standing collection's taken label",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/UndeleteItemRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "204": {
             "description": "Item restored"
+          },
+          "400": {
+            "description": "Validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with existing state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds LIED_MAX_REQUEST_BYTES",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request body is not `application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{orgId}/collections/{collectionId}/renumber": {
+      "get": {
+        "tags": [
+          "collections"
+        ],
+        "summary": "Preview a renumber",
+        "description": "A program is always numbered 1..n, so it answers 409.",
+        "operationId": "preview_renumber",
+        "parameters": [
+          {
+            "name": "orgId",
+            "in": "path",
+            "description": "Organization ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "collectionId",
+            "in": "path",
+            "description": "Collection ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What a renumber would change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenumberPreview"
+                }
+              }
+            }
           },
           "400": {
             "description": "Validation failed",
@@ -8880,6 +9194,156 @@
             "session": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "collections"
+        ],
+        "summary": "Renumber a standing collection",
+        "description": "This changes the numbers printed in the players' folders, so it applies\nonly the preview the client showed: a `previewToken` from a collection\nthat has changed since is a 409, and the client previews again.",
+        "operationId": "renumber_collection",
+        "parameters": [
+          {
+            "name": "orgId",
+            "in": "path",
+            "description": "Organization ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "collectionId",
+            "in": "path",
+            "description": "Collection ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenumberCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Renumbered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RenumberResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Insufficient permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict with existing state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds LIED_MAX_REQUEST_BYTES",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request body is not `application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "session": []
+          }
+        ]
       }
     },
     "/v1/orgs/{orgId}/collections/{collectionId}/reorder": {
@@ -8888,6 +9352,7 @@
           "collections"
         ],
         "summary": "Reorder collection items",
+        "description": "Programs only: a standing collection's order follows its labels, so it\nanswers 409; relabel, swap or renumber its pieces instead.",
         "operationId": "reorder_items",
         "parameters": [
           {
@@ -12356,6 +12821,7 @@
           "name",
           "slug",
           "type",
+          "numberWidth",
           "createdAt",
           "updatedAt"
         ],
@@ -12385,6 +12851,11 @@
           "name": {
             "type": "string"
           },
+          "numberWidth": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Digits in the WebDAV folder names of its pieces (`007-…` or\n`0007-…`), and so the highest label: 999 or 9999."
+          },
           "organizationId": {
             "type": "string",
             "format": "uuid"
@@ -12409,7 +12880,8 @@
           "id",
           "collectionId",
           "arrangementId",
-          "index",
+          "position",
+          "label",
           "createdAt",
           "updatedAt"
         ],
@@ -12444,9 +12916,14 @@
             "type": "string",
             "format": "uuid"
           },
-          "index": {
+          "label": {
+            "type": "string",
+            "description": "The number players are called by: `12`, or `12a` for a piece slipped\nin later. In a program it is always `position` as text. Display it."
+          },
+          "position": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "description": "Running order, 1..n over the live items; order a list by it."
           },
           "updatedAt": {
             "type": "string",
@@ -12718,9 +13195,17 @@
           "name": {
             "type": "string"
           },
+          "numberWidth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Digits in the WebDAV folder names, and so the highest label: `3`\n(up to 999, the default) or `4` (up to 9999, for a large book)."
+          },
           "type": {
             "type": "string",
-            "description": "`program` (fixed concert sequence) or `standing` (flexible repertoire)."
+            "description": "`program` (a concert: numbers are positions) or `standing` (a\nMarschbuch: numbers are labels that keep their gaps)."
           }
         },
         "additionalProperties": false
@@ -12729,17 +13214,27 @@
         "type": "object",
         "description": "Request body for adding an item to a collection.",
         "required": [
-          "arrangementId",
-          "index"
+          "arrangementId"
         ],
         "properties": {
           "arrangementId": {
             "type": "string",
             "format": "uuid"
           },
-          "index": {
-            "type": "integer",
-            "format": "int32"
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Standing collections only: the piece's number, `12` or `12a`. Must\nbe a free number below the highest, the highest + 1 (the default),\nor a letter after a number in use; anything else is a 400, a taken\nlabel a 409."
+          },
+          "position": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Programs only: where the piece goes, 1..n+1 (default: the end); the\npieces from there on move down one."
           }
         },
         "additionalProperties": false
@@ -13033,7 +13528,8 @@
         "description": "One piece of the collection, with its voices and their tallies.",
         "required": [
           "itemId",
-          "index",
+          "position",
+          "label",
           "arrangementId",
           "arrangementTitle",
           "arrangementSlug",
@@ -13071,13 +13567,13 @@
             "type": "integer",
             "minimum": 0
           },
-          "index": {
-            "type": "integer",
-            "format": "int32"
-          },
           "itemId": {
             "type": "string",
             "format": "uuid"
+          },
+          "label": {
+            "type": "string",
+            "description": "The piece's number, as players are called by it (`12`, `12a`)."
           },
           "players": {
             "type": "integer",
@@ -13087,6 +13583,11 @@
           "playersAcknowledged": {
             "type": "integer",
             "minimum": 0
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The piece's place in the running order."
           },
           "required": {
             "type": "integer",
@@ -13409,7 +13910,8 @@
         "description": "The plan for one piece of the collection.",
         "required": [
           "collectionItemId",
-          "index",
+          "position",
+          "label",
           "arrangementTitle",
           "outcome",
           "candidates",
@@ -13437,12 +13939,17 @@
             "type": "string",
             "format": "uuid"
           },
-          "index": {
-            "type": "integer",
-            "format": "int32"
+          "label": {
+            "type": "string",
+            "description": "The piece's number, as players are called by it (`12`, `12a`)."
           },
           "outcome": {
             "$ref": "#/components/schemas/Outcome"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The piece's place in the running order."
           },
           "voice": {
             "oneOf": [
@@ -13552,6 +14059,78 @@
           }
         }
       },
+      "RenumberChange": {
+        "type": "object",
+        "description": "One piece's number before and after a renumber.",
+        "required": [
+          "itemId",
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "itemId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "to": {
+            "type": "string"
+          }
+        }
+      },
+      "RenumberCollectionRequest": {
+        "type": "object",
+        "description": "Request body for applying a renumber.",
+        "required": [
+          "previewToken"
+        ],
+        "properties": {
+          "previewToken": {
+            "type": "string",
+            "description": "`previewToken` from `GET …/renumber`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RenumberPreview": {
+        "type": "object",
+        "description": "What a renumber would do, and the token that applies exactly that.",
+        "required": [
+          "changes",
+          "previewToken"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RenumberChange"
+            },
+            "description": "Every live piece, in order, with its label now and after the\nrenumber (equal where it does not change)."
+          },
+          "previewToken": {
+            "type": "string",
+            "description": "Pass it back to apply this preview; it no longer matches once the\ncollection's pieces or labels change."
+          }
+        }
+      },
+      "RenumberResult": {
+        "type": "object",
+        "description": "The changes a renumber made.",
+        "required": [
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RenumberChange"
+            },
+            "description": "Every piece, in order, with its label before and after."
+          }
+        }
+      },
       "ReorderRequest": {
         "type": "object",
         "description": "Request body for reordering a collection's items.",
@@ -13565,7 +14144,7 @@
               "type": "string",
               "format": "uuid"
             },
-            "description": "The item IDs in their new order; reassigned indices `1..=n`."
+            "description": "The item IDs in their new order; reassigned positions `1..=n`."
           }
         },
         "additionalProperties": false
@@ -13579,6 +14158,21 @@
           "conductor",
           "musician"
         ]
+      },
+      "SwapItemRequest": {
+        "type": "object",
+        "description": "Request body for swapping two pieces.",
+        "required": [
+          "withItemId"
+        ],
+        "properties": {
+          "withItemId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The other piece, in the same collection."
+          }
+        },
+        "additionalProperties": false
       },
       "TagResponse": {
         "type": "object",
@@ -13623,6 +14217,20 @@
             "format": "date-time"
           }
         }
+      },
+      "UndeleteItemRequest": {
+        "type": "object",
+        "description": "Optional request body for restoring a removed item.",
+        "properties": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Standing collections only: the label to restore the piece under when\nits old one is taken, under the same rule as adding."
+          }
+        },
+        "additionalProperties": false
       },
       "UpdateAnnotationRequest": {
         "type": "object",
@@ -13759,26 +14367,42 @@
               "null"
             ]
           },
+          "numberWidth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`3` or `4`. Widening renames every WebDAV folder; narrowing is a 409\nwhile a label would not fit."
+          },
           "type": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`program` (fixed concert sequence) or `standing` (flexible repertoire)."
+            "description": "`program` or `standing`. Program → standing keeps the numbers as\nlabels; standing → program closes the gaps."
           }
         },
         "additionalProperties": false
       },
       "UpdateItemRequest": {
         "type": "object",
-        "description": "Request body for moving an item to a new index: a partial update like\nevery `PATCH`, so `{}` (or the item's current index) changes nothing.",
+        "description": "Request body for moving an item: a partial update like every `PATCH`, so\n`{}` (or the item's current place) changes nothing.",
         "properties": {
-          "index": {
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Standing collections only: the new label, under the same rule as\nadding (the piece's own current label does not count against it)."
+          },
+          "position": {
             "type": [
               "integer",
               "null"
             ],
-            "format": "int32"
+            "format": "int32",
+            "description": "Programs only: the new position, 1..n; the pieces in between shift."
           }
         },
         "additionalProperties": false

@@ -243,6 +243,7 @@ async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Progra
         name,
         &collection::slugify(name),
         "program",
+        3,
         None,
     )
     .await
@@ -296,9 +297,19 @@ async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Progra
         }
 
         let item_id = Uuid::now_v7();
-        collection_item::create(pool, item_id, collection_id, arr_id, index, None)
-            .await
-            .expect("item");
+        collection_item::create(
+            pool,
+            item_id,
+            collection_id,
+            arr_id,
+            collection_item::Placement {
+                position: Some(index),
+                label: None,
+            },
+            None,
+        )
+        .await
+        .expect("item");
         items.push(item_id);
     }
 
@@ -669,6 +680,7 @@ async fn the_org_wide_query_agrees_with_the_per_collection_one() {
         "Empty Book",
         "empty-book",
         "standing",
+        3,
         None,
     )
     .await
@@ -965,7 +977,7 @@ async fn the_per_item_query_returns_only_that_item() {
         .expect("query")
         .expect("the item exists");
         assert_eq!(item.item_id, *item_id);
-        assert_eq!(item.index as usize, position + 1);
+        assert_eq!(item.position as usize, position + 1);
         assert_eq!(item.voices.len(), 2, "only this piece's voices");
     }
 

@@ -172,8 +172,8 @@ async fn create_collection(pool: &PgPool, org_id: Uuid, slug: &str) -> Uuid {
 async fn create_item(pool: &PgPool, coll_id: Uuid, arr_id: Uuid, index: i32) -> Uuid {
     let id = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, index)
-           VALUES ($1, $2, $3, $4)"#,
+        r#"INSERT INTO collection_item (id, collection_id, arrangement_id, position, label)
+           VALUES ($1, $2, $3, $4, ($4::integer)::text)"#,
         id,
         coll_id,
         arr_id,

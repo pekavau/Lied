@@ -102,7 +102,10 @@ pub struct Conflict {
 #[serde(rename_all = "camelCase")]
 pub struct ItemCoverage {
     pub item_id: Uuid,
-    pub index: i32,
+    /// The piece's place in the running order.
+    pub position: i32,
+    /// The piece's number, as players are called by it (`12`, `12a`).
+    pub label: String,
     pub arrangement_id: Uuid,
     pub arrangement_title: String,
     pub arrangement_slug: String,
@@ -376,7 +379,8 @@ async fn query_collection(
         r#"
         SELECT
             ci.id as item_id,
-            ci.index as item_index,
+            ci.position as item_position,
+            ci.label as item_label,
             a.id as arrangement_id,
             a.title as arrangement_title,
             a.slug as arrangement_slug,
@@ -408,7 +412,7 @@ async fn query_collection(
           AND ci.deleted_at IS NULL
           AND c.deleted_at IS NULL
           AND ($3::uuid IS NULL OR ci.id = $3)
-        ORDER BY ci.index ASC, ci.id ASC, v.name ASC, v.id ASC, pa.created_at ASC, pa.id ASC
+        ORDER BY ci.position ASC, ci.id ASC, v.name ASC, v.id ASC, pa.created_at ASC, pa.id ASC
         "#,
         collection_id,
         instrument_filter.as_deref(),
@@ -422,7 +426,8 @@ async fn query_collection(
         if items.last().map(|item| item.item_id) != Some(row.item_id) {
             items.push(ItemCoverage {
                 item_id: row.item_id,
-                index: row.item_index,
+                position: row.item_position,
+                label: row.item_label,
                 arrangement_id: row.arrangement_id,
                 arrangement_title: row.arrangement_title,
                 arrangement_slug: row.arrangement_slug,
@@ -482,7 +487,8 @@ pub async fn for_org(
         SELECT
             c.id as collection_id,
             ci.id as "item_id?",
-            ci.index as "item_index?",
+            ci.position as "item_position?",
+            ci.label as "item_label?",
             a.id as "arrangement_id?",
             a.title as "arrangement_title?",
             a.slug as "arrangement_slug?",
@@ -508,7 +514,7 @@ pub async fn for_org(
           ON pa.collection_item_id = ci.id AND pa.voice_id = v.id
         LEFT JOIN "user" u ON u.id = pa.user_id
         WHERE c.organization_id = $1 AND c.deleted_at IS NULL
-        ORDER BY c.name ASC, c.id ASC, ci.index ASC, ci.id ASC, v.name ASC, v.id ASC,
+        ORDER BY c.name ASC, c.id ASC, ci.position ASC, ci.id ASC, v.name ASC, v.id ASC,
                  pa.created_at ASC, pa.id ASC
         "#,
         organization_id,
@@ -532,15 +538,19 @@ pub async fn for_org(
         let report = reports.last_mut().expect("just pushed");
 
         // A collection with no live items yields one all-NULL row.
-        let (Some(item_id), Some(index), Some(arrangement_id)) =
-            (row.item_id, row.item_index, row.arrangement_id)
-        else {
+        let (Some(item_id), Some(position), Some(label), Some(arrangement_id)) = (
+            row.item_id,
+            row.item_position,
+            row.item_label,
+            row.arrangement_id,
+        ) else {
             continue;
         };
         if report.items.last().map(|i| i.item_id) != Some(item_id) {
             report.items.push(ItemCoverage {
                 item_id,
-                index,
+                position,
+                label,
                 arrangement_id,
                 arrangement_title: row.arrangement_title.unwrap_or_default(),
                 arrangement_slug: row.arrangement_slug.unwrap_or_default(),
