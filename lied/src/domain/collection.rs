@@ -64,7 +64,7 @@ fn map_write_error(err: sqlx::Error) -> CollectionError {
 
 /// Slugify a collection name (immutable once created, per docs/design.md).
 pub fn slugify(input: &str) -> String {
-    crate::domain::user::slugify(input)
+    crate::slug::slugify(input, "collection")
 }
 
 /// Sort allowlist for `GET /v1/orgs/{orgId}/collections`. Default `name:asc`.

@@ -43,13 +43,12 @@ fn map_insert_error(err: sqlx::Error) -> OrganizationError {
     OrganizationError::Database(err)
 }
 
-/// Slugify an organization name into the ASCII, lowercase, hyphen-separated
-/// form used for `Organization.slug` (immutable; see [`crate::domain::user::slugify`]
-/// for the identical algorithm — kept duplicated rather than shared since the
-/// two entities' slug rules could diverge later, e.g. organization slugs
-/// disallowing certain reserved words).
+/// Slugify an organization name into the form used for `Organization.slug`
+/// (immutable). The shared algorithm is [`crate::slug::slugify`]; this
+/// wrapper names the fallback and is where organization-only rules (reserved
+/// words, say) would go.
 pub fn slugify(input: &str) -> String {
-    crate::domain::user::slugify(input)
+    crate::slug::slugify(input, "organization")
 }
 
 /// Insert a new organization row.

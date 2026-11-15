@@ -58,29 +58,12 @@ fn map_insert_error(err: sqlx::Error) -> UserError {
     UserError::Database(err)
 }
 
-/// Slugify a username into the ASCII, lowercase, hyphen-separated form used
-/// for `User.slug` (immutable; distinct from the renameable `username`).
-/// Any character that isn't an ASCII alphanumeric becomes a hyphen; runs of
-/// hyphens collapse to one, and leading/trailing hyphens are trimmed.
+/// Slugify a username into the form used for `User.slug` (immutable;
+/// distinct from the renameable `username`). The shared algorithm is
+/// [`crate::slug::slugify`]; the fallback for a name with nothing
+/// transliterable is `user-<hash>`.
 pub fn slugify(input: &str) -> String {
-    let mut slug = String::with_capacity(input.len());
-    let mut last_was_hyphen = false;
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            last_was_hyphen = false;
-        } else if !last_was_hyphen && !slug.is_empty() {
-            slug.push('-');
-            last_was_hyphen = true;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty() {
-        slug.push_str("user");
-    }
-    slug
+    crate::slug::slugify(input, "user")
 }
 
 /// Insert a new user row. `password_hash` is `None` for OIDC-only accounts
@@ -348,8 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn slugify_falls_back_when_empty() {
-        assert_eq!(slugify("!!!"), "user");
+    fn slugify_falls_back_to_user_and_hash_when_empty() {
+        let slug = slugify("!!!");
+        assert!(slug.starts_with("user-"), "{slug}");
+        assert_ne!(slug, slugify("???"));
     }
 
     #[test]

@@ -59,6 +59,15 @@ subtle = "2.6"
 base64 = "0.22"
 sha2 = "0.10"
 
+# Slugs: pinned exactly, because a slug is immutable once created and a
+# transliteration change in an upgrade would change the slug for new rows of
+# the same title (see lied/src/slug.rs).
+deunicode = "=1.6.2"
+# NFC before slugging, so a decomposed "a" + combining diaeresis (as macOS
+# sends names) slugs the same as a precomposed "ä". Pinned like deunicode:
+# a slug must not change between releases.
+unicode-normalization = "=0.1.26"
+
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
 

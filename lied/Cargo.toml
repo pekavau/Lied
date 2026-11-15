@@ -37,6 +37,8 @@ rand = { workspace = true }
 subtle = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
+deunicode = { workspace = true }
+unicode-normalization = { workspace = true }
 
 figment = { workspace = true }
 

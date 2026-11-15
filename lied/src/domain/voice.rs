@@ -90,9 +90,9 @@ fn map_write_error(err: sqlx::Error) -> VoiceError {
 
 /// Slugify a voice name (docs/design.md: slugs generated at creation, immutable
 /// thereafter). Reuses the shared algorithm — see
-/// [`crate::domain::user::slugify`].
+/// [`crate::slug::slugify`].
 pub fn slugify(input: &str) -> String {
-    crate::domain::user::slugify(input)
+    crate::slug::slugify(input, "voice")
 }
 
 /// Validate that `instrument_id` references a live `instrument` row

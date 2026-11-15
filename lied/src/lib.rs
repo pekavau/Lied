@@ -14,6 +14,7 @@ pub mod file_service;
 pub mod listing;
 pub mod pagination;
 pub mod routes;
+pub mod slug;
 pub mod state;
 pub mod storage;
 pub mod telemetry;
