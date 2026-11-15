@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::auth::app_password::{prefix_of, verify_token};
 use crate::domain::app_password as app_password_repo;
 use crate::domain::audit_log::{audit, AuditContext};
+use crate::domain::user as user_repo;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedWebDavUser {
@@ -57,12 +58,7 @@ pub async fn authenticate(
     let (username, token) =
         decode_basic_auth(header_value).ok_or(WebDavAuthError::MissingOrMalformed)?;
 
-    let candidate_user = sqlx::query!(
-        r#"SELECT id, username::text as "username!" FROM "user" WHERE username = $1"#,
-        username,
-    )
-    .fetch_optional(pool)
-    .await?;
+    let candidate_user = user_repo::find_by_username(pool, &username).await?;
 
     let Some(candidate_user) = candidate_user else {
         return Err(WebDavAuthError::InvalidCredentials);

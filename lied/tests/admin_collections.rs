@@ -2612,3 +2612,63 @@ async fn a_voice_part_number_is_set_from_the_catalog_screens() {
         .unwrap();
     assert_eq!(cleared, None);
 }
+
+#[tokio::test]
+async fn the_console_restores_a_tag_only_through_its_own_org() {
+    use lied::domain::tag;
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+
+    let other_org = Uuid::now_v7();
+    organization::create(
+        &ctx.state.db,
+        other_org,
+        "Rival Orchestra",
+        &organization::slugify("Rival Orchestra"),
+        None,
+    )
+    .await
+    .expect("other org");
+    let ours = tag::create(&ctx.pool, Uuid::now_v7(), fx.org_id, "Festive", None, None)
+        .await
+        .expect("our tag");
+    let theirs = tag::create(&ctx.pool, Uuid::now_v7(), other_org, "Theirs", None, None)
+        .await
+        .expect("their tag");
+    for id in [ours.id, theirs.id] {
+        assert!(tag::soft_delete(&ctx.pool, id, None).await.unwrap());
+    }
+
+    let tags_url = format!("/admin/orgs/{}/tags", fx.org_id);
+    let token = session_csrf(&ctx.app, &browser, &tags_url).await;
+
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{tags_url}/{}/undelete", theirs.id),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert!(
+        tag::find_by_id(&ctx.pool, theirs.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "another org's tag stays deleted"
+    );
+
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &format!("{tags_url}/{}/undelete", ours.id),
+        &[],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert!(tag::find_by_id(&ctx.pool, ours.id).await.unwrap().is_some());
+    assert_eq!(audit_count(&ctx.pool, "tag.undelete").await, 1);
+}

@@ -368,10 +368,10 @@ async fn undelete_tag(
         return console::section_forbidden(&ctx);
     }
     // Scope: the deleted tag must belong to this org.
-    let owned = match tag::list_deleted_for_org(&state.db, org_id).await {
-        Ok(ts) => ts.iter().any(|t| t.id == tag_id),
+    let owned = match tag::find_by_id_including_deleted(&state.db, tag_id).await {
+        Ok(found) => found.is_some_and(|t| t.organization_id == org_id),
         Err(error) => {
-            tracing::error!(%error, "failed to list deleted tags");
+            tracing::error!(%error, "failed to look up tag");
             return error_page(
                 &ctx,
                 StatusCode::INTERNAL_SERVER_ERROR,

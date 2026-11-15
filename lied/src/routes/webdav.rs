@@ -106,15 +106,11 @@ async fn dav(State(state): State<AppState>, request: Request) -> Response {
 
     // The WebDAV `/users/<slug>/library` tree is keyed by user slug; resolve it
     // once for the private-library ownership check.
-    let user_slug =
-        match sqlx::query_scalar!(r#"SELECT slug FROM "user" WHERE id = $1"#, user.user_id)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(Some(slug)) => slug,
-            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+    let user_slug = match crate::domain::user::find_by_id(&state.db, user.user_id).await {
+        Ok(Some(found)) => found.slug,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
 
     let fs = LiedFs::new(state.clone(), user.user_id, user_slug, request_id);
     let handler = DavHandler::builder()

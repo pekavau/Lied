@@ -1947,3 +1947,83 @@ async fn bad_path_and_query_parameters_are_problem_details_naming_them() {
         axum::http::StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn tag_undelete_restores_only_through_the_owning_org() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_a, token_a) = org_with_member(
+        &db.pool,
+        &state,
+        "Org A",
+        "arch_a",
+        membership::Role::Archivist,
+    )
+    .await;
+    let (org_b, token_b) = org_with_member(
+        &db.pool,
+        &state,
+        "Org B",
+        "arch_b",
+        membership::Role::Archivist,
+    )
+    .await;
+
+    let request = bearer_request("POST", &format!("/v1/orgs/{org_a}/tags"), &token_a)
+        .body(axum::body::Body::from(
+            serde_json::json!({ "name": "Festive", "kind": "occasion" }).to_string(),
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let tag_id = Uuid::parse_str(body_json(response).await["id"].as_str().unwrap()).unwrap();
+    assert!(lied::domain::tag::soft_delete(&db.pool, tag_id, None)
+        .await
+        .unwrap());
+
+    let undelete = |org: Uuid, token: &str| {
+        bearer_request(
+            "POST",
+            &format!("/v1/orgs/{org}/tags/{tag_id}/undelete"),
+            token,
+        )
+        .body(axum::body::Body::empty())
+        .unwrap()
+    };
+
+    // Another org's archivist cannot reach it, and nothing changes.
+    let response = app
+        .clone()
+        .oneshot(undelete(org_b, &token_b))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    assert!(lied::domain::tag::find_by_id(&db.pool, tag_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The owning org restores it, audited with the tag's name.
+    let response = app
+        .clone()
+        .oneshot(undelete(org_a, &token_a))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+    assert!(lied::domain::tag::find_by_id(&db.pool, tag_id)
+        .await
+        .unwrap()
+        .is_some());
+    let payload: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT payload FROM audit_log WHERE action = 'tag.undelete' AND target_id = $1"#,
+    )
+    .bind(tag_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(payload["name"], "Festive");
+
+    // A live tag has nothing to restore.
+    let response = app.oneshot(undelete(org_a, &token_a)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
