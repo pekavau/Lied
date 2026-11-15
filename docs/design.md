@@ -253,6 +253,10 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 - Permissions are scoped to organizations. A user's capabilities within an org are determined by `Membership.role`.
 - No system-wide application roles. An optional `User.is_system_admin` boolean covers instance-level operations (org provisioning, user management).
 - A `PartAssignment` implicitly grants the assigned user **read access to that voice's files** for as long as the assignment exists, regardless of Membership in the org. This is how guests and substitutes access parts.
+  - **Live only:** the assignment counts while its collection item, collection, voice and arrangement are all live. Removing the piece, or deleting any of them, ends the access; the assignment row stays.
+  - **One rule for both surfaces:** `domain::access` (`assigned_voice`, `assigned_arrangement`) decides it for WebDAV and `/v1` alike (#99).
+  - **What a guest reads on `/v1`** (no membership, a live assignment): the assigned voice (`GET …/voices/{voiceId}`), its file list and its files (download with `Range`), and the arrangement as a **summary** (`GET …/arrangements/{arrangementId}`): the same response, with the licensing and purchase fields (`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) `null`. Not the other voices, the full score, any list of the org (arrangements, voices, members, collections), global annotations, or any write.
+  - **A refusal is `403`**, whether or not the target exists, as it is for every non-member: a guest learns nothing about the org's other repertoire (the same principle as the WebDAV PROPFIND scope).
 
 **Console access** (`/admin`):
 - **Staff** (`owner`, `archivist`, `conductor`) enter their org's workspace; each screen follows the permission matrix, so a conductor builds collections, assigns parts and writes global annotations but sees arrangement, voice and file data read-only.
@@ -273,6 +277,8 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 | Part assignments | ✓ | ✓ | ✓ | |
 | Read assigned parts | ✓ | ✓ | ✓ | ✓ |
 | Personal annotations (own) | ✓ | ✓ | ✓ | ✓ |
+
+A **guest** (a part assignment without membership) has one row: read assigned parts, under *Auth & access*.
 
 ### HTTP & REST API conventions
 
@@ -1526,7 +1532,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 Still model-supported, still not built:
 
-- The **consumer / reader client** (musician + guest + conductor-in-performance): a cross-platform web + mobile app in its **own repository**, consuming `/v1` + the OpenAPI-generated types. It requires new backend plumbing not present in phase 2 — **CORS**, and a first-party username/password → JWT login with a **refresh-token** flow (the current 30-day JWT has no refresh model). Built ahead of it: `GET /v1/me`, the caller and their memberships (#97). (Bearer-authed `/v1` file streaming with Range already exists from phase 1 — issue #7 — so that is *not* new work.) Covers UC-14, UC-15, UC-17, UC-18, the musician-facing side of UC-19 / UC-20, and the **principal's mobile/end-device coverage view** — the read-only console view ships in phase 2, the mobile-first surface is part of this client.
+- The **consumer / reader client** (musician + guest + conductor-in-performance): a cross-platform web + mobile app in its **own repository**, consuming `/v1` + the OpenAPI-generated types. It requires new backend plumbing not present in phase 2 — **CORS**, and a first-party username/password → JWT login with a **refresh-token** flow (the current 30-day JWT has no refresh model). Built ahead of it: `GET /v1/me`, the caller and their memberships (#97); guests reading their assigned parts on `/v1` (#99). (Bearer-authed `/v1` file streaming with Range already exists from phase 1 — issue #7 — so that is *not* new work.) Covers UC-14, UC-15, UC-17, UC-18, the musician-facing side of UC-19 / UC-20, and the **principal's mobile/end-device coverage view** — the read-only console view ships in phase 2, the mobile-first surface is part of this client.
 - Conversion pipelines (LilyPond → PDF, MusicXML → LilyPond) + the conversion-quality UI (UC-9/UC-10); OMR / Audiveris.
 - Distribution **delivery** (UC-12): notification email + sync. Assignment state (`notifiedAt` / `acknowledgedAt`) is settable in the phase-2 admin, but automated delivery is deferred.
 - OIDC / SSO; the MCP server; external repertoire discovery → purchase pipeline (UC-4); annotation staleness indicator; `difficulty_ratings` cross-scale search.

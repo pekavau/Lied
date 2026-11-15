@@ -25,6 +25,7 @@
 use uuid::Uuid;
 
 use crate::auth::extractors::{AuthSession, BearerOrSession};
+use crate::domain::access;
 use crate::domain::membership::{self, Role};
 use crate::domain::user::User;
 use crate::error::AppError;
@@ -102,6 +103,69 @@ pub async fn require_org_role_v1(
     minimum: Role,
 ) -> Result<Option<membership::Membership>, AppError> {
     require_org_role(state, &auth.user, organization_id, minimum).await
+}
+
+/// How a caller may read an org's arrangement data on `/v1` (#99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// A member of the org, of any role, or a system admin: the member read
+    /// rules.
+    Member,
+    /// A guest: no membership, but a live part assignment
+    /// ([`crate::domain::access`]). Reads only what the assignment grants:
+    /// the assigned voice, its files, and its arrangement's summary.
+    Guest,
+}
+
+/// Require the caller to read arrangement `arrangement_id` of
+/// `organization_id`: a member (any role), or a guest holding a live part
+/// assignment on one of its voices. Anything else is `403`, whether or not
+/// the arrangement exists, as for every non-member before #99, so a guest
+/// learns nothing about the org's other repertoire.
+pub async fn require_arrangement_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    arrangement_id: Uuid,
+) -> Result<Reader, AppError> {
+    match require_org_role_v1(state, auth, organization_id, Role::Musician).await {
+        Ok(_) => Ok(Reader::Member),
+        Err(AppError::Forbidden) => {
+            match access::assigned_arrangement(&state.db, auth.user.id, arrangement_id).await? {
+                Some(org) if org == organization_id => Ok(Reader::Guest),
+                _ => Err(AppError::Forbidden),
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Require the caller to read voice `voice_id` (and its files) of
+/// `arrangement_id` in `organization_id`: a member (any role), or a guest
+/// holding a live part assignment on exactly this voice. Anything else is
+/// `403`, existing or not (see [`require_arrangement_reader_v1`]).
+pub async fn require_voice_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    arrangement_id: Uuid,
+    voice_id: Uuid,
+) -> Result<Reader, AppError> {
+    match require_org_role_v1(state, auth, organization_id, Role::Musician).await {
+        Ok(_) => Ok(Reader::Member),
+        Err(AppError::Forbidden) => {
+            match access::assigned_voice(&state.db, auth.user.id, voice_id).await? {
+                Some(found)
+                    if found.organization_id == organization_id
+                        && found.arrangement_id == arrangement_id =>
+                {
+                    Ok(Reader::Guest)
+                }
+                _ => Err(AppError::Forbidden),
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Which coverage a caller is entitled to see.

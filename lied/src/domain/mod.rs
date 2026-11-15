@@ -22,6 +22,7 @@
 //! ([`crate::listing::stale_or_gone`]). `None` writes unconditionally:
 //! fixtures, and console buttons that carry no version.
 
+pub mod access;
 pub mod app_password;
 pub mod arrangement;
 pub mod audit_log;
