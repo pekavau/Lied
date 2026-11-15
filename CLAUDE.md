@@ -88,7 +88,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 
 ### Testing posture
 - **Unit tests** colocated with code; fast, no DB.
-- **Integration tests** under `tests/`; use `testcontainers` for real Postgres + MinIO.
+- **Integration tests** under `tests/`; use `testcontainers` for real Postgres + object storage (the pinned RustFS image in `tests/common`).
 - **Fixtures** are composable builder helpers (`seed_test_org() -> OrgCtx`, `seed_arrangement(&org)`, `seed_user_with_role(...)`) returning typed handles, layered over a fresh per-test container/schema — not raw per-test SQL. Builders go through the real repository functions so they stay correct as the schema evolves; raw SQL fixtures drift from the actual insert paths and rot.
 - New code without tests is a PR objection, not a hard CI gate (chasing coverage % produces bad tests).
 
