@@ -421,6 +421,8 @@ pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
         .merge(token_router)
         .routes(routes!(list_app_passwords, create_app_password))
         .routes(routes!(revoke_app_password))
+        // The caller's own views: who am I (issue #97).
+        .merge(crate::routes::me::router())
         // Org/User/Membership management (issue #5) — see `routes::orgs` for
         // the handlers; merged rather than re-declared here so that module
         // owns its own route table end to end.

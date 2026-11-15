@@ -310,8 +310,9 @@ List endpoints page by **offset/limit** and answer with an envelope:
 - **Unpaginated by design**, each bounded and read as a whole:
   - per-collection reports (the coverage report, the bulk-assignment preview) —
     a report split across pages cannot be read;
-  - a collection's items (its running order), the tags on one arrangement, and
-    the caller's own app passwords.
+  - a collection's items (its running order), the tags on one arrangement,
+    the caller's own app passwords, and the caller's memberships in
+    `GET /v1/me`.
 
 **Why:** offset gives a cheap `total` for "page 3 of 7"; its weakness, rows
 shifting under concurrent inserts, does not matter at this scale. An optional
@@ -919,6 +920,12 @@ the user holds a membership, part assignment, annotation authorship or app
 password, or is `created_by` of any content row. Audit-log rows do not block:
 their actor becomes NULL.
 
+Any logged-in user reads themselves and their memberships, each with its
+organization and role, at `GET /v1/me` (#97). It is how a client learns
+whom it is acting for after login. The response has no `ETag`: it combines
+the user row with every membership, so no single `updated_at` versions it,
+and nothing is written through it.
+
 #### AppPassword
 
 A revocable, per-device credential for WebDAV.
@@ -1433,7 +1440,7 @@ This is chosen over building a client first because: (1) the archivist/planner w
 
 Still model-supported, still not built:
 
-- The **consumer / reader client** (musician + guest + conductor-in-performance): a cross-platform web + mobile app in its **own repository**, consuming `/v1` + the OpenAPI-generated types. It requires new backend plumbing not present in phase 2 — **CORS**, and a first-party username/password → JWT login with a **refresh-token** flow (the current 30-day JWT has no refresh model). (Bearer-authed `/v1` file streaming with Range already exists from phase 1 — issue #7 — so that is *not* new work.) Covers UC-14, UC-15, UC-17, UC-18, the musician-facing side of UC-19 / UC-20, and the **principal's mobile/end-device coverage view** — the read-only console view ships in phase 2, the mobile-first surface is part of this client.
+- The **consumer / reader client** (musician + guest + conductor-in-performance): a cross-platform web + mobile app in its **own repository**, consuming `/v1` + the OpenAPI-generated types. It requires new backend plumbing not present in phase 2 — **CORS**, and a first-party username/password → JWT login with a **refresh-token** flow (the current 30-day JWT has no refresh model). Built ahead of it: `GET /v1/me`, the caller and their memberships (#97). (Bearer-authed `/v1` file streaming with Range already exists from phase 1 — issue #7 — so that is *not* new work.) Covers UC-14, UC-15, UC-17, UC-18, the musician-facing side of UC-19 / UC-20, and the **principal's mobile/end-device coverage view** — the read-only console view ships in phase 2, the mobile-first surface is part of this client.
 - Conversion pipelines (LilyPond → PDF, MusicXML → LilyPond) + the conversion-quality UI (UC-9/UC-10); OMR / Audiveris.
 - Distribution **delivery** (UC-12): notification email + sync. Assignment state (`notifiedAt` / `acknowledgedAt`) is settable in the phase-2 admin, but automated delivery is deferred.
 - OIDC / SSO; the MCP server; external repertoire discovery → purchase pipeline (UC-4); annotation staleness indicator; `difficulty_ratings` cross-scale search.

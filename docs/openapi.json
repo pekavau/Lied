@@ -454,6 +454,66 @@
         ]
       }
     },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "me"
+        ],
+        "summary": "Who am I",
+        "description": "A system admin reaches every organization, but only those with a\nmembership are listed here; `isSystemAdmin` tells the client the rest.",
+        "operationId": "get_me",
+        "responses": {
+          "200": {
+            "description": "The caller and their memberships",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
     "/v1/orgs": {
       "get": {
         "tags": [
@@ -13041,6 +13101,89 @@
           }
         }
       },
+      "MeMembership": {
+        "type": "object",
+        "description": "One of the caller's memberships, with its organization.",
+        "required": [
+          "id",
+          "organization",
+          "role",
+          "instrumentIds",
+          "isPrincipal",
+          "principalInstrumentIds"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The membership's id, as under `/v1/orgs/{orgId}/members/{memberId}`."
+          },
+          "instrumentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "isPrincipal": {
+            "type": "boolean"
+          },
+          "organization": {
+            "$ref": "#/components/schemas/MeOrganization"
+          },
+          "principalInstrumentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          }
+        }
+      },
+      "MeOrganization": {
+        "type": "object",
+        "description": "The organization a membership belongs to, as much as a client needs to\nshow and enter it.",
+        "required": [
+          "id",
+          "name",
+          "slug"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        }
+      },
+      "MeResponse": {
+        "type": "object",
+        "description": "The caller and their memberships.",
+        "required": [
+          "user",
+          "memberships"
+        ],
+        "properties": {
+          "memberships": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MeMembership"
+            },
+            "description": "Every organization the caller is a member of, ordered by organization\nname; empty for a guest or a system admin without memberships. Not\npaginated: one entry per organization the caller belongs to."
+          },
+          "user": {
+            "$ref": "#/components/schemas/User"
+          }
+        }
+      },
       "MembershipResponse": {
         "type": "object",
         "required": [
@@ -14003,6 +14146,10 @@
     {
       "name": "auth",
       "description": "Bearer-token minting"
+    },
+    {
+      "name": "me",
+      "description": "The caller: who they are and where they belong"
     },
     {
       "name": "app-passwords",

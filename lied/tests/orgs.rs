@@ -1280,3 +1280,101 @@ async fn concurrent_demotions_and_removals_keep_an_owner() {
         assert_eq!(owners, 1, "round {round}: the org keeps an owner");
     }
 }
+
+async fn get_me(
+    app: &axum::Router,
+    request: axum::http::request::Builder,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// `GET /v1/me` (#97): the caller and every membership, with its org and
+/// role, the same through a bearer token and through the console's session
+/// cookie.
+#[tokio::test]
+async fn me_returns_the_caller_and_their_memberships() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let anna = create_plain_user(&db.pool, "anna", "correct horse battery staple").await;
+    let band = create_org(&db.pool, "Stadtkapelle").await;
+    let choir = create_org(&db.pool, "Abendchor").await;
+    let in_band = add_member(&db.pool, band.id, anna.id, membership::Role::Owner).await;
+    add_member(&db.pool, choir.id, anna.id, membership::Role::Musician).await;
+    // Someone else's membership must not leak into Anna's answer.
+    let other = create_plain_user(&db.pool, "bert", "correct horse battery staple").await;
+    add_member(&db.pool, band.id, other.id, membership::Role::Archivist).await;
+
+    let token = mint_token(&state, anna.id);
+    let response = get_me(&app, bearer_request("GET", "/v1/me", &token)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bearer_body = body_json(response).await;
+
+    assert_eq!(bearer_body["user"]["id"], anna.id.to_string());
+    assert_eq!(bearer_body["user"]["username"], "anna");
+    assert_eq!(bearer_body["user"]["isSystemAdmin"], false);
+    assert!(bearer_body["user"].get("passwordHash").is_none());
+    let memberships = bearer_body["memberships"].as_array().unwrap();
+    assert_eq!(memberships.len(), 2, "{bearer_body}");
+    // Ordered by organization name.
+    assert_eq!(memberships[0]["organization"]["name"], "Abendchor");
+    assert_eq!(memberships[0]["role"], "musician");
+    assert_eq!(memberships[1]["organization"]["id"], band.id.to_string());
+    assert_eq!(memberships[1]["organization"]["slug"], band.slug);
+    assert_eq!(memberships[1]["role"], "owner");
+    assert_eq!(memberships[1]["id"], in_band.id.to_string());
+    assert_eq!(memberships[1]["isPrincipal"], false);
+    assert_eq!(memberships[1]["instrumentIds"], serde_json::json!([]));
+
+    let (session, csrf) = admin_login(&app, "anna", "correct horse battery staple").await;
+    let cookie = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/me")
+        .header(
+            axum::http::header::COOKIE,
+            format!("lied_session={session}; lied_csrf={csrf}"),
+        );
+    let response = get_me(&app, cookie).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        bearer_body,
+        "cookie and bearer agree"
+    );
+}
+
+/// A system admin without memberships gets an empty list and the flag set.
+#[tokio::test]
+async fn me_reports_a_system_admin_without_memberships() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let admin = bootstrap_admin(&db.pool, "root", "correct horse battery staple").await;
+
+    let token = mint_token(&state, admin.id);
+    let response = get_me(&app, bearer_request("GET", "/v1/me", &token)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["user"]["isSystemAdmin"], true);
+    assert_eq!(body["memberships"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn me_without_credentials_is_401() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, _state) = build_test_app(db.pool.clone()).await;
+    let response = get_me(
+        &app,
+        axum::http::Request::builder().method("GET").uri("/v1/me"),
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "application/problem+json"
+    );
+}

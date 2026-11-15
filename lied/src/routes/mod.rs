@@ -21,6 +21,7 @@ pub mod files;
 pub mod global_annotations;
 pub mod infra;
 pub(crate) mod json;
+pub mod me;
 pub mod openapi;
 pub mod orgs;
 pub(crate) mod params;

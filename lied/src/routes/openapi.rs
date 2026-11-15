@@ -195,6 +195,7 @@ pub enum Range416 {
         (name = "meta",          description = "API metadata"),
         (name = "instruments",   description = "Instrument controlled vocabulary (instance-wide)"),
         (name = "auth",          description = "Bearer-token minting"),
+        (name = "me",            description = "The caller: who they are and where they belong"),
         (name = "app-passwords", description = "WebDAV app-password credentials"),
         (name = "organizations", description = "Organizations"),
         (name = "users",         description = "User accounts (system-admin)"),
