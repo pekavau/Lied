@@ -79,7 +79,11 @@ axum's own extractors reject a bad request in plain text. In `/v1` use:
 - `routes::json::ApiJson<T>` for JSON bodies;
 - `routes::params::{ApiPath, ApiQuery}` for path and query parameters,
   conventionally imported as `ApiPath as Path, ApiQuery as Query`. `clippy.toml`
-  forbids `axum::extract::{Path, Query}`, so CI catches a slip.
+  forbids `axum::extract::{Path, Query}`, so CI catches a slip;
+- `routes::params::ApiListQuery<T>` on a list endpoint that takes filters:
+  it yields the control parameters (`params: T`) and the raw `filter[…]`
+  pairs (`filters`, for `listing::resolve_filters`) from one decoding pass.
+  Do not read the raw URI for filters.
 
 ## 4. ETags and guarded writes
 

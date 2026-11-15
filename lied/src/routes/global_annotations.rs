@@ -36,7 +36,7 @@ use crate::routes::openapi::{
 };
 use crate::routes::RequestId;
 // Problem Details on a bad parameter (issue #66); see `routes::params`.
-use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
+use crate::routes::params::{ApiListQuery, ApiPath as Path};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -137,8 +137,10 @@ async fn list_annotations(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<GlobalAnnotation>>, AppError> {
     require_org_capability_v1(&state, &auth, org_id, Role::is_staff).await?;
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
@@ -156,7 +158,6 @@ async fn list_annotations(
     .map_err(AppError::Validation)?;
     let sort = global_annotation::SortField::from_key(sort_column)
         .unwrap_or(global_annotation::SortField::CreatedAt);
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, global_annotation::FILTER_ALLOWLIST)
         .map_err(AppError::Validation)?;
     let type_filter = filters

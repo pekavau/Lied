@@ -29,7 +29,7 @@ use crate::routes::openapi::{
 use crate::routes::patch::{changed_fields, present_or_null, reject_blank};
 use crate::routes::RequestId;
 // Problem Details on a bad parameter (issue #66); see `routes::params`.
-use crate::routes::params::{ApiPath as Path, ApiQuery as Query};
+use crate::routes::params::{ApiListQuery, ApiPath as Path};
 use crate::state::AppState;
 
 pub fn router() -> OpenApiRouter<AppState> {
@@ -124,8 +124,10 @@ struct UpdateWorkRequest {
 async fn list_works(
     auth: BearerOrSession,
     State(state): State<AppState>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<work::Work>>, AppError> {
     let _ = &auth;
     let (limit, offset) = crate::pagination::PageParams {
@@ -137,8 +139,6 @@ async fn list_works(
     let (sort_column, sort_direction) =
         listing::resolve_sort(q.sort.as_deref(), work::SORT_ALLOWLIST, work::DEFAULT_SORT)
             .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =
         listing::resolve_filters(&raw_filters, work::FILTER_ALLOWLIST).map_err(validation_error)?;
     let title_filter = filters
@@ -676,8 +676,10 @@ async fn list_arrangements(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
-    Query(q): Query<ListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<ArrangementResponse>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
@@ -693,8 +695,6 @@ async fn list_arrangements(
         arrangement::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, arrangement::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
     let search = build_search(&filters, q.q.as_deref())?;
@@ -1229,8 +1229,10 @@ async fn list_voices(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
-    Query(q): Query<VoiceListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<VoiceListQuery>,
 ) -> Result<Json<Page<VoiceResponse>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
@@ -1248,8 +1250,6 @@ async fn list_voices(
         voice::DEFAULT_SORT,
     )
     .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters = listing::resolve_filters(&raw_filters, voice::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
     let instrument_id_filter = match filters.iter().find(|(field, _)| field == "instrumentId") {
@@ -1733,8 +1733,10 @@ async fn list_tags(
     auth: BearerOrSession,
     State(state): State<AppState>,
     Path(org_id): Path<Uuid>,
-    Query(q): Query<TagListQuery>,
-    raw_uri: axum::http::Uri,
+    ApiListQuery {
+        params: q,
+        filters: raw_filters,
+    }: ApiListQuery<TagListQuery>,
 ) -> Result<Json<Page<TagResponse>>, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
 
@@ -1747,8 +1749,6 @@ async fn list_tags(
     let (sort_column, sort_direction) =
         listing::resolve_sort(q.sort.as_deref(), tag::SORT_ALLOWLIST, tag::DEFAULT_SORT)
             .map_err(validation_error)?;
-
-    let raw_filters = listing::parse_filters(raw_uri.query().unwrap_or(""));
     let filters =
         listing::resolve_filters(&raw_filters, tag::FILTER_ALLOWLIST).map_err(validation_error)?;
     let kind_filter = filters
