@@ -114,3 +114,11 @@ Handlers authorize, extract, call a `domain/*` function, audit and respond.
 Business rules belong in `domain/*` so the console and any later consumer
 (CLAUDE.md, "MCP server") call the same functions instead of going through
 HTTP.
+
+## 7. Update the contract snapshot
+
+`docs/openapi.json` is the served spec, committed. After any change that alters
+the API, run `just openapi` and commit the result; `openapi_snapshot_is_current`
+fails until you do, and the diff is what reviewers read to see the contract
+change. Then `just check`.
+

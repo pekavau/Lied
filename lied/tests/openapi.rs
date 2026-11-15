@@ -997,3 +997,51 @@ fn unpaginated_lists_are_named_exceptions() {
         violations.join("\n")
     );
 }
+
+/// The committed snapshot of the `/v1` contract (issue #75).
+const SNAPSHOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/openapi.json");
+
+/// Issue #75: `docs/openapi.json` is the `/v1` contract as served, committed so
+/// every change to it shows up as a diff in review. A PR that changes the
+/// contract regenerates it with `just openapi`
+/// (`LIED_UPDATE_OPENAPI_SNAPSHOT=1` on this test).
+#[test]
+fn openapi_snapshot_is_current() {
+    let generated =
+        serde_json::to_string_pretty(&build_openapi_json()).expect("spec serializes") + "\n";
+    if std::env::var_os("LIED_UPDATE_OPENAPI_SNAPSHOT").is_some() {
+        std::fs::write(SNAPSHOT, &generated).expect("write docs/openapi.json");
+        return;
+    }
+    let committed = std::fs::read_to_string(SNAPSHOT).unwrap_or_default();
+    if committed == generated {
+        return;
+    }
+    let first_difference = committed
+        .lines()
+        .zip(generated.lines())
+        .enumerate()
+        .find(|(_, (a, b))| a != b)
+        .map(|(i, (a, b))| format!("line {}:\n  committed: {a}\n  generated: {b}", i + 1))
+        .unwrap_or_else(|| {
+            format!(
+                "the files differ in length ({} vs {} lines)",
+                committed.lines().count(),
+                generated.lines().count()
+            )
+        });
+    panic!(
+        "docs/openapi.json is out of date with the /v1 contract.\n\
+         If the change is intended, run `just openapi` and commit the result.\n\
+         First difference, {first_difference}"
+    );
+}
+
+/// The snapshot must not depend on run order or anything else that varies:
+/// two builds produce the same text.
+#[test]
+fn openapi_spec_serializes_deterministically() {
+    let a = serde_json::to_string_pretty(&build_openapi_json()).expect("spec serializes");
+    let b = serde_json::to_string_pretty(&build_openapi_json()).expect("spec serializes");
+    assert_eq!(a, b);
+}
