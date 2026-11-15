@@ -76,6 +76,52 @@ fn map_storage_error(err: storage::StorageError) -> UploadError {
     }
 }
 
+/// What a write did to the `File` rows before its bytes were stored: what
+/// [`undo_unstored_write`] has to take back when they never land.
+#[derive(Debug, Clone, Copy)]
+pub enum UnstoredWrite {
+    /// A new row was inserted.
+    Created { id: Uuid },
+    /// `old_id` was swapped out for the new row `new_id`.
+    Replaced { old_id: Uuid, new_id: Uuid },
+}
+
+/// Take back a row write whose bytes never reached object storage. Shared by
+/// every upload path (`/v1`, the console, WebDAV) so they cannot drift (#109).
+///
+/// - A new row is **hard-deleted**: it references an object that was never
+///   written, so it must not be listable or restorable as a removed file.
+/// - A replace is undone: the new row goes, the old one is live again (its
+///   object was never overwritten, because the new bytes never landed).
+///
+/// A failed rollback is logged at `error` with the ids and the key, never
+/// swallowed: it leaves exactly the state an operator must be able to find.
+pub async fn undo_unstored_write(db: &sqlx::PgPool, write: UnstoredWrite, key: &str) {
+    match write {
+        UnstoredWrite::Created { id } => {
+            if let Err(rollback_error) = file::hard_delete(db, id).await {
+                tracing::error!(
+                    %rollback_error,
+                    file_id = %id,
+                    key = %key,
+                    "failed to roll back the row for an upload that never stored its bytes"
+                );
+            }
+        }
+        UnstoredWrite::Replaced { old_id, new_id } => {
+            if let Err(rollback_error) = file::restore_replaced(db, old_id, new_id).await {
+                tracing::error!(
+                    %rollback_error,
+                    old_file_id = %old_id,
+                    new_file_id = %new_id,
+                    key = %key,
+                    "failed to undo a replace whose bytes never stored; the old file is left soft-deleted"
+                );
+            }
+        }
+    }
+}
+
 /// Store an uploaded file: validate the mime/name, insert the row (cheap
 /// duplicate detection), then stream the bytes to MinIO. On a streaming
 /// failure the never-written row is **hard-deleted** so no phantom remains.
@@ -137,19 +183,7 @@ pub async fn store_upload(
             key,
         }),
         Err(error) => {
-            // The row references an object that was never written — remove it
-            // entirely (not soft-delete) so it can't be listed/restored. If the
-            // compensating delete ALSO fails we have a phantom row pointing at
-            // nothing, which is exactly the state an operator must be able to
-            // find later — never swallow it.
-            if let Err(rollback_error) = file::hard_delete(&state.db, id).await {
-                tracing::error!(
-                    %rollback_error,
-                    file_id = %id,
-                    key = %key,
-                    "failed to roll back the row for an upload that never stored its bytes"
-                );
-            }
+            undo_unstored_write(&state.db, UnstoredWrite::Created { id }, &key).await;
             Err(map_storage_error(error))
         }
     }
@@ -227,18 +261,15 @@ pub async fn store_replacement(
             key,
         }),
         Err(error) => {
-            // Undo the row swap: drop the new row, re-live the old one. A
-            // failure here leaves the file soft-deleted with its bytes intact
-            // and no live row — recoverable, but only if it's visible.
-            if let Err(rollback_error) = file::restore_replaced(&state.db, old.id, new_id).await {
-                tracing::error!(
-                    %rollback_error,
-                    old_file_id = %old.id,
-                    new_file_id = %new_id,
-                    key = %key,
-                    "failed to undo a replace whose bytes never stored; the old file is left soft-deleted"
-                );
-            }
+            undo_unstored_write(
+                &state.db,
+                UnstoredWrite::Replaced {
+                    old_id: old.id,
+                    new_id,
+                },
+                &key,
+            )
+            .await;
             Err(map_storage_error(error))
         }
     }

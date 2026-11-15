@@ -26,6 +26,7 @@ struct Ctx {
     _minio: ContainerAsync<GenericImage>,
     pool: PgPool,
     app: axum::Router,
+    s3: aws_sdk_s3::Client,
 }
 
 impl Ctx {
@@ -34,6 +35,10 @@ impl Ctx {
     }
 
     async fn with_max_files(max_files_per_voice: u32) -> Self {
+        Self::with_limits(max_files_per_voice, 200 * 1024 * 1024).await
+    }
+
+    async fn with_limits(max_files_per_voice: u32, max_upload_bytes: u64) -> Self {
         let pg = Postgres::default()
             .with_tag("16-alpine")
             .start()
@@ -66,7 +71,12 @@ impl Ctx {
             .expect("start minio");
         let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
         let endpoint = format!("http://127.0.0.1:{minio_port}");
-        let state = test_state(pool.clone(), endpoint, max_files_per_voice);
+        let state = test_state(
+            pool.clone(),
+            endpoint,
+            max_files_per_voice,
+            max_upload_bytes,
+        );
         state
             .s3
             .create_bucket()
@@ -81,11 +91,17 @@ impl Ctx {
             _minio: minio,
             pool,
             app,
+            s3: state.s3.clone(),
         }
     }
 }
 
-fn test_state(pool: PgPool, s3_endpoint: String, max_files_per_voice: u32) -> AppState {
+fn test_state(
+    pool: PgPool,
+    s3_endpoint: String,
+    max_files_per_voice: u32,
+    max_upload_bytes: u64,
+) -> AppState {
     let config = AppConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url: Secret::from("postgres://unused/unused".to_string()),
@@ -96,7 +112,7 @@ fn test_state(pool: PgPool, s3_endpoint: String, max_files_per_voice: u32) -> Ap
         s3_region: "us-east-1".to_string(),
         jwt_signing_key: Secret::from("test-signing-key-material-for-webdav-tests".to_string()),
         jwt_lifetime_days: 30,
-        max_upload_bytes: 200 * 1024 * 1024,
+        max_upload_bytes,
         max_request_bytes: 256 * 1024,
         max_files_per_voice,
         max_arrangements_per_org: None,
@@ -1305,4 +1321,591 @@ async fn assignment_visibility_is_scoped_to_the_specific_item_not_the_whole_arra
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("spring"), "spring visible:\n{body}");
     assert!(!body.contains("summer"), "summer hidden:\n{body}");
+}
+
+// ── streaming, rollback, MOVE / COPY / remove_dir (#26, #109) ────────────────
+
+const PART: usize = lied::storage::UPLOAD_PART_SIZE;
+
+/// A deterministic, non-repeating-per-part byte pattern.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// A request whose body arrives in `chunk`-sized frames, as a client's does.
+fn streamed(
+    method: &str,
+    uri: &str,
+    auth: &str,
+    data: &[u8],
+    chunk: usize,
+) -> axum::http::Request<axum::body::Body> {
+    let frames: Vec<Result<bytes::Bytes, std::io::Error>> = data
+        .chunks(chunk)
+        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+        .collect();
+    axum::http::Request::builder()
+        .method(axum::http::Method::from_bytes(method.as_bytes()).unwrap())
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, auth)
+        .body(axum::body::Body::from_stream(futures_util::stream::iter(
+            frames,
+        )))
+        .unwrap()
+}
+
+fn request_with(
+    method: &str,
+    uri: &str,
+    auth: &str,
+    body: Vec<u8>,
+    headers: &[(&str, &str)],
+) -> axum::http::Request<axum::body::Body> {
+    let mut b = axum::http::Request::builder()
+        .method(axum::http::Method::from_bytes(method.as_bytes()).unwrap())
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, auth);
+    for (name, value) in headers {
+        b = b.header(*name, *value);
+    }
+    b.body(axum::body::Body::from(body)).unwrap()
+}
+
+async fn open_multipart_uploads(ctx: &Ctx) -> usize {
+    ctx.s3
+        .list_multipart_uploads()
+        .bucket(BUCKET)
+        .send()
+        .await
+        .expect("list multipart uploads")
+        .uploads()
+        .len()
+}
+
+async fn file_rows_named(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM file WHERE name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A file larger than two parts goes through WebDAV in parts: never more
+/// than one part in memory on the way up, uploaded as a 3-part multipart
+/// object, and read back (whole and ranged) from the storage stream.
+#[tokio::test]
+async fn large_files_stream_through_webdav_in_parts() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/big.pdf";
+    let data = pattern(2 * PART + 3 * 1024 * 1024);
+
+    let (status, _) = send(
+        &ctx.app,
+        streamed("PUT", uri, &basic(&arch), &data, 64 * 1024),
+    )
+    .await;
+    assert!(status.is_success(), "PUT, got {status}");
+    assert!(
+        lied::storage::peak_upload_buffer() <= PART,
+        "an upload held {} bytes, more than one part ({PART})",
+        lied::storage::peak_upload_buffer()
+    );
+    let key = domain::file::derived_key("acme", "bolero", Some("flute-1"), "big", "pdf");
+    let head = ctx
+        .s3
+        .head_object()
+        .bucket(BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .expect("the object exists");
+    assert!(
+        head.e_tag().unwrap_or_default().ends_with("-3\""),
+        "uploaded as three parts: {:?}",
+        head.e_tag()
+    );
+
+    let (status, body) = send(&ctx.app, request("GET", uri, &basic(&arch), vec![])).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(body == data, "the whole file reads back byte for byte");
+
+    // A ranged read seeks: the stream is re-requested from the offset.
+    let (from, to) = (PART + 5, PART + 104);
+    let range = format!("bytes={from}-{to}");
+    let (status, body) = send(
+        &ctx.app,
+        request_with("GET", uri, &basic(&arch), vec![], &[("Range", &range)]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, &data[from..=to]);
+    let (status, body) = send(
+        &ctx.app,
+        request_with("GET", uri, &basic(&arch), vec![], &[("Range", "bytes=-10")]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, &data[data.len() - 10..]);
+}
+
+/// Past `LIED_MAX_UPLOAD_BYTES` while streaming: 413, and nothing left
+/// behind — no row, no object, no open multipart upload.
+#[tokio::test]
+async fn a_too_large_put_is_refused_and_leaves_nothing() {
+    let ctx = Ctx::with_limits(50, (PART + 1024 * 1024) as u64).await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/huge.pdf";
+
+    let (status, _) = send(
+        &ctx.app,
+        streamed("PUT", uri, &basic(&arch), &pattern(2 * PART), 64 * 1024),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(file_rows_named(&ctx.pool, "huge").await, 0, "no row");
+    let key = domain::file::derived_key("acme", "bolero", Some("flute-1"), "huge", "pdf");
+    assert!(
+        ctx.s3
+            .head_object()
+            .bucket(BUCKET)
+            .key(&key)
+            .send()
+            .await
+            .is_err(),
+        "no object"
+    );
+    assert_eq!(
+        open_multipart_uploads(&ctx).await,
+        0,
+        "the multipart upload was aborted"
+    );
+}
+
+/// #109: when the bytes never reach storage, the row write is taken back the
+/// way the `/v1` path takes it back. A new file leaves no row at all (before,
+/// a soft-deleted one stayed, restorable into a file with no content); a
+/// replace leaves the old file live.
+#[tokio::test]
+async fn a_failed_store_leaves_no_row_and_a_failed_replace_keeps_the_old_file() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let dir = "/orgs/acme/arrangements/bolero/voices/flute-1";
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/a.pdf"),
+            &basic(&arch),
+            b"%PDF a".to_vec(),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let old = domain::file::find_by_location(&ctx.pool, arr, Some(voice), "a", "pdf")
+        .await
+        .unwrap()
+        .expect("a.pdf");
+
+    // Storage goes away: empty the bucket and remove it.
+    let key = domain::file::derived_key("acme", "bolero", Some("flute-1"), "a", "pdf");
+    ctx.s3
+        .delete_object()
+        .bucket(BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    ctx.s3.delete_bucket().bucket(BUCKET).send().await.unwrap();
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/b.pdf"),
+            &basic(&arch),
+            b"%PDF b".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        file_rows_named(&ctx.pool, "b").await,
+        0,
+        "no row for b.pdf, neither live nor soft-deleted"
+    );
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/a.pdf"),
+            &basic(&arch),
+            b"%PDF a2".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let live = domain::file::find_by_location(&ctx.pool, arr, Some(voice), "a", "pdf")
+        .await
+        .unwrap()
+        .expect("a.pdf is still live");
+    assert_eq!(live.id, old.id, "the old file is the live one again");
+    assert_eq!(
+        file_rows_named(&ctx.pool, "a").await,
+        1,
+        "the new row is gone"
+    );
+}
+
+/// #45 over WebDAV, early: a new file in a full voice is refused when the PUT
+/// opens, before the client's body is read, so no bytes travel and no
+/// multipart upload starts.
+#[tokio::test]
+async fn a_put_into_a_full_voice_is_refused_before_its_body() {
+    let ctx = Ctx::with_max_files(1).await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let dir = "/orgs/acme/arrangements/bolero/voices/flute-1";
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/a.pdf"),
+            &basic(&arch),
+            b"%PDF a".to_vec(),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = polled.clone();
+    let body = futures_util::stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(bytes::Bytes::from(pattern(2 * PART)))
+    });
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(format!("{dir}/b.pdf"))
+        .header(axum::http::header::AUTHORIZATION, basic(&arch))
+        .body(axum::body::Body::from_stream(body))
+        .unwrap();
+    let (status, _) = send(&ctx.app, req).await;
+    assert_eq!(status, axum::http::StatusCode::INSUFFICIENT_STORAGE);
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "the body was never read"
+    );
+    assert_eq!(open_multipart_uploads(&ctx).await, 0);
+}
+
+/// The private library is plain storage: files and directories move, files
+/// copy, and an empty directory can be removed. A non-empty one survives a
+/// `Depth: 0` DELETE; the default DELETE removes it with its contents.
+#[tokio::test]
+async fn library_files_and_directories_move_copy_and_are_removed() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let alice = seed_user(&ctx.pool, org, "alice", Some("musician")).await;
+    let auth = basic(&alice);
+    let lib = "/users/alice/library";
+    let pdf = b"%PDF etude".to_vec();
+
+    let (status, _) = send(
+        &ctx.app,
+        request("MKCOL", &format!("{lib}/set"), &auth, vec![]),
+    )
+    .await;
+    assert!(status.is_success(), "MKCOL {status}");
+    let (status, _) = send(
+        &ctx.app,
+        request("PUT", &format!("{lib}/set/a.pdf"), &auth, pdf.clone()),
+    )
+    .await;
+    assert!(status.is_success(), "PUT {status}");
+
+    // MOVE a file (rename).
+    let dest = format!("{lib}/set/b.pdf");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            &format!("{lib}/set/a.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &dest)],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let (status, _) = send(
+        &ctx.app,
+        request("GET", &format!("{lib}/set/a.pdf"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    let (_, body) = send(&ctx.app, request("GET", &dest, &auth, vec![])).await;
+    assert_eq!(body, pdf);
+
+    // MOVE a directory.
+    let dest = format!("{lib}/set2");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            &format!("{lib}/set"),
+            &auth,
+            vec![],
+            &[("Destination", &dest)],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let (status, body) = send(
+        &ctx.app,
+        request("GET", &format!("{lib}/set2/b.pdf"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, pdf);
+    let (status, _) = send(
+        &ctx.app,
+        request("PROPFIND", &format!("{lib}/set"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    // COPY a file; Overwrite: F onto an existing one is refused.
+    let dest = format!("{lib}/set2/c.pdf");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "COPY",
+            &format!("{lib}/set2/b.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &dest)],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let (_, body) = send(&ctx.app, request("GET", &dest, &auth, vec![])).await;
+    assert_eq!(body, pdf);
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            &format!("{lib}/set2/b.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &dest), ("Overwrite", "F")],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::PRECONDITION_FAILED);
+
+    // A non-empty directory is not removed by itself...
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "DELETE",
+            &format!("{lib}/set2"),
+            &auth,
+            vec![],
+            &[("Depth", "0")],
+        ),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "Depth: 0 on a non-empty directory, got {status}"
+    );
+    let (status, _) = send(
+        &ctx.app,
+        request("GET", &format!("{lib}/set2/b.pdf"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "its contents are intact"
+    );
+
+    // ...but the default DELETE takes it with its contents,
+    let (status, _) = send(
+        &ctx.app,
+        request("DELETE", &format!("{lib}/set2"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &ctx.app,
+        request("PROPFIND", &format!("{lib}/set2"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    // and an empty directory goes too.
+    let (status, _) = send(
+        &ctx.app,
+        request("MKCOL", &format!("{lib}/empty"), &auth, vec![]),
+    )
+    .await;
+    assert!(status.is_success(), "MKCOL {status}");
+    let (status, _) = send(
+        &ctx.app,
+        request("DELETE", &format!("{lib}/empty"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &ctx.app,
+        request("PROPFIND", &format!("{lib}/empty"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+/// In the org tree a file is a `File` row and a directory an entity, so
+/// MOVE, COPY and directory DELETE are refused with 403 — before dav-server
+/// runs, because it would delete the destination (or the directory's files)
+/// first. A personal annotation may still be renamed within its directory.
+#[tokio::test]
+async fn org_tree_move_copy_and_directory_delete_are_refused() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let auth = basic(&arch);
+    let dir = "/orgs/acme/arrangements/bolero/voices/flute-1";
+    for name in ["a", "b"] {
+        let (status, _) = send(
+            &ctx.app,
+            request("PUT", &format!("{dir}/{name}.pdf"), &auth, b"%PDF".to_vec()),
+        )
+        .await;
+        assert!(status.is_success(), "{status}");
+    }
+    let live = |name: &'static str| {
+        let pool = ctx.pool.clone();
+        async move {
+            domain::file::find_by_location(&pool, arr, Some(voice), name, "pdf")
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+
+    // MOVE onto an existing file (Overwrite defaults to T).
+    let dest = format!("{dir}/b.pdf");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            &format!("{dir}/a.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &dest)],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    assert!(
+        live("a").await && live("b").await,
+        "both files are untouched"
+    );
+
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "COPY",
+            &format!("{dir}/a.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &format!("{dir}/c.pdf"))],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // From the library into the org tree is refused too.
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            "/users/arch/library/x.pdf",
+            &auth,
+            b"%PDF x".to_vec(),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            "/users/arch/library/x.pdf",
+            &auth,
+            vec![],
+            &[("Destination", &format!("{dir}/x.pdf"))],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+    // DELETE of a voice directory would delete its files first.
+    let (status, _) = send(&ctx.app, request("DELETE", dir, &auth, vec![])).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    assert!(
+        live("a").await && live("b").await,
+        "the voice's files survive"
+    );
+
+    // A personal annotation renames within its own directory, audited.
+    let notes = format!("{dir}/annotations/arch");
+    let (status, _) = send(
+        &ctx.app,
+        request("PUT", &format!("{notes}/n.pdf"), &auth, b"%PDF n".to_vec()),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let (status, _) = send(
+        &ctx.app,
+        request_with(
+            "MOVE",
+            &format!("{notes}/n.pdf"),
+            &auth,
+            vec![],
+            &[("Destination", &format!("{notes}/m.pdf"))],
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    let (status, body) = send(
+        &ctx.app,
+        request("GET", &format!("{notes}/m.pdf"), &auth, vec![]),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body, b"%PDF n");
+    let renamed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'personal_annotation.rename'",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(renamed, 1);
 }

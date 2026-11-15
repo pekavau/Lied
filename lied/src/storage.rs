@@ -2,13 +2,15 @@
 //!
 //! Both directions are bounded by a fixed buffer, never the file size
 //! (docs/design.md NFR: "Uploads stream end-to-end … server memory per upload is
-//! fixed at the chunk buffer size"):
-//!   - **Upload** accumulates incoming chunks into ~8 MiB parts and flushes
-//!     each via the S3 `UploadPart` API (`MULTIPART`), enforcing the byte
-//!     ceiling as it goes and aborting the multipart upload if exceeded.
+//! fixed at the chunk buffer size"), for `/v1`, the console and WebDAV alike:
+//!   - **Upload** goes through an [`ObjectWriter`]: incoming bytes fill one
+//!     ~8 MiB part at a time, each uploaded via `UploadPart` as it fills; the
+//!     byte ceiling is enforced as it goes and a started multipart upload is
+//!     aborted on any error. A file below one part is one `PutObject`.
 //!   - **Download** returns the `GetObject` `ByteStream` piped straight into
 //!     the response body, honoring HTTP `Range` for tablet seeking.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -77,10 +79,10 @@ pub trait ChunkSource {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>, StorageError>;
 }
 
-/// Stream `source` to `bucket/key` via S3 multipart upload, enforcing
-/// `max_bytes`. Returns the total number of bytes written. On any error
-/// (including exceeding `max_bytes`) the multipart upload is aborted so no
-/// partial object is left behind.
+/// Stream `source` to `bucket/key`, enforcing `max_bytes`, through an
+/// [`ObjectWriter`]. Returns the total number of bytes written. On any error
+/// (including exceeding `max_bytes`) a started multipart upload is aborted so
+/// no partial object is left behind.
 pub async fn upload_streaming<S: ChunkSource>(
     s3: &S3Client,
     bucket: &str,
@@ -89,86 +91,241 @@ pub async fn upload_streaming<S: ChunkSource>(
     max_bytes: u64,
     mut source: S,
 ) -> Result<u64, StorageError> {
-    let create = s3
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .content_type(content_type)
-        .send()
-        .await
-        .map_err(|e| StorageError::S3(format!("create_multipart_upload: {e}")))?;
+    let mut writer = ObjectWriter::new(s3, bucket, key, content_type, max_bytes);
+    loop {
+        match source.next_chunk().await {
+            Ok(Some(chunk)) => writer.write(chunk).await?,
+            Ok(None) => break,
+            Err(e) => {
+                writer.abort().await;
+                return Err(e);
+            }
+        }
+    }
+    writer.finish().await
+}
 
-    let upload_id = create
-        .upload_id()
-        .ok_or_else(|| StorageError::S3("missing upload_id".into()))?
-        .to_string();
+/// The largest part buffer any [`ObjectWriter`] in this process has held, in
+/// bytes: a high-water mark, so a test can check that uploads stay bounded by
+/// [`PART_SIZE`] whatever the file size (issue #26).
+pub fn peak_upload_buffer() -> usize {
+    PEAK_BUFFERED.load(Ordering::Relaxed)
+}
 
-    // Run the part loop; on any error, abort and propagate.
-    match upload_parts(s3, bucket, key, &upload_id, max_bytes, &mut source).await {
-        Ok(total) => Ok(total),
-        Err(e) => {
-            let _ = s3
-                .abort_multipart_upload()
-                .bucket(bucket)
-                .key(key)
-                .upload_id(&upload_id)
+static PEAK_BUFFERED: AtomicUsize = AtomicUsize::new(0);
+
+/// The size of one multipart part, and so the most an upload holds in memory.
+pub const UPLOAD_PART_SIZE: usize = PART_SIZE;
+
+/// An object being written in pieces, holding at most one part
+/// ([`PART_SIZE`]) in memory (docs/design.md NFR; issue #26).
+///
+/// - [`write`](Self::write) appends bytes and uploads every part as it fills.
+///   The S3 multipart upload starts with the first full part, so a file
+///   smaller than one part never starts one.
+/// - [`finish`](Self::finish) makes the object visible: a single `PutObject`
+///   for a small file, otherwise the last part plus `CompleteMultipartUpload`.
+///   Until then nothing is readable at `key`, which is what lets a caller
+///   write its database row first and roll it back if `finish` fails.
+/// - `max_bytes` is enforced while writing (→ [`StorageError::TooLarge`]).
+/// - Any error aborts a started multipart upload, and so does
+///   [`abort`](Self::abort). A writer dropped without either (a client that
+///   disconnects mid-body) aborts it in the background.
+pub struct ObjectWriter {
+    s3: S3Client,
+    bucket: String,
+    key: String,
+    content_type: String,
+    max_bytes: u64,
+    buf: BytesMut,
+    total: u64,
+    /// The started multipart upload: its id and the parts uploaded so far.
+    multipart: Option<(String, Vec<CompletedPart>)>,
+}
+
+impl std::fmt::Debug for ObjectWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectWriter")
+            .field("key", &self.key)
+            .field("total", &self.total)
+            .field("buffered", &self.buf.len())
+            .field("multipart", &self.multipart.is_some())
+            .finish()
+    }
+}
+
+impl ObjectWriter {
+    pub fn new(s3: &S3Client, bucket: &str, key: &str, content_type: &str, max_bytes: u64) -> Self {
+        ObjectWriter {
+            s3: s3.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_type: content_type.to_string(),
+            max_bytes,
+            buf: BytesMut::new(),
+            total: 0,
+            multipart: None,
+        }
+    }
+
+    /// Bytes written so far.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// The object key being written.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Append `data`, uploading each part as it fills. The buffer never
+    /// grows past one part: `data` is copied in at most the room left.
+    pub async fn write(&mut self, mut data: Bytes) -> Result<(), StorageError> {
+        self.total += data.len() as u64;
+        if self.total > self.max_bytes {
+            let limit = self.max_bytes;
+            self.abort_started().await;
+            return Err(StorageError::TooLarge { limit });
+        }
+        while !data.is_empty() {
+            let room = PART_SIZE - self.buf.len();
+            let take = room.min(data.len());
+            self.buf.extend_from_slice(&data.split_to(take));
+            PEAK_BUFFERED.fetch_max(self.buf.len(), Ordering::Relaxed);
+            if self.buf.len() == PART_SIZE {
+                let part = std::mem::replace(&mut self.buf, BytesMut::new()).freeze();
+                if let Err(e) = self.upload_part(part).await {
+                    self.abort_started().await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Make the object visible at its key. Returns the bytes written.
+    pub async fn finish(mut self) -> Result<u64, StorageError> {
+        let last = std::mem::take(&mut self.buf).freeze();
+        if self.multipart.is_none() {
+            self.s3
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .content_type(&self.content_type)
+                .body(ByteStream::from(last))
                 .send()
-                .await;
-            Err(e)
+                .await
+                .map_err(|e| StorageError::S3(format!("put_object: {e}")))?;
+            return Ok(self.total);
+        }
+        // A multipart upload's last part may be empty only if it is the only
+        // one; ours has at least one full part already, so skip an empty tail.
+        if !last.is_empty() {
+            if let Err(e) = self.upload_part(last).await {
+                self.abort_started().await;
+                return Err(e);
+            }
+        }
+        let Some((upload_id, parts)) = self.multipart.take() else {
+            return Err(StorageError::S3("multipart upload vanished".into()));
+        };
+        let completed = self
+            .s3
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(parts))
+                    .build(),
+            )
+            .send()
+            .await;
+        if let Err(e) = completed {
+            abort_upload(&self.s3, &self.bucket, &self.key, &upload_id).await;
+            return Err(StorageError::S3(format!("complete_multipart_upload: {e}")));
+        }
+        Ok(self.total)
+    }
+
+    /// Give up: abort a started multipart upload. Nothing becomes visible.
+    pub async fn abort(mut self) {
+        self.abort_started().await;
+    }
+
+    async fn upload_part(&mut self, body: Bytes) -> Result<(), StorageError> {
+        if self.multipart.is_none() {
+            let created = self
+                .s3
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .content_type(&self.content_type)
+                .send()
+                .await
+                .map_err(|e| StorageError::S3(format!("create_multipart_upload: {e}")))?;
+            let upload_id = created
+                .upload_id()
+                .ok_or_else(|| StorageError::S3("missing upload_id".into()))?
+                .to_string();
+            self.multipart = Some((upload_id, Vec::new()));
+        }
+        let Some((upload_id, parts)) = self.multipart.as_mut() else {
+            return Err(StorageError::S3("multipart upload vanished".into()));
+        };
+        let part_number = i32::try_from(parts.len() + 1).unwrap_or(i32::MAX);
+        let completed = put_part(
+            &self.s3,
+            &self.bucket,
+            &self.key,
+            upload_id,
+            part_number,
+            body,
+        )
+        .await?;
+        parts.push(completed);
+        Ok(())
+    }
+
+    async fn abort_started(&mut self) {
+        self.buf = BytesMut::new();
+        if let Some((upload_id, _)) = self.multipart.take() {
+            abort_upload(&self.s3, &self.bucket, &self.key, &upload_id).await;
         }
     }
 }
 
-async fn upload_parts<S: ChunkSource>(
-    s3: &S3Client,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    max_bytes: u64,
-    source: &mut S,
-) -> Result<u64, StorageError> {
-    let mut buf = BytesMut::with_capacity(PART_SIZE);
-    let mut parts: Vec<CompletedPart> = Vec::new();
-    let mut part_number: i32 = 1;
-    let mut total: u64 = 0;
-
-    while let Some(chunk) = source.next_chunk().await? {
-        total += chunk.len() as u64;
-        if total > max_bytes {
-            return Err(StorageError::TooLarge { limit: max_bytes });
-        }
-        buf.extend_from_slice(&chunk);
-        while buf.len() >= PART_SIZE {
-            let part = buf.split_to(PART_SIZE).freeze();
-            let completed = put_part(s3, bucket, key, upload_id, part_number, part).await?;
-            parts.push(completed);
-            part_number += 1;
+impl Drop for ObjectWriter {
+    /// A writer dropped mid-upload (the client went away before the body
+    /// ended) must not leave a multipart upload behind: abort it on the
+    /// runtime, since `Drop` cannot await.
+    fn drop(&mut self) {
+        if let Some((upload_id, _)) = self.multipart.take() {
+            let (s3, bucket, key) = (self.s3.clone(), self.bucket.clone(), self.key.clone());
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { abort_upload(&s3, &bucket, &key, &upload_id).await });
+            } else {
+                tracing::warn!(key = %key, "multipart upload left open: no runtime to abort it");
+            }
         }
     }
+}
 
-    // Flush the trailing remainder as the final part. S3 forbids a
-    // multipart upload with zero parts, so a totally empty body still needs
-    // one (possibly empty) part.
-    if !buf.is_empty() || parts.is_empty() {
-        let part = buf.freeze();
-        let completed = put_part(s3, bucket, key, upload_id, part_number, part).await?;
-        parts.push(completed);
-    }
-
-    s3.complete_multipart_upload()
+/// Abort a multipart upload, logging (not returning) a failure: the caller is
+/// already on an error path, and an unaborted upload only costs storage until
+/// the bucket's lifecycle rule (or an operator) clears it.
+async fn abort_upload(s3: &S3Client, bucket: &str, key: &str, upload_id: &str) {
+    if let Err(error) = s3
+        .abort_multipart_upload()
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .set_parts(Some(parts))
-                .build(),
-        )
         .send()
         .await
-        .map_err(|e| StorageError::S3(format!("complete_multipart_upload: {e}")))?;
-
-    Ok(total)
+    {
+        tracing::warn!(%error, key = %key, "failed to abort a multipart upload");
+    }
 }
 
 async fn put_part(
@@ -396,4 +553,92 @@ pub async fn delete_object(s3: &S3Client, bucket: &str, key: &str) -> Result<(),
         .await
         .map_err(|e| StorageError::S3(format!("delete_object: {e}")))?;
     Ok(())
+}
+
+/// Copy `from` to `to` inside `bucket` (server side; no bytes pass through
+/// Lied). Used by WebDAV MOVE and COPY in the private library (#26).
+pub async fn copy_object(
+    s3: &S3Client,
+    bucket: &str,
+    from: &str,
+    to: &str,
+) -> Result<(), StorageError> {
+    s3.copy_object()
+        .bucket(bucket)
+        .copy_source(format!("{bucket}/{}", encode_key(from)))
+        .key(to)
+        .send()
+        .await
+        .map_err(|e| {
+            let svc = e.into_service_error();
+            StorageError::S3(format!("copy_object: {svc}"))
+        })?;
+    Ok(())
+}
+
+/// Every object key under `prefix`, recursively (no delimiter), including a
+/// directory marker equal to `prefix` itself.
+pub async fn list_keys_recursive(
+    s3: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<String>, StorageError> {
+    let mut keys = Vec::new();
+    let mut continuation: Option<String> = None;
+    loop {
+        let mut req = s3.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = &continuation {
+            req = req.continuation_token(token);
+        }
+        let out = req
+            .send()
+            .await
+            .map_err(|e| StorageError::S3(format!("list_objects_v2: {e}")))?;
+        keys.extend(
+            out.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
+        continuation = out
+            .is_truncated()
+            .unwrap_or(false)
+            .then(|| out.next_continuation_token().map(str::to_string))
+            .flatten();
+        if continuation.is_none() {
+            break;
+        }
+    }
+    Ok(keys)
+}
+
+/// Percent-encode an object key for `x-amz-copy-source`, keeping `/`.
+fn encode_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for b in key.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_key;
+
+    #[test]
+    fn copy_source_keys_are_percent_encoded_except_slashes() {
+        assert_eq!(
+            encode_key("users/anna/library/a b.pdf"),
+            "users/anna/library/a%20b.pdf"
+        );
+        assert_eq!(
+            encode_key("users/anna/library/Märsche/1.pdf"),
+            "users/anna/library/M%C3%A4rsche/1.pdf"
+        );
+        assert_eq!(encode_key("a+b&c"), "a%2Bb%26c");
+    }
 }
