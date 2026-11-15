@@ -172,13 +172,16 @@ fn principal_ids_are_subset(instrument_ids: &[Uuid], principal_instrument_ids: &
 /// (docs/design.md: "validated against the live Instrument set in the service
 /// layer on write" — Postgres can't enforce an element-level FK on a `uuid[]`
 /// column). Empty input is trivially valid (no query needed).
-async fn validate_instrument_ids(pool: &PgPool, ids: &[Uuid]) -> Result<bool, sqlx::Error> {
+async fn validate_instrument_ids(
+    db: impl sqlx::PgExecutor<'_>,
+    ids: &[Uuid],
+) -> Result<bool, sqlx::Error> {
     if ids.is_empty() {
         return Ok(true);
     }
     let count: i64 =
         sqlx::query_scalar!(r#"SELECT count(*) FROM instrument WHERE id = ANY($1)"#, ids)
-            .fetch_one(pool)
+            .fetch_one(db)
             .await?
             .unwrap_or(0);
 
@@ -206,13 +209,13 @@ pub struct MembershipFields<'a> {
 /// Does NOT check the last-owner invariant — that requires knowing the
 /// *previous* role for updates, handled separately by callers that have it.
 async fn validate_fields(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     fields: &MembershipFields<'_>,
 ) -> Result<(), MembershipError> {
     if !principal_ids_are_subset(fields.instrument_ids, fields.principal_instrument_ids) {
         return Err(MembershipError::PrincipalNotSubset);
     }
-    if !validate_instrument_ids(pool, fields.instrument_ids).await? {
+    if !validate_instrument_ids(db, fields.instrument_ids).await? {
         return Err(MembershipError::UnknownInstrument);
     }
     Ok(())
@@ -260,7 +263,10 @@ pub async fn create(
 }
 
 /// Look up a membership by id.
-pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Membership>, sqlx::Error> {
+pub async fn find_by_id(
+    db: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<Option<Membership>, sqlx::Error> {
     let row = sqlx::query_as!(
         Row,
         r#"
@@ -274,7 +280,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Membership>, s
         "#,
         id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await?;
 
     Ok(row.map(Row::into_membership))
@@ -309,8 +315,9 @@ pub async fn find_by_user_and_org(
 
 /// Count how many *other* owners an org has, excluding `exclude_membership_id`
 /// (the membership being updated/deleted) — used by the last-owner check.
+/// Only meaningful under [`lock_for_role_change`]'s lock.
 async fn other_owner_count(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     organization_id: Uuid,
     exclude_membership_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
@@ -322,7 +329,7 @@ async fn other_owner_count(
         organization_id,
         exclude_membership_id,
     )
-    .fetch_one(pool)
+    .fetch_one(db)
     .await?
     .unwrap_or(0))
 }
@@ -428,6 +435,45 @@ fn is_stale(expected_version: Option<i64>, current: &Membership) -> bool {
     expected_version.is_some_and(|v| v != current.updated_at.timestamp_millis())
 }
 
+/// Begin the transaction a membership update or delete runs in, and read
+/// the membership under a per-organization lock.
+///
+/// The last-owner check counts the *other* owners and then writes; two
+/// owners demoting or removing each other touch different rows, so without
+/// a shared lock both counts see the other owner and both writes land,
+/// leaving the org ownerless (#67). Locking the organization row makes the
+/// count and the write one serialized step per org. The lock is taken
+/// before any membership row, the same order as
+/// [`organization::delete`](crate::domain::organization::delete), so the two
+/// cannot deadlock; `FOR NO KEY UPDATE` still lets other rows insert
+/// references to the org meanwhile.
+///
+/// Returns the open transaction and the membership as it is under the
+/// lock, or `None` if it does not exist.
+async fn lock_for_role_change(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<(sqlx::Transaction<'static, sqlx::Postgres>, Membership)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let locked = sqlx::query_scalar!(
+        r#"
+        SELECT o.id FROM organization o
+        JOIN membership m ON m.organization_id = o.id
+        WHERE m.id = $1
+        FOR NO KEY UPDATE OF o
+        "#,
+        id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if locked.is_none() {
+        return Ok(None);
+    }
+    // Re-read under the lock: a concurrent writer may have changed the
+    // role, or removed the row, while this one waited.
+    Ok(find_by_id(&mut *tx, id).await?.map(|current| (tx, current)))
+}
+
 /// Update an existing membership's mutable fields. Enforces the last-owner
 /// invariant: if the membership currently holds `role = owner` and the new
 /// `fields.role` is something else, the update is rejected unless at least
@@ -442,7 +488,7 @@ pub async fn update(
     expected_version: Option<i64>,
     fields: MembershipFields<'_>,
 ) -> Result<Option<Membership>, MembershipError> {
-    let Some(current) = find_by_id(pool, id).await? else {
+    let Some((mut tx, current)) = lock_for_role_change(pool, id).await? else {
         return Ok(None);
     };
     // A stale caller learns that first (412), not about rules evaluated
@@ -451,10 +497,10 @@ pub async fn update(
         return Ok(None);
     }
 
-    validate_fields(pool, &fields).await?;
+    validate_fields(&mut *tx, &fields).await?;
 
     if current.role == Role::Owner && fields.role != Role::Owner {
-        let remaining = other_owner_count(pool, current.organization_id, id).await?;
+        let remaining = other_owner_count(&mut *tx, current.organization_id, id).await?;
         if remaining == 0 {
             return Err(MembershipError::LastOwner);
         }
@@ -479,8 +525,9 @@ pub async fn update(
         fields.principal_instrument_ids,
         expected_version,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(row.map(Row::into_membership))
 }
@@ -512,7 +559,7 @@ pub async fn delete(
     id: Uuid,
     expected_version: Option<i64>,
 ) -> Result<bool, MembershipError> {
-    let Some(current) = find_by_id(pool, id).await? else {
+    let Some((mut tx, current)) = lock_for_role_change(pool, id).await? else {
         return Ok(false);
     };
     if is_stale(expected_version, &current) {
@@ -520,7 +567,7 @@ pub async fn delete(
     }
 
     if current.role == Role::Owner {
-        let remaining = other_owner_count(pool, current.organization_id, id).await?;
+        let remaining = other_owner_count(&mut *tx, current.organization_id, id).await?;
         if remaining == 0 {
             return Err(MembershipError::LastOwner);
         }
@@ -531,8 +578,9 @@ pub async fn delete(
         id,
         expected_version,
     )
-        .execute(pool)
-        .await?;
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
 
     Ok(result.rows_affected() > 0)
 }
