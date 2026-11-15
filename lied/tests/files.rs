@@ -768,3 +768,320 @@ async fn concurrent_creates_stop_at_the_ceiling() {
         Ok(_) | Err(lied::domain::file::FileError::TooManyFiles { limit: 2 })
     )));
 }
+
+// --- #99: guests read their assigned parts through /v1 ---
+
+/// A user with no membership anywhere, and a bearer token for them.
+async fn seed_guest(state: &AppState, username: &str) -> (Uuid, String) {
+    let uid = Uuid::now_v7();
+    user::create(
+        &state.db,
+        uid,
+        &user::slugify(username),
+        username,
+        None,
+        None,
+        username,
+        false,
+        None,
+    )
+    .await
+    .expect("guest user");
+    let (token, _) = state.jwt_keyring.mint(uid, None).expect("token");
+    (uid, token)
+}
+
+/// A program collection holding `arr_id` as its only piece: (collection, item).
+async fn seed_program_item(state: &AppState, org_id: Uuid, arr_id: Uuid) -> (Uuid, Uuid) {
+    let collection_id = Uuid::now_v7();
+    lied::domain::collection::create(
+        &state.db,
+        collection_id,
+        org_id,
+        "Spring concert",
+        &format!("spring-{collection_id}"),
+        "program",
+        3,
+        None,
+    )
+    .await
+    .expect("collection");
+    let item = lied::domain::collection_item::create(
+        &state.db,
+        Uuid::now_v7(),
+        collection_id,
+        arr_id,
+        lied::domain::collection_item::Placement {
+            position: None,
+            label: None,
+        },
+        None,
+    )
+    .await
+    .expect("item");
+    (collection_id, item.id)
+}
+
+async fn assign(state: &AppState, item_id: Uuid, voice_id: Uuid, user_id: Uuid) -> Uuid {
+    lied::domain::part_assignment::assign(
+        &state.db,
+        Uuid::now_v7(),
+        item_id,
+        voice_id,
+        user_id,
+        None,
+    )
+    .await
+    .expect("assignment")
+    .id
+}
+
+/// Upload a PDF as `token` to `uri` (a `…/files` collection) and return its id.
+async fn upload_pdf(ctx: &Ctx, token: &str, uri: &str, bytes: &[u8]) -> Uuid {
+    let up = ctx
+        .app
+        .clone()
+        .oneshot(multipart_upload(
+            uri,
+            token,
+            "part.pdf",
+            "application/pdf",
+            bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(up.status(), axum::http::StatusCode::CREATED, "{uri}");
+    Uuid::parse_str(body_json(up).await["id"].as_str().unwrap()).unwrap()
+}
+
+async fn status_of(ctx: &Ctx, request: axum::http::Request<axum::body::Body>) -> u16 {
+    ctx.app
+        .clone()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+fn json_request(
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::IF_MATCH, "\"0\"")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The guest's statuses for the arrangement, the voice and the file.
+async fn guest_reads(ctx: &Ctx, token: &str, uris: &[&str]) -> Vec<u16> {
+    let mut statuses = Vec::new();
+    for uri in uris {
+        statuses.push(status_of(ctx, get_request(uri, token)).await);
+    }
+    statuses
+}
+
+/// A guest (a part assignment, no membership) reads exactly what the
+/// assignment grants over `/v1`: the arrangement's summary, the assigned
+/// voice, its files (with `Range`). Everything else is 403, existing or not,
+/// so the org's other repertoire stays hidden; nothing can be written.
+#[tokio::test]
+async fn a_guest_reads_only_the_assigned_part_through_v1() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let arr_id = seed_arrangement(&ctx.state, org_id, "Radetzky March").await;
+    sqlx::query(
+        "UPDATE arrangement SET publisher = 'Edition X', license_notes = 'two copies',
+         arranger = 'A. Arranger' WHERE id = $1",
+    )
+    .bind(arr_id)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    let flute = seed_voice(&ctx.state, arr_id, "Flute 1").await;
+    let oboe = seed_voice(&ctx.state, arr_id, "Oboe 1").await;
+    let other_arr = seed_arrangement(&ctx.state, org_id, "Florentiner").await;
+    let base = format!("/v1/orgs/{org_id}/arrangements/{arr_id}");
+    let score_file = upload_pdf(&ctx, &arch, &format!("{base}/files"), PDF).await;
+    let flute_file = upload_pdf(&ctx, &arch, &format!("{base}/voices/{flute}/files"), PDF).await;
+    let oboe_file = upload_pdf(&ctx, &arch, &format!("{base}/voices/{oboe}/files"), PDF).await;
+
+    let (_collection, item) = seed_program_item(&ctx.state, org_id, arr_id).await;
+    let (guest_id, guest) = seed_guest(&ctx.state, "anna").await;
+    assign(&ctx.state, item, flute, guest_id).await;
+
+    // The arrangement's summary: musical fields as stored, licensing nulled.
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(get_request(&base, &guest))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(response.headers().get(axum::http::header::ETAG).is_some());
+    let summary = body_json(response).await;
+    assert_eq!(summary["title"], "Radetzky March");
+    assert_eq!(summary["arranger"], "A. Arranger");
+    assert!(summary["publisher"].is_null(), "{summary}");
+    assert!(summary["licenseNotes"].is_null(), "{summary}");
+    // A member still sees everything.
+    let full = body_json(
+        ctx.app
+            .clone()
+            .oneshot(get_request(&base, &arch))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(full["publisher"], "Edition X");
+
+    // The assigned voice and its files, Range included.
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{base}/voices/{flute}"), &guest)).await,
+        200
+    );
+    let list = body_json(
+        ctx.app
+            .clone()
+            .oneshot(get_request(&format!("{base}/voices/{flute}/files"), &guest))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list["total"], 1, "{list}");
+    let file_uri = format!("{base}/voices/{flute}/files/{flute_file}");
+    let whole = ctx
+        .app
+        .clone()
+        .oneshot(get_request(&file_uri, &guest))
+        .await
+        .unwrap();
+    assert_eq!(whole.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_bytes(whole).await, PDF);
+    let mut ranged = get_request(&file_uri, &guest);
+    ranged.headers_mut().insert(
+        axum::http::header::RANGE,
+        axum::http::HeaderValue::from_static("bytes=0-3"),
+    );
+    let partial = ctx.app.clone().oneshot(ranged).await.unwrap();
+    assert_eq!(partial.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(partial).await, b"%PDF");
+
+    // Nothing else: other voice, the score, lists, other pieces, made-up ids.
+    let unknown = Uuid::now_v7();
+    for uri in [
+        format!("{base}/voices/{oboe}"),
+        format!("{base}/voices/{oboe}/files"),
+        format!("{base}/voices/{oboe}/files/{oboe_file}"),
+        format!("{base}/files"),
+        format!("{base}/files/{score_file}"),
+        format!("{base}/voices"),
+        format!("/v1/orgs/{org_id}/arrangements"),
+        format!("/v1/orgs/{org_id}/arrangements/{other_arr}"),
+        format!("/v1/orgs/{org_id}/arrangements/{unknown}"),
+        format!("{base}/voices/{unknown}"),
+        format!("/v1/orgs/{org_id}/arrangements/{other_arr}/voices/{flute}"),
+        format!("/v1/orgs/{org_id}/members"),
+        format!("/v1/orgs/{org_id}/collections"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &guest)).await,
+            403,
+            "{uri}"
+        );
+    }
+
+    // And no writes.
+    assert_eq!(
+        status_of(
+            &ctx,
+            json_request("PATCH", &base, &guest, serde_json::json!({ "title": "x" }))
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        status_of(
+            &ctx,
+            json_request(
+                "PATCH",
+                &format!("{base}/voices/{flute}"),
+                &guest,
+                serde_json::json!({ "name": "x" })
+            )
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        status_of(
+            &ctx,
+            multipart_upload(
+                &format!("{base}/voices/{flute}/files"),
+                &guest,
+                "mine.pdf",
+                "application/pdf",
+                PDF
+            )
+        )
+        .await,
+        403
+    );
+}
+
+/// The access lasts exactly as long as a live assignment: deleting the
+/// assignment, removing the piece from the collection, or deleting the
+/// collection ends it.
+#[tokio::test]
+async fn a_guests_access_ends_with_the_assignment_or_its_collection() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let arr_id = seed_arrangement(&ctx.state, org_id, "Radetzky March").await;
+    let flute = seed_voice(&ctx.state, arr_id, "Flute 1").await;
+    let base = format!("/v1/orgs/{org_id}/arrangements/{arr_id}");
+    let file = upload_pdf(&ctx, &arch, &format!("{base}/voices/{flute}/files"), PDF).await;
+    let (guest_id, guest) = seed_guest(&ctx.state, "anna").await;
+    let voice_uri = format!("{base}/voices/{flute}");
+    let file_uri = format!("{voice_uri}/files/{file}");
+    let uris = [base.as_str(), voice_uri.as_str(), file_uri.as_str()];
+
+    // 1. Deleting the assignment.
+    let (collection, item) = seed_program_item(&ctx.state, org_id, arr_id).await;
+    let assignment = assign(&ctx.state, item, flute, guest_id).await;
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [200, 200, 200]);
+    assert!(
+        lied::domain::part_assignment::delete(&ctx.state.db, assignment, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [403, 403, 403]);
+
+    // 2. Removing the piece from the collection.
+    assign(&ctx.state, item, flute, guest_id).await;
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [200, 200, 200]);
+    assert!(
+        lied::domain::collection_item::remove(&ctx.state.db, collection, item, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [403, 403, 403]);
+
+    // 3. Deleting the collection.
+    let (collection, item) = seed_program_item(&ctx.state, org_id, arr_id).await;
+    assign(&ctx.state, item, flute, guest_id).await;
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [200, 200, 200]);
+    assert!(
+        lied::domain::collection::soft_delete(&ctx.state.db, collection, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(guest_reads(&ctx, &guest, &uris).await, [403, 403, 403]);
+}

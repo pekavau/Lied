@@ -7,7 +7,8 @@
 //!   - voice files:      `/v1/orgs/{org}/arrangements/{arr}/voices/{voice}/files[/{file}]`
 //!
 //! Both POST (create) and PUT (replace) are `owner`/`archivist`-gated and
-//! audited; GET (download/list) requires at least `musician`. The upload
+//! audited; GET (download/list) requires at least `musician`, or, for a
+//! voice's files only, a guest's part assignment on that voice (#99). The upload
 //! routes disable axum's default body limit and instead enforce
 //! `LIED_MAX_UPLOAD_BYTES` while streaming (→ 413).
 
@@ -21,7 +22,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::require_org_role_v1;
+use crate::auth::authz::{require_org_role_v1, require_voice_reader_v1};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
@@ -364,6 +365,27 @@ async fn upload_voice_file(
 // Download (GET one) — streamed, Range-aware.
 // ---------------------------------------------------------------------------
 
+/// Read access to a voice's files (`voice_id`) or the arrangement's full
+/// score (`None`). A voice's files are open to a guest with a live part
+/// assignment on that voice (#99); the full score stays member-only, as over
+/// WebDAV.
+async fn require_file_reader(
+    state: &AppState,
+    auth: &BearerOrSession,
+    org_id: Uuid,
+    arr_id: Uuid,
+    voice_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    match voice_id {
+        Some(voice_id) => require_voice_reader_v1(state, auth, org_id, arr_id, voice_id)
+            .await
+            .map(|_| ()),
+        None => require_org_role_v1(state, auth, org_id, Role::Musician)
+            .await
+            .map(|_| ()),
+    }
+}
+
 async fn do_download(
     state: AppState,
     auth: BearerOrSession,
@@ -373,7 +395,7 @@ async fn do_download(
     file_id: Uuid,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_file_reader(&state, &auth, org_id, arr_id, voice_id).await?;
     scope_arrangement(&state, org_id, arr_id).await?;
 
     let f = file::find_by_id(&state.db, file_id)
@@ -471,7 +493,8 @@ async fn download_score_file(
     do_download(state, auth, org_id, arr_id, None, file_id, headers).await
 }
 
-/// Download a voice file (requires `musician` role). Supports HTTP `Range`.
+/// Download a voice file (requires `musician` role, or a guest's part
+/// assignment on this voice). Supports HTTP `Range`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
@@ -540,7 +563,7 @@ async fn do_list(
     voice_id: Option<Uuid>,
     q: ListQuery,
 ) -> Result<Json<Page<FileResponse>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_file_reader(&state, &auth, org_id, arr_id, voice_id).await?;
     scope_arrangement(&state, org_id, arr_id).await?;
     if let Some(vid) = voice_id {
         scope_voice(&state, arr_id, vid).await?;
@@ -600,7 +623,8 @@ async fn list_score_files(
     do_list(state, auth, org_id, arr_id, None, q).await
 }
 
-/// List voice files for a specific voice (requires `musician` role).
+/// List voice files for a specific voice (requires `musician` role, or a
+/// guest's part assignment on this voice).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",

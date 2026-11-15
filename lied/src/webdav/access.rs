@@ -129,55 +129,37 @@ pub async fn visible_arrangement_slugs(
     }
 }
 
-/// Whether a restricted user may see a specific arrangement — i.e. holds ≥1
-/// part assignment on one of its live voices. Staff always may; callers should
-/// short-circuit on [`Visibility::is_staff`] before calling this.
+/// Whether a restricted user may see a specific arrangement: holds a live
+/// part assignment on one of its voices. Staff always may; callers should
+/// short-circuit on [`Visibility::is_staff`] before calling this. The rule is
+/// [`crate::domain::access::assigned_arrangement`], shared with `/v1`.
 pub async fn has_assignment_on_arrangement(
     pool: &PgPool,
     arrangement_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-             SELECT 1 FROM part_assignment pa
-             JOIN voice v ON v.id = pa.voice_id
-             JOIN collection_item ci ON ci.id = pa.collection_item_id
-             JOIN collection c ON c.id = ci.collection_id
-             WHERE pa.user_id = $1
-               AND v.arrangement_id = $2
-               AND v.deleted_at IS NULL
-               AND ci.deleted_at IS NULL
-               AND c.deleted_at IS NULL
-           ) AS "exists!""#,
-        user_id,
-        arrangement_id,
+    Ok(
+        crate::domain::access::assigned_arrangement(pool, user_id, arrangement_id)
+            .await?
+            .is_some(),
     )
-    .fetch_one(pool)
-    .await
 }
 
-/// Whether a user holds a part assignment on a specific voice. Restricted
-/// users may only see voices (and their files) they are assigned to
-/// (docs/design.md: "musician sees only the files for voices where they have a
-/// PartAssignment").
+/// Whether a user holds a live part assignment on a specific voice.
+/// Restricted users may only see voices (and their files) they are assigned
+/// to (docs/design.md: "musician sees only the files for voices where they
+/// have a PartAssignment"). The rule is
+/// [`crate::domain::access::assigned_voice`], shared with `/v1`.
 pub async fn has_assignment_on_voice(
     pool: &PgPool,
     voice_id: Uuid,
     user_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-             SELECT 1 FROM part_assignment pa
-             JOIN collection_item ci ON ci.id = pa.collection_item_id
-             JOIN collection c ON c.id = ci.collection_id
-             WHERE pa.user_id = $1 AND pa.voice_id = $2
-               AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
-           ) AS "exists!""#,
-        user_id,
-        voice_id,
+    Ok(
+        crate::domain::access::assigned_voice(pool, user_id, voice_id)
+            .await?
+            .is_some(),
     )
-    .fetch_one(pool)
-    .await
 }
 
 // ── collections subtree (read-only computed view, issue #10) ───────────────

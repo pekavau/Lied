@@ -12,7 +12,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::require_org_role_v1;
+use crate::auth::authz::{
+    require_arrangement_reader_v1, require_org_role_v1, require_voice_reader_v1, Reader,
+};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
@@ -424,6 +426,10 @@ async fn delete_work(
 // Arrangement — org-scoped.
 // ---------------------------------------------------------------------------
 
+/// An arrangement. A guest (a part assignment without membership, #99) gets
+/// the same shape as a summary: the musical fields as stored, and the
+/// licensing and purchase fields (`publisher`, `purchaseDate`,
+/// `licenseNotes`, `copyCountAllowed`) always `null`.
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArrangementResponse {
@@ -434,9 +440,13 @@ pub(crate) struct ArrangementResponse {
     pub work_id: Option<Uuid>,
     pub instrumentation: Option<String>,
     pub arranger: Option<String>,
+    /// `null` for a guest.
     pub publisher: Option<String>,
+    /// `null` for a guest.
     pub purchase_date: Option<chrono::NaiveDate>,
+    /// `null` for a guest.
     pub license_notes: Option<String>,
+    /// `null` for a guest.
     pub copy_count_allowed: Option<i32>,
     pub status: String,
     pub duration_seconds: Option<i32>,
@@ -471,6 +481,20 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
             updated_at: a.updated_at,
             deleted_at: a.deleted_at,
         }
+    }
+}
+
+impl ArrangementResponse {
+    /// The summary a guest gets (#99): the licensing and purchase fields are
+    /// the archive's business, not the player's.
+    fn for_reader(mut self, reader: Reader) -> Self {
+        if reader == Reader::Guest {
+            self.publisher = None;
+            self.purchase_date = None;
+            self.license_notes = None;
+            self.copy_count_allowed = None;
+        }
+        self
     }
 }
 
@@ -819,7 +843,11 @@ async fn find_arrangement_scoped_including_deleted(
     Ok(found)
 }
 
-/// Fetch one arrangement by ID (requires `musician` role).
+/// Fetch one arrangement by ID (requires `musician` role, or a guest's part
+/// assignment on one of its voices).
+///
+/// A guest (a live part assignment, no membership) gets the summary: the
+/// licensing and purchase fields are `null`. Any other non-member gets `403`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}",
@@ -844,10 +872,13 @@ async fn get_arrangement(
     State(state): State<AppState>,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    let reader = require_arrangement_reader_v1(&state, &auth, org_id, id).await?;
     let found = find_arrangement_scoped(&state, org_id, id).await?;
     let updated_at = found.updated_at;
-    Ok(etag_response(ArrangementResponse::from(found), updated_at))
+    Ok(etag_response(
+        ArrangementResponse::from(found).for_reader(reader),
+        updated_at,
+    ))
 }
 
 /// Update arrangement metadata (owner/archivist; requires `If-Match`).
@@ -1403,7 +1434,12 @@ async fn find_voice_scoped_including_deleted(
     Ok(found)
 }
 
-/// Fetch one voice by ID (requires `musician` role).
+/// Fetch one voice by ID (requires `musician` role, or a guest's part
+/// assignment on this voice).
+///
+/// A guest (a live part assignment, no membership) reads only the voices
+/// they are assigned to; any other voice, like any other non-member's
+/// request, is `403`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
@@ -1429,7 +1465,7 @@ async fn get_voice(
     State(state): State<AppState>,
     Path((org_id, arrangement_id, id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_voice_reader_v1(&state, &auth, org_id, arrangement_id, id).await?;
     let found = find_voice_scoped(&state, org_id, arrangement_id, id).await?;
     let updated_at = found.updated_at;
     Ok(etag_response(VoiceResponse::from(found), updated_at))
