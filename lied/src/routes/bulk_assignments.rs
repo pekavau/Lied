@@ -48,7 +48,7 @@ pub fn router() -> OpenApiRouter<AppState> {
 struct PreviewQuery {
     /// The player to assign.
     user_id: Uuid,
-    /// The instrument of the part.
+    /// The part's instrument: matched against each voice's primary instrument.
     instrument_id: Uuid,
     /// The part number (the `1` of "Trumpet in Bb 1"). Omit to match voices
     /// that carry no part number, such as Timpani or Harp.
@@ -66,8 +66,10 @@ struct PreviewResponse {
 /// Preview assigning one player to the same part in every piece of a
 /// collection (owner/archivist/conductor).
 ///
-/// A voice matches when it has `instrumentId` and the same `partNumber` (both
-/// absent counts as the same). Each piece reports one outcome: `assign`,
+/// A voice matches when its primary instrument (the first of its
+/// `instrumentIds`) is `instrumentId` and it has the same `partNumber` (both
+/// absent counts as the same); the other instruments of a doubling part do
+/// not make it that instrument's part. Each piece reports one outcome: `assign`,
 /// `alreadyHeld`, `noMatch` (with the piece's voices for that instrument as
 /// `candidates`), `ambiguous` (more than one match, listed in `candidates`), or
 /// `removed`. `alsoHolds` lists other parts of the same piece the player

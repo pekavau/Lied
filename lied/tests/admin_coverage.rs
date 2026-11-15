@@ -354,7 +354,7 @@ async fn seed_programme_named(
             arr_id,
             name,
             &lied::domain::voice::slugify(name),
-            instrument,
+            &[instrument],
             lied::domain::voice::NewPartNumber::Set(None),
             None,
         )

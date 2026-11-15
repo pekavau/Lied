@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM voice_instrument WHERE voice_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4553fb8c71808bf55f90ccff37c86bc4a88dd926fc4ddbdbbc285eefd3210a12"
+}

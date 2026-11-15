@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE voice v\n        SET name = $2,\n            instrument_id = $3,\n            part_number = CASE WHEN $5 THEN v.part_number ELSE $4 END,\n            updated_at = now()\n        WHERE v.id = $1 AND v.deleted_at IS NULL\n          AND ($6::bigint IS NULL OR floor(extract(epoch FROM v.updated_at) * 1000)::bigint = $6)\n        RETURNING\n            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,\n            v.created_at as \"created_at: DateTime<Utc>\",\n            v.updated_at as \"updated_at: DateTime<Utc>\",\n            v.created_by,\n            v.deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "query": "\n        SELECT\n            v.id, v.arrangement_id, v.name, v.slug,\n            ARRAY(SELECT vi.instrument_id FROM voice_instrument vi WHERE vi.voice_id = v.id ORDER BY vi.position) as \"instrument_ids!\",\n            v.part_number,\n            v.created_at as \"created_at: DateTime<Utc>\",\n            v.updated_at as \"updated_at: DateTime<Utc>\",\n            v.created_by,\n            v.deleted_at as \"deleted_at: DateTime<Utc>\"\n        FROM voice v\n        JOIN arrangement a ON a.id = v.arrangement_id\n        WHERE v.id = $1 AND v.deleted_at IS NULL AND a.deleted_at IS NULL\n        ",
   "describe": {
     "columns": [
       {
@@ -25,8 +25,8 @@
       },
       {
         "ordinal": 4,
-        "name": "instrument_id",
-        "type_info": "Uuid"
+        "name": "instrument_ids!",
+        "type_info": "UuidArray"
       },
       {
         "ordinal": 5,
@@ -56,12 +56,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Text",
-        "Uuid",
-        "Int2",
-        "Bool",
-        "Int8"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -69,7 +64,7 @@
       false,
       false,
       false,
-      false,
+      null,
       true,
       false,
       false,
@@ -77,5 +72,5 @@
       true
     ]
   },
-  "hash": "1c2d7a04f0a5b063e9ab504a211a09d382227455508608f96ddc4187a1409b51"
+  "hash": "ad36dc3f6ba2c4fdf52cc93f233fac76529211635e8a4bfd923e1241655a4a21"
 }

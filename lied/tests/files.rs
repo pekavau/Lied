@@ -238,7 +238,7 @@ async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
         arr_id,
         name,
         &voice::slugify(name),
-        instrument_id,
+        &[instrument_id],
         lied::domain::voice::NewPartNumber::Set(None),
         None,
     )

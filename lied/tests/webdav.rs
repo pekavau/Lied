@@ -132,8 +132,12 @@ async fn seed(pool: &PgPool) -> (String, Uuid, Uuid) {
     // One voice on a1, and a part assignment giving the musician that voice.
     let v1 = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO voice (id, arrangement_id, name, slug, instrument_id)
-           VALUES ($1, $2, 'Flute 1', 'flute-1', $3)"#,
+        r#"WITH v AS (
+               INSERT INTO voice (id, arrangement_id, name, slug)
+               VALUES ($1, $2, 'Flute 1', 'flute-1') RETURNING id
+           )
+           INSERT INTO voice_instrument (voice_id, instrument_id, position)
+           SELECT id, $3, 1 FROM v"#,
         v1,
         a1,
         instrument_id,

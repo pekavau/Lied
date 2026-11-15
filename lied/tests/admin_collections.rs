@@ -1046,7 +1046,7 @@ async fn seed_voice(state: &AppState, arr_id: Uuid, name: &str) -> Uuid {
         arr_id,
         name,
         &lied::domain::voice::slugify(name),
-        instrument_id,
+        &[instrument_id],
         lied::domain::voice::NewPartNumber::Set(None),
         None,
     )
@@ -2084,7 +2084,7 @@ async fn seed_part(
         arr_id,
         name,
         &lied::domain::voice::slugify(name),
-        instrument_id,
+        &[instrument_id],
         lied::domain::voice::NewPartNumber::Set(part_number),
         None,
     )
@@ -3224,5 +3224,102 @@ async fn the_move_dropdown_offers_only_numbers_the_piece_may_take() {
         move_form(lowest).contains("value=\"4\""),
         "piece 1 may move to the end: {}",
         move_form(lowest)
+    );
+}
+
+/// #57: the console voice form takes a primary instrument and "also plays"
+/// extras; the list shows them joined, the edit form preselects the extras,
+/// and saving without extras drops them.
+#[tokio::test]
+async fn a_console_voice_carries_extra_instruments() {
+    let ctx = Ctx::new().await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let arr = seed_arrangement(&ctx.state, fx.org_id, "Bolero").await;
+    let voices_url = format!("/admin/orgs/{}/arrangements/{arr}/voices", fx.org_id);
+    let key = |k: &'static str| {
+        let pool = ctx.pool.clone();
+        async move {
+            sqlx::query_scalar!("SELECT id FROM instrument WHERE key = $1", k)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let flute: Uuid = key("flute").await;
+    let piccolo: Uuid = key("piccolo").await;
+    let stored = |voice: Uuid| {
+        let pool = ctx.pool.clone();
+        async move {
+            sqlx::query_scalar!(
+                "SELECT instrument_id FROM voice_instrument WHERE voice_id = $1 ORDER BY position",
+                voice
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let (_, html) = load_page(&ctx.app, &browser, &voices_url).await;
+    assert!(html.contains("name=\"also_instrument_ids\""), "{html}");
+    let token = form_csrf(&html);
+    let (flute_s, piccolo_s) = (flute.to_string(), piccolo.to_string());
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &voices_url,
+        &[
+            ("name", "Flute 2 / Piccolo"),
+            ("instrument_id", &flute_s),
+            ("also_instrument_ids", &piccolo_s),
+            // Picking the primary again among the extras means the same.
+            ("also_instrument_ids", &flute_s),
+            ("part_number", "2"),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    let voice: Uuid = sqlx::query_scalar!("SELECT id FROM voice WHERE arrangement_id = $1", arr)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored(voice).await, vec![flute, piccolo]);
+
+    let (_, html) = load_page(&ctx.app, &browser, &voices_url).await;
+    assert!(html.contains("Flute / Piccolo"), "{html}");
+
+    let edit_url = format!("{voices_url}/{voice}");
+    let (_, html) = load_page(&ctx.app, &browser, &edit_url).await;
+    assert!(
+        html.contains(&format!("<option value=\"{piccolo}\" selected")),
+        "the extra is preselected: {html}"
+    );
+    let version = html
+        .split("name=\"expected_version\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("expected_version")
+        .to_string();
+    let token = form_csrf(&html);
+    let response = post_form(
+        &ctx.app,
+        &browser,
+        &edit_url,
+        &[
+            ("name", "Flute 2"),
+            ("instrument_id", &flute_s),
+            ("part_number", "2"),
+            ("expected_version", &version),
+        ],
+        &token,
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    assert_eq!(
+        stored(voice).await,
+        vec![flute],
+        "no extras: only the primary"
     );
 }

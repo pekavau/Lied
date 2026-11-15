@@ -740,7 +740,7 @@ async fn instrumentation_filters_by_a_live_voice() {
         with_harp,
         "Harp 1",
         "harp-1",
-        instrument,
+        &[instrument],
         lied::domain::voice::NewPartNumber::Set(None),
         None,
     )
@@ -1017,4 +1017,66 @@ async fn a_filter_error_names_the_field_it_is_talking_about() {
         !rendered.contains("a tag id"),
         "…and must not send the caller looking at tags: {rendered}"
     );
+}
+
+/// #57: the instrument facet finds an arrangement through a voice that
+/// carries the instrument at any position, not only as its primary: a piece
+/// needing a timpanist is found even when timpani is the third instrument of
+/// "Perc. 2".
+#[tokio::test]
+async fn the_instrument_facet_matches_any_instrument_of_a_voice() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) = org_with_member(
+        &db.pool,
+        &state,
+        "Search Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let instruments: Vec<Uuid> =
+        sqlx::query_scalar!(r#"SELECT id FROM instrument ORDER BY key LIMIT 3"#)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let (snare, cymbals, timpani) = (instruments[0], instruments[1], instruments[2]);
+    let with_perc = seed_searchable(&db.pool, org_id, "March", None, None, None, None, None).await;
+    seed_searchable(
+        &db.pool,
+        org_id,
+        "Quiet Piece",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    voice::create(
+        &db.pool,
+        Uuid::now_v7(),
+        with_perc,
+        "Perc. 2",
+        "perc-2",
+        &[snare, cymbals, timpani],
+        lied::domain::voice::NewPartNumber::Set(Some(2)),
+        None,
+    )
+    .await
+    .expect("voice");
+
+    for instrument in [snare, cymbals, timpani] {
+        assert_eq!(
+            search_titles(
+                &app,
+                &token,
+                org_id,
+                &format!("filter[instrumentId]={instrument}")
+            )
+            .await,
+            vec!["March"],
+            "found through instrument {instrument}"
+        );
+    }
 }

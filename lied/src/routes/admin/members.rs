@@ -333,7 +333,7 @@ async fn member_edit_page(
 
 /// A `<select multiple>` of the instrument vocabulary (grouped by family),
 /// pre-selecting `selected`.
-fn instrument_multiselect(
+pub(crate) fn instrument_multiselect(
     name: &str,
     instruments: &[instrument::Instrument],
     selected: &[Uuid],

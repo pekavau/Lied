@@ -160,8 +160,12 @@ async fn create_voice(pool: &PgPool, arr_id: Uuid, slug: &str) -> Uuid {
         .expect("instrument");
     let id = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO voice (id, arrangement_id, name, slug, instrument_id)
-           VALUES ($1, $2, $3, $3, $4)"#,
+        r#"WITH v AS (
+               INSERT INTO voice (id, arrangement_id, name, slug)
+               VALUES ($1, $2, $3, $3) RETURNING id
+           )
+           INSERT INTO voice_instrument (voice_id, instrument_id, position)
+           SELECT id, $4, 1 FROM v"#,
         id,
         arr_id,
         slug,

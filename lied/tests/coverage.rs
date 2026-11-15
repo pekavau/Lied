@@ -287,7 +287,7 @@ async fn seed_programme_named(pool: &PgPool, org_id: Uuid, name: &str) -> Progra
                 arr_id,
                 name,
                 &voice::slugify(&format!("{title}-{name}")),
-                instrument,
+                &[instrument],
                 lied::domain::voice::NewPartNumber::Set(None),
                 None,
             )
@@ -570,7 +570,7 @@ async fn a_principal_sees_their_section_and_nothing_else() {
         .unwrap()
         .iter()
         .flat_map(|item| item["voices"].as_array().unwrap())
-        .map(|v| v["instrumentId"].as_str().unwrap())
+        .map(|v| v["instrumentIds"][0].as_str().unwrap())
         .collect();
     assert!(
         instruments.iter().all(|id| *id == flute.to_string()),
@@ -995,4 +995,71 @@ async fn the_per_item_query_returns_only_that_item() {
         .is_none(),
         "an item from another collection must not resolve"
     );
+}
+
+/// #57: a doubling part ("Flute 2 / Piccolo") belongs to every section whose
+/// instrument it carries, so the flute principal and a piccolo principal both
+/// see it. Staff still count it once.
+#[tokio::test]
+async fn a_doubling_part_counts_for_every_section_it_plays_in() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, staff_token) = org_with_member(
+        &db.pool,
+        &state,
+        "Coverage Phil",
+        "arch",
+        membership::Role::Archivist,
+    )
+    .await;
+    let programme = seed_programme(&db.pool, org_id).await;
+    let (flute, _trumpet) = two_instruments(&db.pool).await;
+    let piccolo: Uuid =
+        sqlx::query_scalar!(r#"SELECT id FROM instrument ORDER BY key OFFSET 2 LIMIT 1"#)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let first_arrangement: Uuid = sqlx::query_scalar!(
+        "SELECT arrangement_id FROM collection_item WHERE id = $1",
+        programme.items[0]
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    voice::create(
+        &db.pool,
+        Uuid::now_v7(),
+        first_arrangement,
+        "Flute 2 / Piccolo",
+        "flute-2-piccolo",
+        &[flute, piccolo],
+        lied::domain::voice::NewPartNumber::Set(Some(2)),
+        None,
+    )
+    .await
+    .expect("voice");
+    let flute_lead = seed_musician(&db.pool, &state, org_id, "flute-lead", true, &[flute]).await;
+    let piccolo_lead =
+        seed_musician(&db.pool, &state, org_id, "piccolo-lead", true, &[piccolo]).await;
+
+    let staff = coverage_json(&app, &staff_token, org_id, programme.collection_id).await;
+    assert_eq!(staff["required"], 5, "four single parts and one doubling");
+    let flutes = coverage_json(&app, &flute_lead, org_id, programme.collection_id).await;
+    assert_eq!(
+        flutes["required"], 3,
+        "two flute parts and the doubling, whose primary is the flute"
+    );
+    let piccolos = coverage_json(&app, &piccolo_lead, org_id, programme.collection_id).await;
+    assert_eq!(
+        piccolos["required"], 1,
+        "the doubling counts for the piccolo section too"
+    );
+    let names: Vec<&str> = piccolos["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|item| item["voices"].as_array().unwrap())
+        .map(|v| v["voiceName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Flute 2 / Piccolo"]);
 }

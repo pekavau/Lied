@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            i.id as instrument_id,\n            i.display_name as instrument_name,\n            v.part_number as \"part_number?\",\n            count(DISTINCT ci.id) as \"pieces!\"\n        FROM collection_item ci\n        JOIN collection c ON c.id = ci.collection_id AND c.deleted_at IS NULL\n        JOIN arrangement a ON a.id = ci.arrangement_id AND a.deleted_at IS NULL\n        JOIN voice v ON v.arrangement_id = a.id AND v.deleted_at IS NULL\n        -- A part is named by its primary instrument (see the module docs).\n        JOIN voice_instrument vi ON vi.voice_id = v.id AND vi.position = 1\n        JOIN instrument i ON i.id = vi.instrument_id\n        WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL\n        GROUP BY i.id, i.display_name, v.part_number\n        ORDER BY i.display_name ASC, v.part_number ASC NULLS LAST\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "instrument_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "instrument_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "part_number?",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "pieces!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "c89cde57c87d841fdad499d4b8130de8d9433377a87ade8c629ba5d9be0b6cfe"
+}

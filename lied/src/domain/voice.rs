@@ -27,11 +27,15 @@ pub struct Voice {
     pub arrangement_id: Uuid,
     pub name: String,
     pub slug: String,
-    pub instrument_id: Uuid,
+    /// The instruments this part is read on, in order; never empty. The first
+    /// is the **primary**: "Flute 2 / Piccolo" is `[flute, piccolo]`, and a
+    /// percussion part lists every instrument its player handles (#57).
+    /// Display, sorting and part identity use the primary.
+    pub instrument_ids: Vec<Uuid>,
     /// Which part of its instrument this voice is — the `1` of "Trumpet in Bb
     /// 1". `None` is an ordinary value (Timpani, Harp, Solo Cornet), not a
-    /// missing one. `(instrument_id, part_number)` is how "the same part" is
-    /// recognised across pieces (issue #55).
+    /// missing one. `(primary instrument, part_number)` is how "the same
+    /// part" is recognised across pieces (issue #55).
     pub part_number: Option<i16>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -45,8 +49,12 @@ pub enum VoiceError {
     Database(#[from] sqlx::Error),
     #[error("slug already exists in this arrangement")]
     DuplicateSlug,
-    #[error("instrument_id does not reference a live instrument")]
+    #[error("instrumentIds must reference live instruments")]
     UnknownInstrument,
+    #[error("instrumentIds must name at least one instrument")]
+    NoInstrument,
+    #[error("instrumentIds must not name an instrument twice")]
+    DuplicateInstrument,
     #[error("part_number must be at least 1")]
     InvalidPartNumber,
 }
@@ -95,15 +103,65 @@ pub fn slugify(input: &str) -> String {
     crate::slug::slugify(input, "voice")
 }
 
-/// Validate that `instrument_id` references a live `instrument` row
-/// (mirrors [`crate::domain::membership::validate_fields`]'s pattern for the
-/// `uuid[]` columns there, but this is a single scalar FK — Postgres *could*
-/// enforce this with a real FK, and the migration already declares
-/// `instrument_id uuid NOT NULL REFERENCES instrument (id)`, so the only
-/// reason to also check here is to turn the bare FK-violation `23503` into a
-/// clean domain error rather than a generic database error).
-async fn validate_instrument_id(pool: &PgPool, instrument_id: Uuid) -> Result<bool, sqlx::Error> {
-    crate::domain::instrument::exists(pool, instrument_id).await
+impl Voice {
+    /// The primary instrument: the first of [`Voice::instrument_ids`].
+    pub fn primary_instrument_id(&self) -> Uuid {
+        self.instrument_ids.first().copied().unwrap_or_default()
+    }
+}
+
+/// Validate a voice's instrument list: at least one, none twice, all known.
+/// The table's foreign key would refuse an unknown id too; checking first
+/// turns that into a clean domain error. Runs in the write's transaction,
+/// which is what holds the "at least one instrument" rule: the schema
+/// cannot, because the rows live in `voice_instrument`.
+async fn validate_instruments(
+    db: impl sqlx::PgExecutor<'_>,
+    instrument_ids: &[Uuid],
+) -> Result<(), VoiceError> {
+    if instrument_ids.is_empty() {
+        return Err(VoiceError::NoInstrument);
+    }
+    let mut distinct = instrument_ids.to_vec();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() != instrument_ids.len() {
+        return Err(VoiceError::DuplicateInstrument);
+    }
+    let known: i64 = sqlx::query_scalar!(
+        r#"SELECT count(*) as "count!" FROM instrument WHERE id = ANY($1)"#,
+        &distinct,
+    )
+    .fetch_one(db)
+    .await?;
+    if known != distinct.len() as i64 {
+        return Err(VoiceError::UnknownInstrument);
+    }
+    Ok(())
+}
+
+/// Replace a voice's instrument rows with `instrument_ids`, in order.
+async fn write_instruments(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    voice_id: Uuid,
+    instrument_ids: &[Uuid],
+) -> Result<(), VoiceError> {
+    sqlx::query!("DELETE FROM voice_instrument WHERE voice_id = $1", voice_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query!(
+        r#"
+        INSERT INTO voice_instrument (voice_id, instrument_id, position)
+        SELECT $1, i.id, i.ord::smallint
+        FROM unnest($2::uuid[]) WITH ORDINALITY AS i(id, ord)
+        "#,
+        voice_id,
+        instrument_ids,
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(map_write_error)?;
+    Ok(())
 }
 
 struct Row {
@@ -111,7 +169,7 @@ struct Row {
     arrangement_id: Uuid,
     name: String,
     slug: String,
-    instrument_id: Uuid,
+    instrument_ids: Vec<Uuid>,
     part_number: Option<i16>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -126,7 +184,7 @@ impl Row {
             arrangement_id: self.arrangement_id,
             name: self.name,
             slug: self.slug,
-            instrument_id: self.instrument_id,
+            instrument_ids: self.instrument_ids,
             part_number: self.part_number,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -136,9 +194,9 @@ impl Row {
     }
 }
 
-/// Insert a new voice row. Validates `instrument_id` up front so the error
-/// is a clean [`VoiceError::UnknownInstrument`] rather than a raw FK
-/// violation.
+/// Insert a new voice with its instruments (first = primary), in one
+/// transaction. The list is validated first ([`VoiceError::NoInstrument`],
+/// [`VoiceError::DuplicateInstrument`], [`VoiceError::UnknownInstrument`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn create(
     pool: &PgPool,
@@ -146,7 +204,7 @@ pub async fn create(
     arrangement_id: Uuid,
     name: &str,
     slug: &str,
-    instrument_id: Uuid,
+    instrument_ids: &[Uuid],
     part_number: NewPartNumber,
     created_by: Option<Uuid>,
 ) -> Result<Voice, VoiceError> {
@@ -155,21 +213,19 @@ pub async fn create(
         NewPartNumber::Set(n) => (false, n),
     };
     validate_part_number(explicit)?;
-    if !validate_instrument_id(pool, instrument_id).await? {
-        return Err(VoiceError::UnknownInstrument);
-    }
+    let mut tx = pool.begin().await?;
+    validate_instruments(&mut *tx, instrument_ids).await?;
 
-    let row = sqlx::query_as!(
-        Row,
+    let row = sqlx::query!(
         r#"
-        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)
+        INSERT INTO voice (id, arrangement_id, name, slug, part_number, created_by)
         VALUES (
-            $1, $2, $3, $4, $5,
-            CASE WHEN $8 THEN lied_guess_part_number($3) ELSE $6 END,
-            $7
+            $1, $2, $3, $4,
+            CASE WHEN $7 THEN lied_guess_part_number($3) ELSE $5 END,
+            $6
         )
         RETURNING
-            id, arrangement_id, name, slug, instrument_id, part_number,
+            id, arrangement_id, name, slug, part_number,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>",
             created_by,
@@ -179,16 +235,28 @@ pub async fn create(
         arrangement_id,
         name,
         slug,
-        instrument_id,
         explicit,
         created_by,
         from_name,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_write_error)?;
+    write_instruments(&mut tx, id, instrument_ids).await?;
+    tx.commit().await?;
 
-    Ok(row.into_voice())
+    Ok(Voice {
+        id: row.id,
+        arrangement_id: row.arrangement_id,
+        name: row.name,
+        slug: row.slug,
+        instrument_ids: instrument_ids.to_vec(),
+        part_number: row.part_number,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        created_by: row.created_by,
+        deleted_at: row.deleted_at,
+    })
 }
 
 /// Look up a voice by id. Hides the row if it is itself soft-deleted, OR if
@@ -200,7 +268,9 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Voice>, sqlx::
         Row,
         r#"
         SELECT
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
+            v.id, v.arrangement_id, v.name, v.slug,
+            ARRAY(SELECT vi.instrument_id FROM voice_instrument vi WHERE vi.voice_id = v.id ORDER BY vi.position) as "instrument_ids!",
+            v.part_number,
             v.created_at as "created_at: DateTime<Utc>",
             v.updated_at as "updated_at: DateTime<Utc>",
             v.created_by,
@@ -227,13 +297,15 @@ pub async fn find_by_id_including_deleted(
         Row,
         r#"
         SELECT
-            id, arrangement_id, name, slug, instrument_id, part_number,
-            created_at as "created_at: DateTime<Utc>",
-            updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            deleted_at as "deleted_at: DateTime<Utc>"
-        FROM voice
-        WHERE id = $1
+            v.id, v.arrangement_id, v.name, v.slug,
+            ARRAY(SELECT vi.instrument_id FROM voice_instrument vi WHERE vi.voice_id = v.id ORDER BY vi.position) as "instrument_ids!",
+            v.part_number,
+            v.created_at as "created_at: DateTime<Utc>",
+            v.updated_at as "updated_at: DateTime<Utc>",
+            v.created_by,
+            v.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM voice v
+        WHERE v.id = $1
         "#,
         id,
     )
@@ -256,7 +328,8 @@ pub const SORT_ALLOWLIST: &[(&str, &str)] = &[("name", "v.name"), ("createdAt", 
 pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
     ("v.name", crate::listing::SortDirection::Asc);
 
-/// Filter allowlist: exact match on `instrumentId`.
+/// Filter allowlist: `instrumentId` matches a voice that carries that
+/// instrument at any position.
 pub const FILTER_ALLOWLIST: &[&str] = &["instrumentId"];
 
 /// Fetch one page of voices for a (live) arrangement, applying the
@@ -277,7 +350,10 @@ pub async fn list_for_arrangement(
     let query = format!(
         r#"
         SELECT
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
+            v.id, v.arrangement_id, v.name, v.slug,
+            ARRAY(SELECT vi.instrument_id FROM voice_instrument vi
+                  WHERE vi.voice_id = v.id ORDER BY vi.position) as instrument_ids,
+            v.part_number,
             v.created_at, v.updated_at, v.created_by, v.deleted_at,
             count(*) OVER() as total
         FROM voice v
@@ -285,7 +361,9 @@ pub async fn list_for_arrangement(
         WHERE v.arrangement_id = $3
           AND v.deleted_at IS NULL
           AND a.deleted_at IS NULL
-          AND ($4::uuid IS NULL OR v.instrument_id = $4)
+          AND ($4::uuid IS NULL OR EXISTS (
+                SELECT 1 FROM voice_instrument vi
+                WHERE vi.voice_id = v.id AND vi.instrument_id = $4))
         ORDER BY {sort_column} {direction}, v.id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -309,7 +387,9 @@ pub async fn list_for_arrangement(
                 WHERE v.arrangement_id = $1
                   AND v.deleted_at IS NULL
                   AND a.deleted_at IS NULL
-                  AND ($2::uuid IS NULL OR v.instrument_id = $2)
+                  AND ($2::uuid IS NULL OR EXISTS (
+                        SELECT 1 FROM voice_instrument vi
+                        WHERE vi.voice_id = v.id AND vi.instrument_id = $2))
             "#;
             sqlx::query_scalar::<_, i64>(count_query)
                 .bind(arrangement_id)
@@ -327,7 +407,7 @@ pub async fn list_for_arrangement(
                 arrangement_id: row.try_get("arrangement_id")?,
                 name: row.try_get("name")?,
                 slug: row.try_get("slug")?,
-                instrument_id: row.try_get("instrument_id")?,
+                instrument_ids: row.try_get("instrument_ids")?,
                 part_number: row.try_get("part_number")?,
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
@@ -340,7 +420,8 @@ pub async fn list_for_arrangement(
     Ok((items, total))
 }
 
-/// Update a voice's mutable fields (`name`, `instrument_id`, `part_number`).
+/// Update a voice's mutable fields (`name`, the instrument list,
+/// `part_number`); the instrument list is replaced as a whole.
 /// `slug` is immutable. Returns `None` if no live row (own + parent) matched `id`.
 ///
 /// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
@@ -349,7 +430,7 @@ pub async fn update(
     id: Uuid,
     expected_version: Option<i64>,
     name: &str,
-    instrument_id: Uuid,
+    instrument_ids: &[Uuid],
     part_number: PartNumberChange,
 ) -> Result<Option<Voice>, VoiceError> {
     let (keep, explicit) = match part_number {
@@ -357,22 +438,19 @@ pub async fn update(
         PartNumberChange::Set(n) => (false, n),
     };
     validate_part_number(explicit)?;
-    if !validate_instrument_id(pool, instrument_id).await? {
-        return Err(VoiceError::UnknownInstrument);
-    }
+    let mut tx = pool.begin().await?;
+    validate_instruments(&mut *tx, instrument_ids).await?;
 
-    let row = sqlx::query_as!(
-        Row,
+    let row = sqlx::query!(
         r#"
         UPDATE voice v
         SET name = $2,
-            instrument_id = $3,
-            part_number = CASE WHEN $5 THEN v.part_number ELSE $4 END,
+            part_number = CASE WHEN $4 THEN v.part_number ELSE $3 END,
             updated_at = now()
         WHERE v.id = $1 AND v.deleted_at IS NULL
-          AND ($6::bigint IS NULL OR floor(extract(epoch FROM v.updated_at) * 1000)::bigint = $6)
+          AND ($5::bigint IS NULL OR floor(extract(epoch FROM v.updated_at) * 1000)::bigint = $5)
         RETURNING
-            v.id, v.arrangement_id, v.name, v.slug, v.instrument_id, v.part_number,
+            v.id, v.arrangement_id, v.name, v.slug, v.part_number,
             v.created_at as "created_at: DateTime<Utc>",
             v.updated_at as "updated_at: DateTime<Utc>",
             v.created_by,
@@ -380,16 +458,31 @@ pub async fn update(
         "#,
         id,
         name,
-        instrument_id,
         explicit,
         keep,
         expected_version,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_write_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    write_instruments(&mut tx, id, instrument_ids).await?;
+    tx.commit().await?;
 
-    Ok(row.map(Row::into_voice))
+    Ok(Some(Voice {
+        id: row.id,
+        arrangement_id: row.arrangement_id,
+        name: row.name,
+        slug: row.slug,
+        instrument_ids: instrument_ids.to_vec(),
+        part_number: row.part_number,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        created_by: row.created_by,
+        deleted_at: row.deleted_at,
+    }))
 }
 
 /// Soft-delete: sets `deleted_at` on this row ONLY. Returns `false` if no

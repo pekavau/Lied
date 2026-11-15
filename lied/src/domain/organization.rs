@@ -351,6 +351,20 @@ pub async fn delete(
 
     sqlx::query!(
         r#"
+        DELETE FROM voice_instrument
+        WHERE voice_id IN (
+            SELECT v.id FROM voice v
+            JOIN arrangement a ON a.id = v.arrangement_id
+            WHERE a.organization_id = $1
+        )
+        "#,
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        r#"
         DELETE FROM voice
         WHERE arrangement_id IN (SELECT id FROM arrangement WHERE organization_id = $1)
         "#,

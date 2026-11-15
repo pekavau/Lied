@@ -4270,7 +4270,7 @@
                           "arrangementId",
                           "name",
                           "slug",
-                          "instrumentId",
+                          "instrumentIds",
                           "createdAt",
                           "updatedAt"
                         ],
@@ -4294,9 +4294,13 @@
                             "type": "string",
                             "format": "uuid"
                           },
-                          "instrumentId": {
-                            "type": "string",
-                            "format": "uuid"
+                          "instrumentIds": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "format": "uuid"
+                            },
+                            "description": "The instruments this part is read on, in order and never empty; the\nfirst is the primary (\"Flute 2 / Piccolo\" is `[flute, piccolo]`)."
                           },
                           "name": {
                             "type": "string"
@@ -4307,7 +4311,7 @@
                               "null"
                             ],
                             "format": "int32",
-                            "description": "Which part of its instrument this is (the `1` of \"Trumpet in Bb 1\");\n`null` for parts that carry no number. Bulk assignment across a\ncollection matches on `(instrumentId, partNumber)`."
+                            "description": "Which part of its instrument this is (the `1` of \"Trumpet in Bb 1\");\n`null` for parts that carry no number. Bulk assignment across a\ncollection matches on the primary instrument and `partNumber`."
                           },
                           "slug": {
                             "type": "string"
@@ -6928,7 +6932,7 @@
           "part-assignments"
         ],
         "summary": "Preview assigning a player to one part across a collection",
-        "description": "A voice matches when it has `instrumentId` and the same `partNumber` (both\nabsent counts as the same). Each piece reports one outcome: `assign`,\n`alreadyHeld`, `noMatch` (with the piece's voices for that instrument as\n`candidates`), `ambiguous` (more than one match, listed in `candidates`), or\n`removed`. `alsoHolds` lists other parts of the same piece the player\nalready holds — a conflict that is reported, not refused.",
+        "description": "A voice matches when its primary instrument (the first of its\n`instrumentIds`) is `instrumentId` and it has the same `partNumber` (both\nabsent counts as the same); the other instruments of a doubling part do\nnot make it that instrument's part. Each piece reports one outcome: `assign`,\n`alreadyHeld`, `noMatch` (with the piece's voices for that instrument as\n`candidates`), `ambiguous` (more than one match, listed in `candidates`), or\n`removed`. `alsoHolds` lists other parts of the same piece the player\nalready holds — a conflict that is reported, not refused.",
         "operationId": "preview_bulk_assignment",
         "parameters": [
           {
@@ -6964,7 +6968,7 @@
           {
             "name": "instrumentId",
             "in": "query",
-            "description": "The instrument of the part.",
+            "description": "The part's instrument: matched against each voice's primary instrument.",
             "required": true,
             "schema": {
               "type": "string",
@@ -14269,12 +14273,16 @@
         "description": "Request body for creating a voice.",
         "required": [
           "name",
-          "instrumentId"
+          "instrumentIds"
         ],
         "properties": {
-          "instrumentId": {
-            "type": "string",
-            "format": "uuid"
+          "instrumentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The instruments this part is read on, primary first: at least one,\nnone twice."
           },
           "name": {
             "type": "string"
@@ -15545,12 +15553,16 @@
         "type": "object",
         "description": "Request body for `PATCH …/voices/{voiceId}`: a partial update. An omitted\nfield is kept — in particular an omitted `partNumber` is never re-guessed\nfrom a new name, and a client that predates the field cannot erase it.\nSend `partNumber: null` to clear it.",
         "properties": {
-          "instrumentId": {
+          "instrumentIds": {
             "type": [
-              "string",
+              "array",
               "null"
             ],
-            "format": "uuid"
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Replaces the whole list when sent (primary first, at least one, none\ntwice); omitted keeps it."
           },
           "name": {
             "type": [
@@ -15664,13 +15676,17 @@
         "required": [
           "voiceId",
           "voiceName",
-          "instrumentId",
+          "instrumentIds",
           "players"
         ],
         "properties": {
-          "instrumentId": {
-            "type": "string",
-            "format": "uuid"
+          "instrumentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The voice's instruments, primary first (#57)."
           },
           "players": {
             "type": "array",
@@ -15718,7 +15734,7 @@
           "arrangementId",
           "name",
           "slug",
-          "instrumentId",
+          "instrumentIds",
           "createdAt",
           "updatedAt"
         ],
@@ -15742,9 +15758,13 @@
             "type": "string",
             "format": "uuid"
           },
-          "instrumentId": {
-            "type": "string",
-            "format": "uuid"
+          "instrumentIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The instruments this part is read on, in order and never empty; the\nfirst is the primary (\"Flute 2 / Piccolo\" is `[flute, piccolo]`)."
           },
           "name": {
             "type": "string"
@@ -15755,7 +15775,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Which part of its instrument this is (the `1` of \"Trumpet in Bb 1\");\n`null` for parts that carry no number. Bulk assignment across a\ncollection matches on `(instrumentId, partNumber)`."
+            "description": "Which part of its instrument this is (the `1` of \"Trumpet in Bb 1\");\n`null` for parts that carry no number. Bulk assignment across a\ncollection matches on the primary instrument and `partNumber`."
           },
           "slug": {
             "type": "string"

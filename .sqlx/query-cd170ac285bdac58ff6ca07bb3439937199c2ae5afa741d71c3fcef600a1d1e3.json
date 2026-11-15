@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, part_number, created_by)\n        VALUES (\n            $1, $2, $3, $4, $5,\n            CASE WHEN $8 THEN lied_guess_part_number($3) ELSE $6 END,\n            $7\n        )\n        RETURNING\n            id, arrangement_id, name, slug, instrument_id, part_number,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
+  "query": "\n        INSERT INTO voice (id, arrangement_id, name, slug, part_number, created_by)\n        VALUES (\n            $1, $2, $3, $4,\n            CASE WHEN $7 THEN lied_guess_part_number($3) ELSE $5 END,\n            $6\n        )\n        RETURNING\n            id, arrangement_id, name, slug, part_number,\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by,\n            deleted_at as \"deleted_at: DateTime<Utc>\"\n        ",
   "describe": {
     "columns": [
       {
@@ -25,31 +25,26 @@
       },
       {
         "ordinal": 4,
-        "name": "instrument_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 5,
         "name": "part_number",
         "type_info": "Int2"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "created_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "updated_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "created_by",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "deleted_at: DateTime<Utc>",
         "type_info": "Timestamptz"
       }
@@ -60,14 +55,12 @@
         "Uuid",
         "Text",
         "Text",
-        "Uuid",
         "Int2",
         "Uuid",
         "Bool"
       ]
     },
     "nullable": [
-      false,
       false,
       false,
       false,
@@ -79,5 +72,5 @@
       true
     ]
   },
-  "hash": "dc378c4e2568b8f0b6eede45f1de3ba558e8eabd5c49ba7b839761e471f36e2c"
+  "hash": "cd170ac285bdac58ff6ca07bb3439937199c2ae5afa741d71c3fcef600a1d1e3"
 }
