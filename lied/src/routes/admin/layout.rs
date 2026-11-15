@@ -84,6 +84,7 @@ pub fn page(title: &str, display_name: &str, body: Markup) -> Markup {
         a href="/admin" { "Home" }
         a href="/admin/orgs" { "Organizations" }
         a href="/admin/users" { "Users" }
+        a href="/admin/app-passwords" { "App passwords" }
         span { " — logged in as " (display_name) " — " }
         form class="inline" method="post" action="/admin/logout" {
             button type="submit" { "Log out" }

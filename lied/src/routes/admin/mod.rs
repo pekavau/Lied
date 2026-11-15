@@ -15,6 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod annotations;
+pub mod app_passwords;
 pub mod arrangements;
 pub mod bulk_assign;
 pub mod collections;
@@ -81,6 +82,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(bulk_assign::router())
         // Global annotations: arrangement block, editor, overview (issue #36).
         .merge(annotations::router())
+        // The caller's own WebDAV app passwords; no org role needed (issue #88).
+        .merge(app_passwords::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,
@@ -206,6 +209,12 @@ async fn index(State(state): State<AppState>, auth: Option<AuthSession>) -> Resp
                     }
                 }
             }
+        }
+        h2 { "WebDAV access" }
+        p {
+            "Open your parts in a tablet reader or your file manager with an "
+            a href="/admin/app-passwords" { "app password" }
+            " — one per device."
         }
         @if user.is_system_admin {
             p class="muted" {
