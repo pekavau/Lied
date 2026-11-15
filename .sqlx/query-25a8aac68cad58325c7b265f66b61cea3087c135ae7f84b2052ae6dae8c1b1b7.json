@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"count!\"\n           FROM part_assignment pa\n           JOIN collection_item ci ON ci.id = pa.collection_item_id\n           JOIN collection c ON c.id = ci.collection_id\n           JOIN voice v ON v.id = pa.voice_id\n           JOIN arrangement a ON a.id = v.arrangement_id\n           WHERE pa.user_id = $1\n             AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n             AND v.deleted_at IS NULL AND a.deleted_at IS NULL\n             AND ($2::uuid IS NULL OR a.organization_id = $2)\n             AND ($3::uuid IS NULL OR c.id = $3)\n             AND ($4::bool IS NULL OR (pa.acknowledged_at IS NOT NULL) = $4)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "25a8aac68cad58325c7b265f66b61cea3087c135ae7f84b2052ae6dae8c1b1b7"
+}
