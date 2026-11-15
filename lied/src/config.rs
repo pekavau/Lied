@@ -52,16 +52,21 @@ pub struct AppConfig {
     /// Postgres connection string. Secret.
     pub database_url: Secret,
 
-    /// MinIO / S3 endpoint URL, e.g. `http://localhost:9000`.
+    /// S3 endpoint URL of the object store, e.g. `http://localhost:9000`.
     pub s3_endpoint: String,
-    /// MinIO / S3 bucket used for file storage.
+    /// S3 bucket used for file storage.
     pub s3_bucket: String,
-    /// MinIO / S3 access key id. Secret.
+    /// S3 access key id. Secret.
     pub s3_access_key_id: Secret,
-    /// MinIO / S3 secret access key. Secret.
+    /// S3 secret access key. Secret.
     pub s3_secret_access_key: Secret,
-    /// MinIO / S3 region (MinIO ignores the value but the SDK requires one).
+    /// S3 region (a single-node store ignores the value but the SDK requires one).
     pub s3_region: String,
+    /// Days an overwritten or deleted object's previous version is kept
+    /// (`LIED_S3_VERSION_RETENTION_DAYS`, default 30). The bucket has
+    /// versioning on; Lied sets a lifecycle rule that expires noncurrent
+    /// versions after this many days. `0` keeps them forever (no rule).
+    pub s3_version_retention_days: u32,
 
     /// HS256 signing secret for bearer JWTs. Secret.
     pub jwt_signing_key: Secret,
@@ -123,6 +128,7 @@ struct Defaults {
     s3_endpoint: String,
     s3_bucket: String,
     s3_region: String,
+    s3_version_retention_days: u32,
     jwt_lifetime_days: i64,
     max_upload_bytes: u64,
     max_request_bytes: u64,
@@ -146,6 +152,7 @@ impl Default for Defaults {
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_bucket: "lied".to_string(),
             s3_region: "us-east-1".to_string(),
+            s3_version_retention_days: 30,
             jwt_lifetime_days: 30,
             max_upload_bytes: 200 * 1024 * 1024,
             max_request_bytes: 256 * 1024,
@@ -209,22 +216,17 @@ impl AppConfig {
     /// `Defaults` struct means figment never needs a (insecure) default
     /// value for them.
     pub fn load() -> Result<Self, ConfigError> {
-        let figment = Figment::new()
-            .merge(Serialized::defaults(Defaults::default()))
-            .merge(Toml::file("config.toml"))
-            .merge(Env::prefixed("LIED_"));
-
-        let defaults: Defaults = figment.extract()?;
+        let defaults = layered(Env::prefixed("LIED_"))?;
 
         let database_url = resolve_secret("LIED_DATABASE_URL")?
             .map(Secret::from)
             .ok_or(ConfigError::MissingSecret("LIED_DATABASE_URL"))?;
         let s3_access_key_id = resolve_secret("LIED_S3_ACCESS_KEY_ID")?
             .map(Secret::from)
-            .unwrap_or_else(|| Secret::from("minioadmin".to_string()));
+            .unwrap_or_else(|| Secret::from("rustfsadmin".to_string()));
         let s3_secret_access_key = resolve_secret("LIED_S3_SECRET_ACCESS_KEY")?
             .map(Secret::from)
-            .unwrap_or_else(|| Secret::from("minioadmin".to_string()));
+            .unwrap_or_else(|| Secret::from("rustfsadmin".to_string()));
         let jwt_signing_key = resolve_secret("LIED_JWT_SIGNING_KEY")?
             .map(Secret::from)
             .ok_or(ConfigError::MissingSecret("LIED_JWT_SIGNING_KEY"))?;
@@ -237,6 +239,7 @@ impl AppConfig {
             s3_access_key_id,
             s3_secret_access_key,
             s3_region: defaults.s3_region,
+            s3_version_retention_days: defaults.s3_version_retention_days,
             jwt_signing_key,
             jwt_lifetime_days: defaults.jwt_lifetime_days,
             max_upload_bytes: defaults.max_upload_bytes,
@@ -254,6 +257,17 @@ impl AppConfig {
             secure_cookies: defaults.secure_cookies,
         })
     }
+}
+
+/// The non-secret configuration: built-in defaults, then `config.toml`,
+/// then `env`. A value of the wrong type (a negative or non-numeric
+/// `LIED_S3_VERSION_RETENTION_DAYS`, say) is an error, not a default.
+fn layered(env: Env) -> Result<Defaults, ConfigError> {
+    Ok(Figment::new()
+        .merge(Serialized::defaults(Defaults::default()))
+        .merge(Toml::file("config.toml"))
+        .merge(env)
+        .extract()?)
 }
 
 /// Resolve a secret-bearing env var, supporting three sources, checked in order:
@@ -341,6 +355,7 @@ impl fmt::Debug for AppConfig {
             .field("s3_access_key_id", &self.s3_access_key_id)
             .field("s3_secret_access_key", &self.s3_secret_access_key)
             .field("s3_region", &self.s3_region)
+            .field("s3_version_retention_days", &self.s3_version_retention_days)
             .field("jwt_signing_key", &self.jwt_signing_key)
             .field("jwt_lifetime_days", &self.jwt_lifetime_days)
             .field("max_upload_bytes", &self.max_upload_bytes)
@@ -374,6 +389,7 @@ mod tests {
             s3_access_key_id: Secret::from("AKIAEXAMPLE".to_string()),
             s3_secret_access_key: Secret::from("verysecretkey".to_string()),
             s3_region: "us-east-1".to_string(),
+            s3_version_retention_days: 30,
             jwt_signing_key: Secret::from("0123456789abcdef".to_string()),
             jwt_lifetime_days: 30,
             max_upload_bytes: 1,
@@ -410,6 +426,40 @@ mod tests {
         // browsers drop `Secure` cookies on non-TLS origins. HTTPS operators
         // opt in via LIED_SECURE_COOKIES=true.
         assert!(!Defaults::default().secure_cookies);
+    }
+
+    /// `LIED_S3_VERSION_RETENTION_DAYS`: 30 by default, `0` accepted (keep
+    /// old versions forever), negative or non-numeric refused at startup.
+    /// Each case reads its own prefix, so parallel tests cannot see each
+    /// other's variables.
+    #[test]
+    fn version_retention_defaults_to_30_and_refuses_bad_values() {
+        let read = |prefix: &str| layered(Env::prefixed(prefix));
+        assert_eq!(
+            read("LIED_TEST_RETENTION_UNSET_")
+                .unwrap()
+                .s3_version_retention_days,
+            30
+        );
+
+        std::env::set_var("LIED_TEST_RETENTION_ZERO_S3_VERSION_RETENTION_DAYS", "0");
+        let zero = read("LIED_TEST_RETENTION_ZERO_");
+        std::env::remove_var("LIED_TEST_RETENTION_ZERO_S3_VERSION_RETENTION_DAYS");
+        assert_eq!(zero.unwrap().s3_version_retention_days, 0);
+
+        for (prefix, value) in [
+            ("LIED_TEST_RETENTION_NEG_", "-1"),
+            ("LIED_TEST_RETENTION_TEXT_", "a month"),
+        ] {
+            let var = format!("{prefix}S3_VERSION_RETENTION_DAYS");
+            std::env::set_var(&var, value);
+            let result = read(prefix);
+            std::env::remove_var(&var);
+            assert!(
+                matches!(result, Err(ConfigError::Figment(_))),
+                "{value:?} must be refused"
+            );
+        }
     }
 
     #[test]

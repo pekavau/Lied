@@ -13,6 +13,8 @@
 //!   - the friendly 415 / 413 error pages;
 //!   - filenames can't inject path segments into the derived storage key.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -23,7 +25,6 @@ use lied::state::AppState;
 use lied::storage;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
 use testcontainers::{ContainerAsync, ImageExt};
@@ -43,7 +44,7 @@ const PDF_V2: &[u8] = b"%PDF-1.4\nreplacement bytes\ntrailer<<>>\n%%EOF\n";
 
 struct Ctx {
     _pg: ContainerAsync<Postgres>,
-    _minio: ContainerAsync<GenericImage>,
+    _store: ContainerAsync<GenericImage>,
     pool: PgPool,
     app: axum::Router,
     state: AppState,
@@ -82,20 +83,8 @@ impl Ctx {
             .await
             .expect("migrate");
 
-        let minio = // Chainguard's MinIO build: the upstream image the testcontainers module
-        // pulls was removed from Docker Hub (#59 tracks a long-term choice).
-        // A GenericImage rather than the module because current MinIO prints
-        // its "API:" ready line to stderr, and the module waits on stdout.
-        // Credentials are MinIO's built-in minioadmin/minioadmin defaults.
-        GenericImage::new("cgr.dev/chainguard/minio", "latest")
-            .with_exposed_port(9000.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("API:"))
-            .with_cmd(["server", "/data"])
-            .start()
-            .await
-            .expect("start minio");
-        let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
-        let endpoint = format!("http://127.0.0.1:{minio_port}");
+        // Object storage: the pinned RustFS image (tests/common).
+        let (store, endpoint) = common::start_object_store().await;
 
         let state = test_state(
             pool.clone(),
@@ -117,7 +106,7 @@ impl Ctx {
         let app = lied::routes::build_router(state.clone());
         Self {
             _pg: pg,
-            _minio: minio,
+            _store: store,
             pool,
             app,
             state,
@@ -136,9 +125,10 @@ fn test_config(
         database_url: Secret::from("postgres://unused/unused".to_string()),
         s3_endpoint,
         s3_bucket: BUCKET.to_string(),
-        s3_access_key_id: Secret::from("minioadmin".to_string()),
-        s3_secret_access_key: Secret::from("minioadmin".to_string()),
+        s3_access_key_id: Secret::from(common::ACCESS_KEY.to_string()),
+        s3_secret_access_key: Secret::from(common::SECRET_KEY.to_string()),
         s3_region: "us-east-1".to_string(),
+        s3_version_retention_days: 30,
         jwt_signing_key: Secret::from("test-signing-key-material-console-files".to_string()),
         jwt_lifetime_days: 30,
         max_upload_bytes,

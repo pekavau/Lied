@@ -71,6 +71,95 @@ pub async fn ensure_bucket(s3: &S3Client, bucket: &str) -> Result<BucketStatus, 
     }
 }
 
+/// The id of the lifecycle rule Lied sets on its bucket.
+pub const VERSION_RETENTION_RULE_ID: &str = "lied-noncurrent-version-expiry";
+
+/// Turn bucket versioning on and set how long old versions are kept (#59).
+///
+/// With versioning on, overwriting an object (a replaced part, an app
+/// saving over an annotation) or deleting one keeps the previous content as
+/// a noncurrent version. A lifecycle rule expires noncurrent versions
+/// `retention_days` after they were superseded, and removes delete markers
+/// that no longer hide anything; `retention_days == 0` keeps them forever, so
+/// any lifecycle configuration is removed instead.
+///
+/// **Lied owns the bucket's lifecycle configuration:** the S3 API replaces
+/// the whole configuration at once, so a rule an operator added by hand is
+/// overwritten on the next start. Idempotent; runs on every start.
+pub async fn ensure_versioning(
+    s3: &S3Client,
+    bucket: &str,
+    retention_days: u32,
+) -> Result<(), StorageError> {
+    use aws_sdk_s3::types::{
+        BucketLifecycleConfiguration, BucketVersioningStatus, ExpirationStatus,
+        LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, NoncurrentVersionExpiration,
+        VersioningConfiguration,
+    };
+
+    s3.put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            StorageError::S3(format!("put_bucket_versioning: {}", e.into_service_error()))
+        })?;
+
+    if retention_days == 0 {
+        // Keep every version: no rule may expire them.
+        s3.delete_bucket_lifecycle()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::S3(format!(
+                    "delete_bucket_lifecycle: {}",
+                    e.into_service_error()
+                ))
+            })?;
+        return Ok(());
+    }
+
+    let days = i32::try_from(retention_days).unwrap_or(i32::MAX);
+    let rule = LifecycleRule::builder()
+        .id(VERSION_RETENTION_RULE_ID)
+        .status(ExpirationStatus::Enabled)
+        .filter(LifecycleRuleFilter::builder().prefix("").build())
+        .noncurrent_version_expiration(
+            NoncurrentVersionExpiration::builder()
+                .noncurrent_days(days)
+                .build(),
+        )
+        .expiration(
+            LifecycleExpiration::builder()
+                .expired_object_delete_marker(true)
+                .build(),
+        )
+        .build()
+        .map_err(|e| StorageError::S3(format!("lifecycle rule: {e}")))?;
+    let configuration = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .map_err(|e| StorageError::S3(format!("lifecycle configuration: {e}")))?;
+    s3.put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(configuration)
+        .send()
+        .await
+        .map_err(|e| {
+            StorageError::S3(format!(
+                "put_bucket_lifecycle_configuration: {}",
+                e.into_service_error()
+            ))
+        })?;
+    Ok(())
+}
+
 /// A single chunk source for [`upload_streaming`]: yields the next chunk of
 /// the body, `Ok(None)` at end of stream. Implemented for axum's
 /// `Multipart` field in the route layer so this module stays HTTP-agnostic.
