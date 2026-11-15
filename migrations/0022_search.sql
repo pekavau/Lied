@@ -1,7 +1,7 @@
 -- Archive search (issue #34): full-text over the arrangement and the text that
 -- hangs off it, plus trigram fuzzy matching on title and composer.
 --
--- docs/design.md (Data Model -> Search & metadata) specifies FTS over title,
+-- CLAUDE.md (Data Model -> Search & metadata) specifies FTS over title,
 -- composer, arranger, instrumentation description and tag names, with pg_trgm
 -- for fuzzy title/composer matching. The searchable text therefore spans THREE
 -- tables -- `arrangement`, `work` (composer) and `tag` (via `arrangement_tag`)

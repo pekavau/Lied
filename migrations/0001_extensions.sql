@@ -1,7 +1,7 @@
 -- Extensions required by later migrations.
 --
 -- citext: case-insensitive text, used for User.username and User.email
--- (docs/design.md Entities: User).
+-- (CLAUDE.md Entities: User).
 --
 -- pgcrypto: provides gen_random_uuid(), used only for the static instrument
 -- seed rows in 0019_seed_instruments.sql. Runtime application code always

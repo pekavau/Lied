@@ -1,4 +1,4 @@
--- User: a person using the system (docs/design.md Entities: User). No
+-- User: a person using the system (CLAUDE.md Entities: User). No
 -- system-wide application role -- authorization is per-org via
 -- Membership.role; `is_system_admin` covers instance-level operations only.
 -- No `deleted_at` in phase 1 -- user deletion is admin-gated hard delete
@@ -16,7 +16,7 @@ CREATE TABLE "user" (
     created_by      uuid
 );
 
--- Unique constraints table (docs/design.md): User.slug; User.username;
+-- Unique constraints table (CLAUDE.md): User.slug; User.username;
 -- User.email (partial, where not null -- many users may have no email).
 CREATE UNIQUE INDEX user_slug_key ON "user" (slug);
 CREATE UNIQUE INDEX user_username_key ON "user" (username);

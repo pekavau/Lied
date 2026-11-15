@@ -1,8 +1,8 @@
--- Membership: a user's membership in an organization (docs/design.md Entities:
+-- Membership: a user's membership in an organization (CLAUDE.md Entities:
 -- Membership). `instrument_ids` / `principal_instrument_ids` are `uuid[]`
 -- referencing Instrument by id -- Postgres cannot enforce element-level FKs
 -- on an array, so these are validated against the live Instrument set in
--- the service layer on write (see docs/design.md Decisions: Authorization /
+-- the service layer on write (see CLAUDE.md Decisions: Authorization /
 -- Membership FK-integrity note). `is_principal` is orthogonal to `role`.
 CREATE TABLE membership (
     id                          uuid PRIMARY KEY,
@@ -20,6 +20,6 @@ CREATE TABLE membership (
 
 CREATE INDEX membership_organization_id_idx ON membership (organization_id);
 
--- Unique constraints table (docs/design.md): Membership (user_id,
+-- Unique constraints table (CLAUDE.md): Membership (user_id,
 -- organization_id). No soft-delete on this entity.
 CREATE UNIQUE INDEX membership_user_id_organization_id_key ON membership (user_id, organization_id);

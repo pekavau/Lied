@@ -1,4 +1,4 @@
--- Tag: an open-ended classifier scoped to an organization (docs/design.md
+-- Tag: an open-ended classifier scoped to an organization (CLAUDE.md
 -- Entities: Tag). `kind` stays free-text by design (no CHECK) so orgs can
 -- invent categories without a migration.
 CREATE TABLE tag (
@@ -14,7 +14,7 @@ CREATE TABLE tag (
 
 CREATE INDEX tag_organization_id_idx ON tag (organization_id);
 
--- Unique constraints table (docs/design.md): Tag (organization_id, name, kind),
+-- Unique constraints table (CLAUDE.md): Tag (organization_id, name, kind),
 -- live rows only.
 CREATE UNIQUE INDEX tag_organization_id_name_kind_key
     ON tag (organization_id, name, kind)

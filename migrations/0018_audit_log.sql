@@ -1,10 +1,10 @@
--- audit_log: shallow, append-only-by-convention audit trail (docs/design.md
+-- audit_log: shallow, append-only-by-convention audit trail (CLAUDE.md
 -- Security baseline: Audit logging). `org_id` is nullable for
 -- instance-level events and for writes to instance-wide entities (Work,
 -- Instrument), which are never attributed to an org regardless of which
 -- org the actor was operating from. `actor_user_id` is nullable for system
 -- events. `payload` is jsonb with secrets redacted before write (see
--- docs/design.md Redaction policy) -- the redaction happens in the `audit()`
+-- CLAUDE.md Redaction policy) -- the redaction happens in the `audit()`
 -- application-layer helper, not in SQL.
 CREATE TABLE audit_log (
     id              uuid PRIMARY KEY,

@@ -1,5 +1,5 @@
 -- AppPassword: revocable, WebDAV-scoped credential issued per device
--- (docs/design.md Entities: AppPassword). No `expires_at` in phase 1; a nullable
+-- (CLAUDE.md Entities: AppPassword). No `expires_at` in phase 1; a nullable
 -- expiry column can be added later without a backfill (null = never
 -- expires).
 CREATE TABLE app_password (
@@ -18,7 +18,7 @@ CREATE INDEX app_password_user_id_idx ON app_password (user_id);
 -- still-active passwords before the (intentionally slow) argon2 verify.
 CREATE INDEX app_password_prefix_idx ON app_password (user_id, prefix) WHERE revoked_at IS NULL;
 
--- Unique constraints table (docs/design.md): AppPassword (user_id, name). No
+-- Unique constraints table (CLAUDE.md): AppPassword (user_id, name). No
 -- soft-delete on this entity (revocation is `revoked_at`, not deletion), so
 -- this is a plain unique index over the full row set.
 CREATE UNIQUE INDEX app_password_user_id_name_key ON app_password (user_id, name);

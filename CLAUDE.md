@@ -109,7 +109,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 ### Definition of done (issue can close)
 1. Acceptance criteria in the issue body all checked.
 2. CI green (fmt + clippy + test + deny + image build).
-3. Migration applies cleanly from scratch, if schema changed.
+3. Migration applies cleanly from scratch, if schema changed; a new migration's checksum is appended to `lied/tests/migration_checksums.txt`, and no committed migration was edited (comments included — sqlx checksums the whole file and existing databases refuse to start, #111).
 4. Public-API docs updated (rustdoc on public items) if behavior changed.
 5. Branch rebased clean (no `fixup!` / `squash!` left).
 6. `docs/design.md` updated if a design decision shifted (and CLAUDE.md if a working rule did).
