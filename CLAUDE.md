@@ -375,7 +375,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 ### Local verification
 - **`just`** is the build tool; `justfile` lives at the repo root.
 - **`just check`** runs fmt + clippy + test — the canonical command an autonomous loop runs to verify its work.
-- Other targets: `just fmt`, `just lint`, `just test`, `just migrate`, `just prepare` (refreshes `.sqlx/` after SQL changes), `just dev` (`docker compose up` + `cargo watch`), `just build` (release binary), `just image` (docker image build), `just backup` (runs `pg_dump` + `mc mirror` against the docker-compose volumes).
+- Other targets: `just fmt`, `just lint`, `just test`, `just openapi` (regenerates `docs/openapi.json`, the committed `/v1` contract), `just migrate`, `just prepare` (refreshes `.sqlx/` after SQL changes), `just dev` (`docker compose up` + `cargo watch`), `just build` (release binary), `just image` (docker image build), `just backup` (runs `pg_dump` + `mc mirror` against the docker-compose volumes).
 
 ### Toolchain pinning
 - **`rust-toolchain.toml`** at the repo root pins the Rust version explicitly. Example:
@@ -451,7 +451,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 4. Public-API docs updated (rustdoc on public items) if behavior changed.
 5. Branch rebased clean (no `fixup!` / `squash!` left).
 6. CLAUDE.md updated if a design decision shifted.
-7. If `/v1` behaviour changed: `docs/openapi.json` regenerated (`just openapi`; `openapi_snapshot_is_current` fails otherwise), and if an API convention changed, the test in `tests/openapi.rs` that pins it updated or added. A convention that only lives in prose drifts; one with a test does not.
+7. If `/v1` behaviour changed: `docs/openapi.json` regenerated (`just openapi`; `openapi_snapshot_is_current` fails otherwise), and if an API convention changed, the test in `lied/tests/openapi.rs` that pins it updated or added. A crate version bump changes `info.version`, so it regenerates the snapshot too. A convention that only lives in prose drifts; one with a test does not.
 
 ### Documentation
 - `rustdoc` on public items in any future library crates.
