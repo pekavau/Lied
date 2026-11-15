@@ -585,17 +585,21 @@ pub async fn delete(
     Ok(result.rows_affected() > 0)
 }
 
-/// One organization a user belongs to, with the role they hold there —
-/// the rows the console's `/admin` landing lists so a member can enter each
-/// org's workspace. Joins `membership` to `organization`; ordered by org
-/// name for a stable, human-friendly list.
+/// One organization a user belongs to, with their membership there — the
+/// rows the console's `/admin` landing lists so a member can enter each
+/// org's workspace, and the memberships `GET /v1/me` returns. Joins
+/// `membership` to `organization`; ordered by org name for a stable,
+/// human-friendly list.
 #[derive(Debug, Clone)]
 pub struct UserOrg {
+    pub membership_id: Uuid,
     pub organization_id: Uuid,
     pub organization_name: String,
     pub organization_slug: String,
     pub role: Role,
+    pub instrument_ids: Vec<Uuid>,
     pub is_principal: bool,
+    pub principal_instrument_ids: Vec<Uuid>,
 }
 
 /// Every organization `user_id` is a member of, with their role in each.
@@ -607,11 +611,14 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<UserOrg>,
     let rows = sqlx::query!(
         r#"
         SELECT
+            m.id   AS membership_id,
             o.id   AS organization_id,
             o.name AS organization_name,
             o.slug AS organization_slug,
             m.role AS role,
-            m.is_principal AS is_principal
+            m.instrument_ids AS instrument_ids,
+            m.is_principal AS is_principal,
+            m.principal_instrument_ids AS principal_instrument_ids
         FROM membership m
         JOIN organization o ON o.id = m.organization_id
         WHERE m.user_id = $1
@@ -638,11 +645,14 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<UserOrg>,
                 return None;
             };
             Some(UserOrg {
+                membership_id: r.membership_id,
                 organization_id: r.organization_id,
                 organization_name: r.organization_name,
                 organization_slug: r.organization_slug,
                 role,
+                instrument_ids: r.instrument_ids,
                 is_principal: r.is_principal,
+                principal_instrument_ids: r.principal_instrument_ids,
             })
         })
         .collect())

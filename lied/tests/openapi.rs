@@ -94,6 +94,8 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/tokens",
     "/v1/app-passwords",
     "/v1/app-passwords/{appPasswordId}",
+    // The caller (routes/me.rs)
+    "/v1/me",
     // Orgs
     "/v1/orgs",
     "/v1/orgs/{orgId}",

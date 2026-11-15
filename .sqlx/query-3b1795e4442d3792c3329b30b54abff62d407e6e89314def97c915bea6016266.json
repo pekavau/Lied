@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            m.id   AS membership_id,\n            o.id   AS organization_id,\n            o.name AS organization_name,\n            o.slug AS organization_slug,\n            m.role AS role,\n            m.instrument_ids AS instrument_ids,\n            m.is_principal AS is_principal,\n            m.principal_instrument_ids AS principal_instrument_ids\n        FROM membership m\n        JOIN organization o ON o.id = m.organization_id\n        WHERE m.user_id = $1\n        ORDER BY o.name ASC, o.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "membership_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "organization_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "organization_slug",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "role",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "instrument_ids",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 6,
+        "name": "is_principal",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "principal_instrument_ids",
+        "type_info": "UuidArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3b1795e4442d3792c3329b30b54abff62d407e6e89314def97c915bea6016266"
+}
