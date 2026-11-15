@@ -15,6 +15,11 @@ lint:
 test:
     cargo test --all
 
+# Regenerate docs/openapi.json, the committed snapshot of the /v1 contract
+# (issue #75). Run it whenever a change alters the API; CI fails otherwise.
+openapi:
+    LIED_UPDATE_OPENAPI_SNAPSHOT=1 cargo test -p lied --test openapi openapi_snapshot_is_current
+
 # Apply pending SQL migrations to the database pointed at by $DATABASE_URL.
 migrate:
     sqlx migrate run --source migrations

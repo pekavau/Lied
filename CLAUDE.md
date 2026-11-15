@@ -451,6 +451,7 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 4. Public-API docs updated (rustdoc on public items) if behavior changed.
 5. Branch rebased clean (no `fixup!` / `squash!` left).
 6. CLAUDE.md updated if a design decision shifted.
+7. If `/v1` behaviour changed: `docs/openapi.json` regenerated (`just openapi`; `openapi_snapshot_is_current` fails otherwise), and if an API convention changed, the test in `tests/openapi.rs` that pins it updated or added. A convention that only lives in prose drifts; one with a test does not.
 
 ### Documentation
 - `rustdoc` on public items in any future library crates.

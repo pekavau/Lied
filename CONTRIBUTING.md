@@ -58,6 +58,10 @@ A few project-specific rules worth knowing up front:
   shape) are in `CLAUDE.md` ("HTTP & REST API conventions"); how to add or
   change a `/v1` endpoint, including its OpenAPI annotation, is in
   [`docs/api-guidelines.md`](docs/api-guidelines.md).
+- `docs/openapi.json` is the committed `/v1` contract. A change that alters the
+  API must regenerate it with `just openapi` (CI fails otherwise), so the
+  contract change is visible as a diff in review. If you change an API
+  convention, change the test in `lied/tests/openapi.rs` that pins it too.
 
 ## Pull request workflow
 
