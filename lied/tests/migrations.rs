@@ -575,3 +575,48 @@ async fn collection_numbering_migration_carries_old_numbers_over() {
     );
     assert_eq!(width(ids[2]).await, 4);
 }
+
+/// Applied migrations never change, comments included (#111). sqlx stores
+/// each migration's SHA-384 when it applies it and, since the server
+/// migrates on start (#87), refuses to start against a database whose
+/// applied migration no longer matches. Every test here migrates a fresh
+/// database, so nothing else would notice: this pins the checksums in
+/// `tests/migration_checksums.txt`.
+#[test]
+fn applied_migrations_are_never_edited() {
+    let manifest = include_str!("migration_checksums.txt");
+    let pinned: std::collections::BTreeMap<i64, &str> = manifest
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let (version, checksum) = line.split_once(' ').expect("`<version> <sha384>`");
+            (version.parse().expect("numeric version"), checksum.trim())
+        })
+        .collect();
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let current: std::collections::BTreeMap<i64, String> = lied::state::MIGRATOR
+        .iter()
+        .map(|m| (m.version, hex(&m.checksum)))
+        .collect();
+
+    for (version, checksum) in &pinned {
+        match current.get(version) {
+            None => panic!("migration {version:04} was removed; applied migrations must stay"),
+            Some(now) => assert_eq!(
+                now, checksum,
+                "migration {version:04} was edited after it was committed; databases that \
+                 applied it will refuse to start. Restore it and put the change in a new migration."
+            ),
+        }
+    }
+    let missing: Vec<String> = current
+        .iter()
+        .filter(|(version, _)| !pinned.contains_key(version))
+        .map(|(version, checksum)| format!("{version:04} {checksum}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "new migration(s) not pinned; append to lied/tests/migration_checksums.txt:\n{}",
+        missing.join("\n")
+    );
+}

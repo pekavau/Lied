@@ -1,5 +1,5 @@
 -- Collection: a named, indexed set of arrangements belonging to an
--- organization (docs/design.md Entities: Collection).
+-- organization (CLAUDE.md Entities: Collection).
 CREATE TABLE collection (
     id              uuid PRIMARY KEY,
     organization_id uuid NOT NULL REFERENCES organization (id),
@@ -15,7 +15,7 @@ CREATE TABLE collection (
 
 CREATE INDEX collection_organization_id_idx ON collection (organization_id);
 
--- Unique constraints table (docs/design.md): Collection (organization_id,
+-- Unique constraints table (CLAUDE.md): Collection (organization_id,
 -- slug), live rows only.
 CREATE UNIQUE INDEX collection_organization_id_slug_key
     ON collection (organization_id, slug)

@@ -48,6 +48,11 @@ A few project-specific rules worth knowing up front:
 - **SQL goes through `sqlx::query!` / `query_as!`** (compile-time-checked,
   parameterized). String-formatted SQL is not accepted. After changing any SQL,
   run `just prepare` and commit the updated `.sqlx/` cache.
+- **A committed migration is never edited, not even a comment.** sqlx
+  checksums every applied migration and the server refuses to start when one
+  changed. Fix a schema mistake in a new migration, and append the new one's
+  checksum to `lied/tests/migration_checksums.txt` (the
+  `applied_migrations_are_never_edited` test prints the line).
 - **Business logic lives in `domain/*`**, not in HTTP handlers — the REST and
   (future) MCP surfaces call the same service functions.
 - `#![forbid(unsafe_code)]`; `unwrap()`/`expect()` in production paths trip

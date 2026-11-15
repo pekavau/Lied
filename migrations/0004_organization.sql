@@ -1,4 +1,4 @@
--- Organization: an orchestra or ensemble (docs/design.md Entities: Organization).
+-- Organization: an orchestra or ensemble (CLAUDE.md Entities: Organization).
 -- No `deleted_at` -- deleting an org is an admin-gated hard delete (cascade
 -- impact is large; undelete UX is messy). `slug` is immutable per the
 -- WebDAV-layout decision; renames are a separate, explicit, audited op.
@@ -11,5 +11,5 @@ CREATE TABLE organization (
     created_by  uuid
 );
 
--- Unique constraints table (docs/design.md): Organization.slug, global.
+-- Unique constraints table (CLAUDE.md): Organization.slug, global.
 CREATE UNIQUE INDEX organization_slug_key ON organization (slug);

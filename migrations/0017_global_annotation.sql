@@ -1,5 +1,5 @@
 -- GlobalAnnotation: a conductor-/director-level annotation on an
--- arrangement, visible to all (docs/design.md Entities: GlobalAnnotation). Not
+-- arrangement, visible to all (CLAUDE.md Entities: GlobalAnnotation). Not
 -- in the soft-delete entity list, so no `deleted_at`. No unique constraint
 -- -- duplicates are the norm (multiple annotations per arrangement).
 CREATE TABLE global_annotation (
