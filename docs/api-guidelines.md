@@ -41,6 +41,10 @@ one `routes!(…)`; the module's router is merged into `v1::api_router`.
   admits anonymous callers says so with an empty `()` entry (or `security()`
   for no auth at all), and must be listed in `ANONYMOUS_OPERATIONS`
   (`only_allowlisted_operations_admit_anonymous_callers`).
+  Take the user through `BearerOrSession`: it also enforces the CSRF header on
+  cookie-authenticated writes (CLAUDE.md, CSRF), so a handler that reads the
+  session itself must check it the same way (`csrf::verify_header`, as
+  `POST /v1/tokens` does through its `SessionCsrf` guard).
 - **Success responses.** At least one `2xx`
   (`every_operation_has_at_least_one_2xx_response`). Lists return
   `body = inline(Page<T>)`; single-entity reads and writes declare the `ETag`

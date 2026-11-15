@@ -15,7 +15,7 @@ use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::app_password::generate as generate_app_password;
-use crate::auth::extractors::BearerOrSession;
+use crate::auth::extractors::{BearerOrSession, SessionCsrf};
 use crate::auth::password::{verify_dummy, verify_password};
 use crate::auth::ratelimit::login_rate_limit_layer;
 use crate::domain::audit_log::{audit, AuditContext};
@@ -150,7 +150,12 @@ struct MintTokenResponse {
 async fn mint_token(
     State(state): State<AppState>,
     session: tower_sessions::Session,
-    headers: axum::http::HeaderMap,
+    // Minting from the cookie is a cookie-authenticated write (issue #72):
+    // without the guard a cross-site page could mint a token for the victim.
+    // It sits before `ApiJson` so it runs before the body is parsed, and a
+    // logged-in session is always held to it, even when the body also
+    // carries credentials, so the rule does not depend on the body.
+    _csrf: SessionCsrf,
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<MintTokenRequest>,
 ) -> Result<Json<MintTokenResponse>, AppError> {
@@ -161,14 +166,7 @@ async fn mint_token(
         .ok()
         .flatten()
     {
-        // Minting from the cookie is a cookie-authenticated write (issue #72):
-        // without this a cross-site page could mint a token for the victim.
-        // A logged-in session always takes this path, even when the body also
-        // carries credentials, so the rule does not depend on the body.
-        Some(id) => {
-            crate::auth::csrf::verify_header(&session, &headers).await?;
-            Some(id)
-        }
+        Some(id) => Some(id),
         None => match (&body.username, &body.password) {
             (Some(username), Some(password)) => {
                 let found = user::find_by_username(&state.db, username)
@@ -466,5 +464,16 @@ pub fn router(state: AppState) -> OpenApiRouter<AppState> {
     let session_layer =
         crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
 
-    api_router(state.config.ratelimit_login_per_min).layer(session_layer)
+    // A cookie client that logged in without loading an `/admin` page has no
+    // CSRF cookie yet; this hands it one on any cookie-authenticated `/v1`
+    // response, so a GET before the first write is enough (issue #72). It
+    // sits inside the session layer, which it needs.
+    let csrf_cookie_layer = axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::csrf::v1_csrf_cookie_middleware,
+    );
+
+    api_router(state.config.ratelimit_login_per_min)
+        .layer(csrf_cookie_layer)
+        .layer(session_layer)
 }
