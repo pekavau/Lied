@@ -697,6 +697,24 @@ directory too.
   - The same files are reachable under `/orgs/<org>/arrangements/...` with the same per-role filtering; the collections subtree is the "what's in this concert, in order" view, not a separate permission domain.
 - **PROPFIND scope at the arrangements root.** A `musician` (or guest/substitute) listing `/orgs/<org>/arrangements/` sees **only arrangements where they hold at least one `PartAssignment`** — unassigned arrangements are simply absent, not shown as empty/403 placeholders. Staff roles (`owner`/`archivist`/`conductor`) see all. Rationale: showing every title with locked subdirs would leak the org's full repertoire and naming to guests and clutter a mounted tablet view with hundreds of inaccessible folders; discoverability of "what the org owns" belongs in the admin UI, not the filesystem view. Consistent with the collections-subtree filtering above.
 - `/users/<user>/library/` is private to that user, not bound to any org.
+- **MOVE, COPY and DELETE per tree (#26).**
+
+  | | Private library | Personal annotations | Org tree (score, voices, files) |
+  |---|---|---|---|
+  | MOVE / rename | files and directories | a file, within its own directory (audited) | **403** |
+  | COPY | files and directories | **403** | **403** |
+  | DELETE of a directory | empty, or with its contents (default `Depth: infinity`); `Depth: 0` on a non-empty one is refused | **403** | **403** |
+
+  In the org tree a file is a `File` row whose name and format are its
+  identity, and a directory is an entity (arrangement, voice), so a rename or
+  copy there would have to create or move rows, not objects: it goes through
+  the console or `/v1`. These refusals happen **before** dav-server runs,
+  because dav-server deletes an existing MOVE/COPY destination, and a
+  directory's files, before it asks the filesystem whether the operation is
+  allowed; refused afterwards, a MOVE onto an existing part would already
+  have removed it. Clients that save through a temporary file and a MOVE
+  (Finder, LibreOffice) work in the library; in the org tree, save with a
+  direct PUT.
 
 ### Display clients (deferred)
 Musicians can use existing apps against the WebDAV interface:
@@ -1324,7 +1342,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 |---|---|---|---|
 | Max single file upload | `LIED_MAX_UPLOAD_BYTES` | 200 MB | Covers 99.9th-percentile orchestral PDFs; anything larger is almost always a mistake or needs splitting |
 | Max non-upload request body | `LIED_MAX_REQUEST_BYTES` | 256 KB | JSON / form bodies; prevents bomb attacks |
-| Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached. Counts live files per voice, and per arrangement for full-score files. A new upload or a restore into a full one is refused: `409` on `/v1` and in the console, `507 Insufficient Storage` over WebDAV. Replacing a file is exempt, and soft-deleted files do not count. |
+| Max files per voice | `LIED_MAX_FILES_PER_VOICE` | 50 | Sanity guardrail; never normally reached. Counts live files per voice, and per arrangement for full-score files. A new upload or a restore into a full one is refused: `409` on `/v1` and in the console, `507 Insufficient Storage` over WebDAV, where a new file is refused as the PUT opens, before its body is sent. Replacing a file is exempt, and soft-deleted files do not count. |
 | Max arrangements per org | `LIED_MAX_ARRANGEMENTS_PER_ORG` | unset (no limit) | Reserved for SaaS-mode quotas later |
 | Max list page size | `LIED_MAX_PAGE_SIZE` | 200 (default 50) | Offset/limit pagination ceiling (see HTTP & REST API conventions) |
 | Rate limit, authenticated | `LIED_RATELIMIT_AUTH_PER_MIN` | 120 req/min | HTMX UIs fire several requests per interaction |
@@ -1343,7 +1361,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 - **Org policy (DB row / `org_settings`, edited in the admin UI by `owner`).** Only genuine per-org *business policy* that is **not** a resource/abuse protection. In phase 1 this set is nearly empty; candidates as they arise: per-org storage quota (SaaS-mode, deferred), default difficulty scale, default tag vocabulary, display preferences. These live on the `Organization` row or a small settings table.
 - **Hybrid (deferred):** if an org ever needs to tune a Tier-1 limit, the env var sets the operator's **hard ceiling** and the org setting may only make it **stricter** — enforced value = `min(operator_cap, org_setting)`. An org admin can tighten its own limits, never loosen them. Phase 1 needs only the env vars; this pattern is noted so the boundary isn't violated later.
 
-**Uploads stream end-to-end.** axum's `extract::Multipart` reads the body as a stream; chunks flow straight to MinIO via the S3 `UploadPart` API. Server memory per upload is fixed at the chunk buffer size (a few MB), not file size. The same applies to downloads: aws-sdk-s3's `GetObject` returns a `ByteStream` piped directly into the axum response body, with HTTP `Range` requests honored so tablets can seek inside large PDFs.
+**Uploads stream end-to-end**, on `/v1`, the console and WebDAV alike (WebDAV since #26). Incoming bytes fill one 8 MiB part at a time, and each part goes to MinIO via the S3 `UploadPart` API as it fills (`storage::ObjectWriter`); a file smaller than one part is a single `PutObject`. Server memory per upload is that one part, not the file size; `LIED_MAX_UPLOAD_BYTES` is enforced while streaming, and a refused or abandoned upload aborts its multipart upload. Nothing is readable at the key until the upload completes, which is what lets every path write the `File` row first and take it back if the bytes never land: a new row is deleted, a replace restores the previous file (`file_service::undo_unstored_write`, shared by all three, #109). The same applies to downloads: aws-sdk-s3's `GetObject` returns a `ByteStream` piped into the response body (on `/v1`) or read chunk by chunk (WebDAV), with HTTP `Range` honored so tablets can seek inside large PDFs; a WebDAV seek re-requests the object from the new offset.
 
 ### Security baseline
 - **Rate limiting** is built in from day 1, with per-route and per-identity buckets configurable per deployment. Defaults (all env-overridable):
