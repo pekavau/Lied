@@ -517,8 +517,9 @@ pub async fn list_for_org(
               $11::uuid IS NULL
               OR EXISTS (
                   SELECT 1 FROM voice v
+                  JOIN voice_instrument vi ON vi.voice_id = v.id
                   WHERE v.arrangement_id = a.id
-                    AND v.instrument_id = $11
+                    AND vi.instrument_id = $11
                     AND v.deleted_at IS NULL
               )
           )

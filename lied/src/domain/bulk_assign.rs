@@ -17,11 +17,13 @@
 //! If the collection changed in between (a piece or voice removed), the whole
 //! write is refused with [`BulkAssignError::Stale`] and nothing is assigned.
 //!
-//! **What "the same part" means.** A voice matches when it has the requested
-//! `instrument_id` and the same `part_number` — including both being `NULL`,
+//! **What "the same part" means.** A voice matches when its **primary**
+//! instrument (the first of its instruments, #57) is the requested one and it
+//! has the same `part_number` — including both being `NULL`,
 //! which is how unnumbered parts (Timpani, Harp) are matched. Two matching
 //! voices in one piece is ambiguous and is reported rather than guessed at:
-//! one person cannot play both.
+//! one person cannot play both. A doubling part ("Flute 2 / Piccolo") is still
+//! "Flute 2": the piccolo it also plays does not make it the piccolo part.
 //!
 //! **Conflicts are reported, never blocking** (the coverage rules): if the
 //! player already holds a different voice of a piece, the plan says so next to
@@ -167,7 +169,9 @@ pub async fn plan(
         LEFT JOIN voice v
           ON v.arrangement_id = a.id
          AND v.deleted_at IS NULL
-         AND v.instrument_id = $2
+         AND EXISTS (
+               SELECT 1 FROM voice_instrument vi
+               WHERE vi.voice_id = v.id AND vi.position = 1 AND vi.instrument_id = $2)
         WHERE ci.collection_id = $1
           AND ci.deleted_at IS NULL
           AND c.deleted_at IS NULL
@@ -409,7 +413,9 @@ pub async fn apply(
           ON v.id = p.voice_id
          AND v.arrangement_id = a.id
          AND v.deleted_at IS NULL
-         AND v.instrument_id = $4
+         AND EXISTS (
+               SELECT 1 FROM voice_instrument vi
+               WHERE vi.voice_id = v.id AND vi.position = 1 AND vi.instrument_id = $4)
          AND v.part_number IS NOT DISTINCT FROM $5
         ORDER BY ci.id, v.id
         FOR SHARE OF ci, v
@@ -528,7 +534,9 @@ pub async fn parts_in_collection(
         JOIN collection c ON c.id = ci.collection_id AND c.deleted_at IS NULL
         JOIN arrangement a ON a.id = ci.arrangement_id AND a.deleted_at IS NULL
         JOIN voice v ON v.arrangement_id = a.id AND v.deleted_at IS NULL
-        JOIN instrument i ON i.id = v.instrument_id
+        -- A part is named by its primary instrument (see the module docs).
+        JOIN voice_instrument vi ON vi.voice_id = v.id AND vi.position = 1
+        JOIN instrument i ON i.id = vi.instrument_id
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL
         GROUP BY i.id, i.display_name, v.part_number
         ORDER BY i.display_name ASC, v.part_number ASC NULLS LAST

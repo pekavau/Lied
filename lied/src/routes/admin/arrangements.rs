@@ -1208,12 +1208,44 @@ const FAMILY_ORDER: &[&str] = &[
     "other",
 ];
 
-#[derive(Deserialize)]
+/// The voice form, read from ordered pairs: the "also plays" `<select
+/// multiple>` submits its key once per selected instrument, which a derived
+/// form struct would collapse.
 struct VoiceForm {
     name: Option<String>,
     instrument_id: Option<String>,
+    also_instrument_ids: Vec<String>,
     part_number: Option<String>,
     expected_version: Option<String>,
+}
+
+impl VoiceForm {
+    fn from_pairs(pairs: &[(String, String)]) -> Self {
+        let one = |key: &str| super::members::field(pairs, key).map(str::to_string);
+        VoiceForm {
+            name: one("name"),
+            instrument_id: one("instrument_id"),
+            also_instrument_ids: super::members::multi(pairs, "also_instrument_ids"),
+            part_number: one("part_number"),
+            expected_version: one("expected_version"),
+        }
+    }
+
+    /// The voice's instruments, primary first (#57): the required primary
+    /// select, then the "also plays" choices in the order submitted (the
+    /// instrument list's order). An extra that repeats the primary is
+    /// dropped rather than refused: picking it in both places means the same.
+    fn instrument_ids(&self) -> Option<Vec<Uuid>> {
+        let primary = Uuid::parse_str(blank_to_none(self.instrument_id.clone())?.trim()).ok()?;
+        let mut ids = vec![primary];
+        for raw in &self.also_instrument_ids {
+            let id = Uuid::parse_str(raw.trim()).ok()?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Some(ids)
+    }
 }
 
 /// Parse the optional part-number field: blank is "no number" (Timpani, Harp),
@@ -1276,6 +1308,29 @@ pub(crate) fn ordered_families(instruments: &[instrument::Instrument]) -> Vec<&s
             .unwrap_or(FAMILY_ORDER.len())
     });
     families
+}
+
+/// A voice's instruments as one label, primary first: "Flute / Piccolo".
+pub(crate) fn instrument_names(instruments: &[instrument::Instrument], ids: &[Uuid]) -> String {
+    ids.iter()
+        .map(|id| instrument_name(instruments, *id))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// The "also plays" multi-select: the instruments a doubling or percussion
+/// part adds to its primary.
+fn also_plays_picker(instruments: &[instrument::Instrument], selected: &[Uuid]) -> Markup {
+    html! {
+        label {
+            "Also plays "
+            (super::members::instrument_multiselect("also_instrument_ids", instruments, selected))
+        }
+        small class="muted" {
+            " For a doubling (\"Flute 2 / Piccolo\") or a percussion part read by one player. "
+            "The instrument above stays the primary: part matching across a collection uses it."
+        }
+    }
 }
 
 /// A `<select name="instrument_id">` with the vocabulary grouped into
@@ -1373,7 +1428,7 @@ async fn voices_page(
                 @for v in &voices {
                     tr {
                         td { (v.name) }
-                        td { (instrument_name(&instruments, v.instrument_id)) }
+                        td { (instrument_names(&instruments, &v.instrument_ids)) }
                         td {
                             @match v.part_number {
                                 Some(n) => (n),
@@ -1397,6 +1452,7 @@ async fn voices_page(
                 (layout::csrf_field(&token))
                 label { "Name " input type="text" name="name" required; }
                 label { "Instrument " (instrument_picker(&instruments, None)) }
+                (also_plays_picker(&instruments, &[]))
                 (part_number_input(None, true))
                 button type="submit" { "Add voice" }
             }
@@ -1435,8 +1491,9 @@ async fn create_voice(
     auth: Option<AuthSession>,
     Path((org_id, arr_id)): Path<(Uuid, Uuid)>,
     RequestId(request_id): RequestId,
-    Form(form): Form<VoiceForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let form = VoiceForm::from_pairs(&pairs);
     let ctx = match console::enter(&state, auth, org_id).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
@@ -1452,6 +1509,7 @@ async fn create_voice(
     ) {
         return response;
     }
+    let instrument_ids = form.instrument_ids();
     let Some(name) = blank_to_none(form.name) else {
         return error_page(
             &ctx,
@@ -1459,15 +1517,12 @@ async fn create_voice(
             "Voice name must not be empty.",
         );
     };
-    let instrument_id = match blank_to_none(form.instrument_id).map(|s| Uuid::parse_str(&s)) {
-        Some(Ok(id)) => id,
-        _ => {
-            return error_page(
-                &ctx,
-                StatusCode::BAD_REQUEST,
-                "Please choose an instrument.",
-            )
-        }
+    let Some(instrument_ids) = instrument_ids else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Please choose an instrument.",
+        );
     };
     let Ok(part_number) = parse_part_number(form.part_number) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP);
@@ -1479,7 +1534,7 @@ async fn create_voice(
         arr_id,
         &name,
         &slug,
-        instrument_id,
+        &instrument_ids,
         match part_number {
             None => voice::NewPartNumber::FromName,
             Some(n) => voice::NewPartNumber::Set(Some(n)),
@@ -1498,7 +1553,7 @@ async fn create_voice(
                 serde_json::json!({
                     "name": created.name,
                     "slug": created.slug,
-                    "instrumentId": created.instrument_id,
+                    "instrumentIds": created.instrument_ids,
                     "partNumber": created.part_number,
                 }),
             )
@@ -1513,6 +1568,13 @@ async fn create_voice(
             StatusCode::CONFLICT,
             "A voice with a slug derived from this name already exists in this arrangement.",
         ),
+        Err(voice::VoiceError::NoInstrument | voice::VoiceError::DuplicateInstrument) => {
+            error_page(
+                &ctx,
+                StatusCode::BAD_REQUEST,
+                "Please choose an instrument.",
+            )
+        }
         Err(voice::VoiceError::UnknownInstrument) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,
@@ -1579,7 +1641,8 @@ async fn voice_detail_page(
                 (layout::csrf_field(&token))
                 input type="hidden" name="expected_version" value=(version);
                 label { "Name " input type="text" name="name" value=(v.name) required; }
-                label { "Instrument " (instrument_picker(&instruments, Some(v.instrument_id))) }
+                label { "Instrument " (instrument_picker(&instruments, Some(v.primary_instrument_id()))) }
+                (also_plays_picker(&instruments, v.instrument_ids.get(1..).unwrap_or_default()))
                 (part_number_input(v.part_number, false))
                 button type="submit" { "Save changes" }
             }
@@ -1588,7 +1651,7 @@ async fn voice_detail_page(
                 button type="submit" { "Delete voice" }
             }
         } @else {
-            p { "Instrument: " (instrument_name(&instruments, v.instrument_id)) }
+            p { "Instrument: " (instrument_names(&instruments, &v.instrument_ids)) }
             p {
                 "Part number: "
                 @match v.part_number {
@@ -1611,8 +1674,9 @@ async fn update_voice(
     auth: Option<AuthSession>,
     Path((org_id, arr_id, voice_id)): Path<(Uuid, Uuid, Uuid)>,
     RequestId(request_id): RequestId,
-    Form(form): Form<VoiceForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let form = VoiceForm::from_pairs(&pairs);
     let ctx = match console::enter(&state, auth, org_id).await {
         Ok(ctx) => ctx,
         Err(response) => return response,
@@ -1640,6 +1704,7 @@ async fn update_voice(
             &format!("/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"),
         );
     }
+    let instrument_ids = form.instrument_ids();
     let Some(name) = blank_to_none(form.name) else {
         return error_page(
             &ctx,
@@ -1647,15 +1712,12 @@ async fn update_voice(
             "Voice name must not be empty.",
         );
     };
-    let instrument_id = match blank_to_none(form.instrument_id).map(|s| Uuid::parse_str(&s)) {
-        Some(Ok(id)) => id,
-        _ => {
-            return error_page(
-                &ctx,
-                StatusCode::BAD_REQUEST,
-                "Please choose an instrument.",
-            )
-        }
+    let Some(instrument_ids) = instrument_ids else {
+        return error_page(
+            &ctx,
+            StatusCode::BAD_REQUEST,
+            "Please choose an instrument.",
+        );
     };
     let Ok(part_number) = parse_part_number(form.part_number) else {
         return error_page(&ctx, StatusCode::BAD_REQUEST, PART_NUMBER_HELP);
@@ -1665,7 +1727,7 @@ async fn update_voice(
         voice_id,
         Some(listing::version_of(current.updated_at)),
         &name,
-        instrument_id,
+        &instrument_ids,
         voice::PartNumberChange::Set(part_number),
     )
     .await
@@ -1680,12 +1742,12 @@ async fn update_voice(
                 serde_json::json!({
                     "before": {
                         "name": current.name,
-                        "instrumentId": current.instrument_id,
+                        "instrumentIds": current.instrument_ids,
                         "partNumber": current.part_number,
                     },
                     "after": {
                         "name": updated.name,
-                        "instrumentId": updated.instrument_id,
+                        "instrumentIds": updated.instrument_ids,
                         "partNumber": updated.part_number,
                     },
                 }),
@@ -1707,6 +1769,13 @@ async fn update_voice(
             ),
             _ => error_page(&ctx, StatusCode::NOT_FOUND, "Voice not found."),
         },
+        Err(voice::VoiceError::NoInstrument | voice::VoiceError::DuplicateInstrument) => {
+            error_page(
+                &ctx,
+                StatusCode::BAD_REQUEST,
+                "Please choose an instrument.",
+            )
+        }
         Err(voice::VoiceError::UnknownInstrument) => error_page(
             &ctx,
             StatusCode::BAD_REQUEST,

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO voice_instrument (voice_id, instrument_id, position)\n        SELECT $1, i.id, i.ord::smallint\n        FROM unnest($2::uuid[]) WITH ORDINALITY AS i(id, ord)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a6356b998ff1904159dcec2adec08074564eb94e5c13cde7d853a25d15104d2"
+}

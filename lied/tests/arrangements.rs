@@ -634,7 +634,7 @@ async fn archivist_adds_a_voice_with_an_instrument_and_lists_it() {
         &token,
     )
     .body(axum::body::Body::from(
-        serde_json::json!({ "name": "Flute 1", "instrumentId": instrument_id }).to_string(),
+        serde_json::json!({ "name": "Flute 1", "instrumentIds": [instrument_id] }).to_string(),
     ))
     .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
@@ -673,7 +673,7 @@ async fn creating_a_voice_with_an_unknown_instrument_returns_400() {
         &token,
     )
     .body(axum::body::Body::from(
-        serde_json::json!({ "name": "Ghost", "instrumentId": Uuid::now_v7() }).to_string(),
+        serde_json::json!({ "name": "Ghost", "instrumentIds": [Uuid::now_v7()] }).to_string(),
     ))
     .unwrap();
     let response = app.oneshot(request).await.unwrap();
@@ -827,7 +827,7 @@ async fn a_voice_is_not_reachable_or_modifiable_through_another_orgs_path() {
         &token_a,
     )
     .body(axum::body::Body::from(
-        serde_json::json!({ "name": "Oboe", "instrumentId": instrument_id }).to_string(),
+        serde_json::json!({ "name": "Oboe", "instrumentIds": [instrument_id] }).to_string(),
     ))
     .unwrap();
     let v = app.clone().oneshot(v).await.unwrap();
@@ -850,7 +850,7 @@ async fn a_voice_is_not_reachable_or_modifiable_through_another_orgs_path() {
         ("GET", None),
         (
             "PATCH",
-            Some(serde_json::json!({ "name": "Hijacked", "instrumentId": instrument_id })),
+            Some(serde_json::json!({ "name": "Hijacked", "instrumentIds": [instrument_id] })),
         ),
         ("DELETE", None),
     ] {
@@ -888,7 +888,7 @@ async fn voices_can_be_sorted_by_created_at() {
             &token,
         )
         .body(axum::body::Body::from(
-            serde_json::json!({ "name": name, "instrumentId": instrument_id }).to_string(),
+            serde_json::json!({ "name": name, "instrumentIds": [instrument_id] }).to_string(),
         ))
         .unwrap();
         assert_eq!(
@@ -1129,7 +1129,7 @@ async fn voice_patch_changes_only_the_fields_it_sends() {
         &token,
     )
     .body(axum::body::Body::from(
-        serde_json::json!({ "name": "Flute 2", "instrumentId": instruments[0] }).to_string(),
+        serde_json::json!({ "name": "Flute 2", "instrumentIds": [instruments[0]] }).to_string(),
     ))
     .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
@@ -1145,12 +1145,12 @@ async fn voice_patch_changes_only_the_fields_it_sends() {
         &app,
         &token,
         &uri,
-        serde_json::json!({ "instrumentId": instruments[1] }),
+        serde_json::json!({ "instrumentIds": [instruments[1]] }),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(body["name"], "Flute 2");
-    assert_eq!(body["instrumentId"], instruments[1].to_string());
+    assert_eq!(body["instrumentIds"], serde_json::json!([instruments[1]]));
     assert_eq!(body["partNumber"], 2);
 
     // Name only: the instrument stays, and the part number is not re-guessed.
@@ -1158,7 +1158,7 @@ async fn voice_patch_changes_only_the_fields_it_sends() {
         patch_json(&app, &token, &uri, serde_json::json!({ "name": "Piccolo" })).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(body["name"], "Piccolo");
-    assert_eq!(body["instrumentId"], instruments[1].to_string());
+    assert_eq!(body["instrumentIds"], serde_json::json!([instruments[1]]));
     assert_eq!(body["partNumber"], 2);
 }
 
@@ -1538,7 +1538,7 @@ async fn every_guarded_write_refuses_a_stale_version() {
         arr.id,
         "Flute 1",
         "flute-1",
-        instrument,
+        &[instrument],
         voice::NewPartNumber::FromName,
         None,
     )
@@ -1549,7 +1549,7 @@ async fn every_guarded_write_refuses_a_stale_version() {
         v.id,
         stale(v.updated_at),
         "X",
-        instrument,
+        &[instrument],
         Change::Keep
     )
     .await
@@ -1560,7 +1560,7 @@ async fn every_guarded_write_refuses_a_stale_version() {
         v.id,
         Some(version(v.updated_at)),
         "Flute I",
-        instrument,
+        &[instrument],
         Change::Keep,
     )
     .await
@@ -2072,4 +2072,98 @@ async fn tag_undelete_restores_only_through_the_owning_org() {
     // A live tag has nothing to restore.
     let response = app.oneshot(undelete(org_a, &token_a)).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+/// #57: a voice carries several instruments, in order, primary first — a
+/// doubling ("Flute 2 / Piccolo") or a percussion part read by one player.
+/// The list is never empty and never names an instrument twice.
+#[tokio::test]
+async fn a_voice_carries_several_instruments_primary_first() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+    let instruments: Vec<Uuid> =
+        sqlx::query_scalar!(r#"SELECT id FROM instrument ORDER BY key LIMIT 3"#)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let arr = create_arrangement_json(&app, &token, org_id, "Bolero").await;
+    let arr_id = arr["id"].as_str().unwrap();
+    let voices_uri = format!("/v1/orgs/{org_id}/arrangements/{arr_id}/voices");
+    let post = |body: serde_json::Value| {
+        let app = app.clone();
+        let request = bearer_request("POST", &voices_uri, &token)
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        async move {
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            (status, body_json(response).await)
+        }
+    };
+    let get = |uri: String| {
+        let app = app.clone();
+        let request = bearer_request("GET", &uri, &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        async move { body_json(app.oneshot(request).await.unwrap()).await }
+    };
+
+    // Order is kept as sent, not sorted: the second id is the primary here.
+    let doubled = [instruments[1], instruments[0]];
+    let (status, created) = post(serde_json::json!({
+        "name": "Flute 2 / Piccolo", "instrumentIds": doubled
+    }))
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");
+    assert_eq!(created["instrumentIds"], serde_json::json!(doubled));
+    let uri = format!("{voices_uri}/{}", created["id"].as_str().unwrap());
+    assert_eq!(
+        get(uri.clone()).await["instrumentIds"],
+        serde_json::json!(doubled)
+    );
+
+    // Refused lists name the field.
+    for bad in [
+        serde_json::json!([]),
+        serde_json::json!([instruments[0], instruments[0]]),
+        serde_json::json!([instruments[0], Uuid::now_v7()]),
+    ] {
+        let (status, body) = post(serde_json::json!({ "name": "Bad", "instrumentIds": bad })).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert!(
+            body["errors"].get("instrumentIds").is_some(),
+            "{bad}: {body}"
+        );
+    }
+
+    // PATCH without the list keeps it; with it, replaces the whole list.
+    let (status, _, body) =
+        patch_json(&app, &token, &uri, serde_json::json!({ "name": "Flute 2" })).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["instrumentIds"], serde_json::json!(doubled));
+    let three = [instruments[2], instruments[0], instruments[1]];
+    let (status, _, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "instrumentIds": three }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(body["instrumentIds"], serde_json::json!(three));
+    let (status, _, body) = patch_json(
+        &app,
+        &token,
+        &uri,
+        serde_json::json!({ "instrumentIds": [] }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        get(uri.clone()).await["instrumentIds"],
+        serde_json::json!(three),
+        "a refused PATCH leaves the list alone"
+    );
 }

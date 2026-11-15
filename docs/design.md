@@ -609,7 +609,7 @@ request):
 **Facets** are ordinary allowlisted filters (see *Sort and filter*):
 `status`, `difficultyMin` / `difficultyMax` (the ABRSM `difficulty` column),
 `durationMinSeconds` / `durationMaxSeconds`, `tag` (comma-separated ids; an
-arrangement must carry **all** of them) and `instrumentId` (the arrangement has a live voice for
+arrangement must carry **all** of them) and `instrumentId` (the arrangement has a live voice that carries that instrument, at any position, for
 that instrument). Ranges are separate min/max fields rather than a `3..6`
 syntax, so each is its own allowlisted name and its own OpenAPI parameter.
 
@@ -767,7 +767,8 @@ erDiagram
     Organization ||--o{ Collection : curates
     Work |o--o{ Arrangement : "edition of"
     Arrangement ||--o{ Voice : "has parts"
-    Instrument ||--o{ Voice : "played on"
+    Voice ||--|{ VoiceInstrument : "played on"
+    Instrument ||--o{ VoiceInstrument : "in"
     Arrangement ||--o{ File : "full-score files"
     Voice ||--o{ File : "part files"
     File |o--o{ File : "derived from"
@@ -857,10 +858,28 @@ One instrumental part of an arrangement: Flute 1, Violin II, Trumpet in B♭.
 | `arrangement_id` | FK | |
 | `name` | text | |
 | `slug` | text | Immutable, unique per arrangement. |
-| `instrument_id` | FK | |
 | `part_number` | smallint ≥ 1, nullable | The `1` of "Trumpet in B♭ 1"; null for parts with no number. See *Part identity and bulk assignment*. |
 
-Audit fields, soft-deletable.
+Audit fields, soft-deletable. Its instruments are the `VoiceInstrument` rows
+below; on `/v1` a voice carries them as `instrumentIds`, in order.
+
+#### VoiceInstrument
+
+The instruments a voice is read on (#57), in order: one for most parts, two
+or more for a doubling ("Flute 2 / Piccolo", "Trumpet 1 (doubling
+flugelhorn)") or a percussion part read by one player ("Perc. 1: snare, bass
+drum, cymbals").
+
+| Field | Type | Notes |
+|---|---|---|
+| `voice_id`, `instrument_id` | FK | Unique together: a voice names an instrument once. |
+| `position` | smallint ≥ 1 | Order within the voice, unique per voice. **Position 1 is the primary**, which display, sorting and part identity use. |
+
+No audit fields and no soft delete: the rows are part of their voice, and a
+voice write replaces its whole list. **A voice has at least one instrument**;
+the schema cannot say so across two tables, so `domain::voice` checks it, in
+the same transaction as the voice write (an empty, repeated or unknown
+instrument is a 400 naming `instrumentIds`).
 
 #### File
 
@@ -893,7 +912,7 @@ An orchestra or ensemble.
 Audit fields. No `deleted_at`: deleting an org is an admin-only **hard**
 delete, because the cascade is large and undelete would be messy. It runs in
 one transaction, in FK-safe order: part assignments → collection items →
-collection sections → collections → arrangement tags → tags → global annotations → files → voices →
+collection sections → collections → arrangement tags → tags → global annotations → files → voice instruments → voices →
 arrangements → memberships → the organization. **Not deleted:** works
 (shared with other orgs) and audit-log rows (kept with their `org_id`, so the
 deletion itself stays auditable). Removing the files' stored objects is
@@ -1180,7 +1199,7 @@ Attaching and detaching are real inserts and deletes.
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
   **Permissions:** *creating* a Work is open to any authenticated user with at least one Membership in any org (an archivist adding a new piece's abstract entry); *editing* a Work is restricted to its original creator (`created_by`) or any `is_system_admin`. This stops "alice fixes a typo and rewrites a shared title for everyone"; for legitimate edits in someone else's Work, escalate to a system admin.
 - **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
-- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `Voice.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (`Voice.instrument_id ∈ Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument *(not yet built)* requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
+- **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `VoiceInstrument.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (a voice's instruments ∩ `Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument *(not yet built)* requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
 
 #### Lifecycle, existence, audit
 - **DB is source of truth for existence; MinIO versioning is content history only.** Setting `deleted_at` hides a row from REST, WebDAV, and search; the MinIO object remains. Undelete clears `deleted_at` — no MinIO operation. Hard delete (admin-only) *(not yet built)* removes both the DB row and all MinIO object versions. MinIO version history is reachable through REST admin endpoints *(not yet built)* but never surfaced via WebDAV. File undelete is *(console only)*; the other soft-deleted entities have a `/v1` `…/undelete`.
@@ -1202,6 +1221,7 @@ Attaching and detaching are real inserts and deletes.
   | `Instrument` | `key` |
   | `Arrangement` | `(organization_id, slug)` |
   | `Voice` | `(arrangement_id, slug)` |
+  | `VoiceInstrument` | `(voice_id, instrument_id)` (primary key); `(voice_id, position)` |
   | `File` | `(arrangement_id, voice_id, name, format)` for voice files; `(arrangement_id, name, format) WHERE voice_id IS NULL` for full-score files (Postgres treats NULL as distinct, so a partial index covers the score case) |
   | `Membership` | `(user_id, organization_id)` |
   | `Collection` | `(organization_id, slug)` |
@@ -1229,8 +1249,8 @@ Attaching and detaching are real inserts and deletes.
 
 #### Annotations & distribution state
 - **Distribution (UC-12) and coverage (UC-13).** No separate distribution table; `PartAssignment.notified_at` and `PartAssignment.acknowledged_at` (both nullable timestamps) carry the state. Coverage check: a part is **covered** once at least one musician holds it (the model has no desk counts, so "enough players" is not a question it can answer); acknowledgement is reported as a **ratio of players**, not a per-part flag, because a section where two of three have replied is neither rehearsed nor unrehearsed. Coverage only ever reports — no operation refuses because a part is unassigned.
-  One report, two views, differing only in which voices count as *required*: the **full-program** view (every live voice of each item) for staff, and the **section** view (voices whose `instrument_id` is in the principal's `principal_instrument_ids`) — the only view a principal may read, scoped to their own instruments. It is a query over existing tables; nothing is stored.
-- **Part identity and bulk assignment (#55).** "The same part across pieces" is the pair `(instrument_id, part_number)` of a voice; a null part number matches null (Timpani, Harp).
+  One report, two views, differing only in which voices count as *required*: the **full-program** view (every live voice of each item) for staff, and the **section** view (voices with **any** instrument in the principal's `principal_instrument_ids`, so a doubling "Flute 2 / Piccolo" counts for the flute section and for a piccolo principal) — the only view a principal may read, scoped to their own instruments. It is a query over existing tables; nothing is stored.
+- **Part identity and bulk assignment (#55).** "The same part across pieces" is the pair (primary instrument, `part_number`) of a voice; a null part number matches null (Timpani, Harp). Only the **primary** counts (#57): "Flute 2 / Piccolo" is the second flute part that also plays piccolo, so assigning the 2nd flute across a collection takes it and assigning a piccolo part does not. Matching on any instrument would hand the doubling to whichever instrument was asked for, and the plan could no longer say which part a player holds.
   - **Part numbers are guessed conservatively** from the voice name: only when it carries exactly one ordinal (a trailing arabic or roman number, a leading "1st" or "2."), and never for a combination ("Horn 1 & 3", "Violin I und II", "Flute 2/Piccolo"). **Why:** a wrong number hands a player the wrong part; a missing one shows up in the preview, where a person fixes it.
   - The same guess backfilled existing voices and fills in a **new voice created without a part number**, so later voices number like earlier ones.
   - **On the wire** the field is tri-state: on create, omitted = guess from the name and `null` = none; on PATCH, omitted = keep (never re-guessed from a new name) and `null` = clear, per the general PATCH rule.
@@ -1239,7 +1259,6 @@ Attaching and detaching are real inserts and deletes.
   - **The confirm writes exactly what was previewed**: the `(item, voice)` pairs for the requested part, all or nothing, with their audit rows in the same transaction. It refuses with 409 if any pair is gone or *is no longer that part* (renumbered, re-instrumented), and names the player by id, not username.
   - Re-running after adding pieces extends the assignment, since pairs already held are only reported.
   - **Enforced by:** the SQL function `lied_guess_part_number` (migration 0024), used both for the backfill and as the insert default.
-  - **Deferred:** a voice carrying several instruments — percussion grab-bags, doublings (#57).
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
   **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
   **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
@@ -1261,7 +1280,7 @@ The columns the archive is searched by; how they are searched is *Archive search
   - `Arrangement.difficulty` (smallint 1–8, nullable) — **ABRSM scale** is the canonical numeric for filters and ranges.
   - `Arrangement.difficulty_ratings` (jsonb, nullable) — optional map of scale → grade for cross-referencing, e.g. `{"abrsm": "6", "aba": "3.5", "henle": "5", "rcm": "8"}`. The `abrsm` key, if present, must agree with `difficulty` (rounded). UI suggests known scales (ABRSM, ABA, Henle, RCM, Trinity) via autocomplete.
   - `Arrangement.difficulty_notes` (text, nullable) — prose caveats (e.g. "grade 5 except the cadenza"); expected to be rarely used.
-  - Instrumentation filter joins through `Voice.instrument_id`; no new field.
+  - Instrumentation filter joins through `VoiceInstrument` (any position); no new field. The full-text index holds no instrument data, so it needs no trigger on that table.
 
 #### Authorization
 - **Membership roles.** `Membership.role` has four values: `owner`, `archivist`, `conductor`, `musician` (stored as `text` + `CHECK` per the enum convention in [CLAUDE.md](../CLAUDE.md), Implementation conventions). Every org has at least one `owner`; demoting the last owner is rejected. The principal sub-role (`Membership.is_principal`) is **orthogonal to role** — it adds the section-coverage view without changing other permissions. Guests/substitutes don't need a Membership; `PartAssignment` implicitly grants the read access they need. The per-role capability breakdown is the Permission matrix (under Architecture, after Auth & access).

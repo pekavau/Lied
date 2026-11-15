@@ -261,7 +261,12 @@ async fn file_unique_indexes_distinguish_voice_files_from_score_files() {
 
     let voice_id = Uuid::now_v7();
     sqlx::query!(
-        r#"INSERT INTO voice (id, arrangement_id, name, slug, instrument_id) VALUES ($1, $2, 'Flute 1', 'flute-1', $3)"#,
+        r#"WITH v AS (
+               INSERT INTO voice (id, arrangement_id, name, slug)
+               VALUES ($1, $2, 'Flute 1', 'flute-1') RETURNING id
+           )
+           INSERT INTO voice_instrument (voice_id, instrument_id, position)
+           SELECT id, $3, 1 FROM v"#,
         voice_id,
         arr_id,
         instrument_id
@@ -619,4 +624,99 @@ fn applied_migrations_are_never_edited() {
         "new migration(s) not pinned; append to lied/tests/migration_checksums.txt:\n{}",
         missing.join("\n")
     );
+}
+
+/// #57: migration 0028 moves each voice's single instrument into
+/// `voice_instrument` at position 1 (the primary), including voices that are
+/// soft-deleted, and drops `voice.instrument_id`.
+#[tokio::test]
+async fn voice_instrument_migration_keeps_each_voices_instrument_as_its_primary() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .expect("connect");
+
+    let mut before = sqlx::migrate!("../migrations");
+    before.migrations = before
+        .migrations
+        .iter()
+        .filter(|m| m.version < 28)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    before.run(&pool).await.expect("migrate to 27");
+
+    let org = Uuid::now_v7();
+    sqlx::query("INSERT INTO organization (id, name, slug) VALUES ($1, 'O', 'o')")
+        .bind(org)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let arr = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO arrangement (id, organization_id, title, slug, status) VALUES ($1, $2, 'A', 'a', 'active')",
+    )
+    .bind(arr)
+    .bind(org)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let instruments: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM instrument ORDER BY key LIMIT 2")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut voices = Vec::new();
+    for (n, (instrument, removed)) in [(instruments[0], false), (instruments[1], true)]
+        .into_iter()
+        .enumerate()
+    {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO voice (id, arrangement_id, name, slug, instrument_id, deleted_at)
+             VALUES ($1, $2, $3, $3, $4, CASE WHEN $5 THEN now() END)",
+        )
+        .bind(id)
+        .bind(arr)
+        .bind(format!("v{n}"))
+        .bind(instrument)
+        .bind(removed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        voices.push((id, instrument));
+    }
+
+    sqlx::migrate!("../migrations")
+        .run(&pool)
+        .await
+        .expect("migrate to the end");
+
+    for (voice, instrument) in voices {
+        let rows: Vec<(Uuid, i16)> = sqlx::query_as(
+            "SELECT instrument_id, position FROM voice_instrument WHERE voice_id = $1",
+        )
+        .bind(voice)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![(instrument, 1)], "voice {voice}");
+    }
+    let column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'voice' AND column_name = 'instrument_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!column, "voice.instrument_id is dropped");
 }

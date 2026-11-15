@@ -64,7 +64,8 @@ pub struct Player {
 pub struct VoiceCoverage {
     pub voice_id: Uuid,
     pub voice_name: String,
-    pub instrument_id: Uuid,
+    /// The voice's instruments, primary first (#57).
+    pub instrument_ids: Vec<Uuid>,
     pub players: Vec<Player>,
 }
 
@@ -175,7 +176,7 @@ struct Grouper;
 pub(crate) struct VoiceRow {
     pub voice_id: Option<Uuid>,
     pub voice_name: Option<String>,
-    pub instrument_id: Option<Uuid>,
+    pub instrument_ids: Option<Vec<Uuid>>,
     pub assignment_id: Option<Uuid>,
     pub user_id: Option<Uuid>,
     pub username: Option<String>,
@@ -191,7 +192,7 @@ impl Grouper {
         let VoiceRow {
             voice_id,
             voice_name,
-            instrument_id,
+            instrument_ids,
             assignment_id,
             user_id,
             username,
@@ -201,8 +202,8 @@ impl Grouper {
         } = row;
         // An all-NULL voice marks a piece with nothing required (no live
         // voices, or a removed arrangement) — not a voice.
-        let (Some(voice_id), Some(voice_name), Some(instrument_id)) =
-            (voice_id, voice_name, instrument_id)
+        let (Some(voice_id), Some(voice_name), Some(instrument_ids)) =
+            (voice_id, voice_name, instrument_ids)
         else {
             return;
         };
@@ -210,7 +211,7 @@ impl Grouper {
             item.voices.push(VoiceCoverage {
                 voice_id,
                 voice_name,
-                instrument_id,
+                instrument_ids,
                 players: Vec::new(),
             });
         }
@@ -387,7 +388,10 @@ async fn query_collection(
             (a.deleted_at IS NOT NULL) as "arrangement_removed!",
             v.id as "voice_id?",
             v.name as "voice_name?",
-            v.instrument_id as "instrument_id?",
+            CASE WHEN v.id IS NULL THEN NULL ELSE ARRAY(
+                SELECT vi.instrument_id FROM voice_instrument vi
+                WHERE vi.voice_id = v.id ORDER BY vi.position
+            ) END as "instrument_ids?: Vec<Uuid>",
             pa.id as "assignment_id?",
             pa.user_id as "assignee_user_id?",
             u.username as "assignee_username?",
@@ -403,7 +407,12 @@ async fn query_collection(
         LEFT JOIN voice v
           ON v.arrangement_id = a.id
          AND v.deleted_at IS NULL
-         AND ($2::uuid[] IS NULL OR v.instrument_id = ANY($2))
+         -- The section view: a voice belongs to a principal's section when
+         -- any of its instruments does, so a doubling part ("Flute 2 /
+         -- Piccolo") counts for both sections (#57).
+         AND ($2::uuid[] IS NULL OR EXISTS (
+               SELECT 1 FROM voice_instrument vi
+               WHERE vi.voice_id = v.id AND vi.instrument_id = ANY($2)))
         LEFT JOIN part_assignment pa
           ON pa.collection_item_id = ci.id
          AND pa.voice_id = v.id
@@ -446,7 +455,7 @@ async fn query_collection(
             VoiceRow {
                 voice_id: row.voice_id,
                 voice_name: row.voice_name,
-                instrument_id: row.instrument_id,
+                instrument_ids: row.instrument_ids,
                 assignment_id: row.assignment_id,
                 user_id: row.assignee_user_id,
                 username: row.assignee_username,
@@ -495,7 +504,10 @@ pub async fn for_org(
             (a.deleted_at IS NOT NULL) as "arrangement_removed?",
             v.id as "voice_id?",
             v.name as "voice_name?",
-            v.instrument_id as "instrument_id?",
+            CASE WHEN v.id IS NULL THEN NULL ELSE ARRAY(
+                SELECT vi.instrument_id FROM voice_instrument vi
+                WHERE vi.voice_id = v.id ORDER BY vi.position
+            ) END as "instrument_ids?: Vec<Uuid>",
             pa.id as "assignment_id?",
             pa.user_id as "assignee_user_id?",
             u.username as "assignee_username?",
@@ -509,7 +521,12 @@ pub async fn for_org(
         LEFT JOIN voice v
           ON v.arrangement_id = a.id
          AND v.deleted_at IS NULL
-         AND ($2::uuid[] IS NULL OR v.instrument_id = ANY($2))
+         -- The section view: a voice belongs to a principal's section when
+         -- any of its instruments does, so a doubling part ("Flute 2 /
+         -- Piccolo") counts for both sections (#57).
+         AND ($2::uuid[] IS NULL OR EXISTS (
+               SELECT 1 FROM voice_instrument vi
+               WHERE vi.voice_id = v.id AND vi.instrument_id = ANY($2)))
         LEFT JOIN part_assignment pa
           ON pa.collection_item_id = ci.id AND pa.voice_id = v.id
         LEFT JOIN "user" u ON u.id = pa.user_id
@@ -569,7 +586,7 @@ pub async fn for_org(
             VoiceRow {
                 voice_id: row.voice_id,
                 voice_name: row.voice_name,
-                instrument_id: row.instrument_id,
+                instrument_ids: row.instrument_ids,
                 assignment_id: row.assignment_id,
                 user_id: row.assignee_user_id,
                 username: row.assignee_username,

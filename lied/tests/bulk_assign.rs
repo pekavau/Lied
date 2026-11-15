@@ -311,7 +311,7 @@ async fn voice(
         arr_id,
         name,
         &lied::domain::voice::slugify(name),
-        instrument_id,
+        &[instrument_id],
         lied::domain::voice::NewPartNumber::Set(part_number),
         None,
     )
@@ -539,7 +539,7 @@ async fn a_voice_carries_a_part_number_over_v1() {
         &ctx,
         &tok,
         &url,
-        serde_json::json!({ "name": "Trumpet in Bb 2", "instrumentId": trumpet, "partNumber": 2 }),
+        serde_json::json!({ "name": "Trumpet in Bb 2", "instrumentIds": [trumpet], "partNumber": 2 }),
     )
     .await;
     assert_eq!(created["partNumber"], 2);
@@ -549,7 +549,7 @@ async fn a_voice_carries_a_part_number_over_v1() {
         &ctx,
         &tok,
         &url,
-        serde_json::json!({ "name": "Trumpet 4", "instrumentId": trumpet, "partNumber": null }),
+        serde_json::json!({ "name": "Trumpet 4", "instrumentIds": [trumpet], "partNumber": null }),
     )
     .await;
     assert!(unnumbered["partNumber"].is_null(), "{unnumbered}");
@@ -562,7 +562,7 @@ async fn a_voice_carries_a_part_number_over_v1() {
             &url,
             &tok,
             Some(serde_json::json!({
-                "name": "Trumpet 0", "instrumentId": trumpet, "partNumber": 0
+                "name": "Trumpet 0", "instrumentIds": [trumpet], "partNumber": 0
             })),
         ),
     )
@@ -576,7 +576,7 @@ async fn a_voice_carries_a_part_number_over_v1() {
         &ctx,
         &tok,
         &voice_url,
-        serde_json::json!({ "name": "Trumpet in Bb 3", "instrumentId": trumpet, "partNumber": 3 }),
+        serde_json::json!({ "name": "Trumpet in Bb 3", "instrumentIds": [trumpet], "partNumber": 3 }),
     )
     .await;
     assert_eq!(updated["partNumber"], 3);
@@ -602,7 +602,7 @@ async fn a_new_voice_without_a_part_number_takes_it_from_its_name() {
             &ctx,
             &tok,
             &url,
-            serde_json::json!({ "name": name, "instrumentId": trumpet }),
+            serde_json::json!({ "name": name, "instrumentIds": [trumpet] }),
         )
         .await;
         assert_eq!(created["partNumber"], expected, "{name}");
@@ -622,7 +622,7 @@ async fn a_patch_that_omits_the_part_number_keeps_it_and_null_clears_it() {
         &ctx,
         &tok,
         &url,
-        serde_json::json!({ "name": "Trumpet in Bb 1", "instrumentId": trumpet, "partNumber": 1 }),
+        serde_json::json!({ "name": "Trumpet in Bb 1", "instrumentIds": [trumpet], "partNumber": 1 }),
     )
     .await;
     let voice_url = format!("{url}/{}", created["id"].as_str().unwrap());
@@ -632,7 +632,7 @@ async fn a_patch_that_omits_the_part_number_keeps_it_and_null_clears_it() {
         &ctx,
         &tok,
         &voice_url,
-        serde_json::json!({ "name": "Trumpet in B♭ 1", "instrumentId": trumpet }),
+        serde_json::json!({ "name": "Trumpet in B♭ 1", "instrumentIds": [trumpet] }),
     )
     .await;
     assert_eq!(renamed["name"], "Trumpet in B♭ 1");
@@ -642,7 +642,7 @@ async fn a_patch_that_omits_the_part_number_keeps_it_and_null_clears_it() {
         &ctx,
         &tok,
         &voice_url,
-        serde_json::json!({ "name": "Trumpet in B♭ 1", "instrumentId": trumpet, "partNumber": null }),
+        serde_json::json!({ "name": "Trumpet in B♭ 1", "instrumentIds": [trumpet], "partNumber": null }),
     )
     .await;
     assert!(cleared["partNumber"].is_null(), "explicit null clears it");
@@ -954,7 +954,7 @@ async fn a_voice_renumbered_or_moved_since_the_preview_makes_the_confirm_stale()
     .await
     .unwrap();
     sqlx::query!(
-        "UPDATE voice SET instrument_id = $2 WHERE id = $1",
+        "UPDATE voice_instrument SET instrument_id = $2 WHERE voice_id = $1 AND position = 1",
         book.first_trumpet_1,
         flute
     )
@@ -967,7 +967,7 @@ async fn a_voice_renumbered_or_moved_since_the_preview_makes_the_confirm_stale()
 
     // Put back, the same confirm goes through: the 409s were the changes.
     sqlx::query!(
-        "UPDATE voice SET instrument_id = $2 WHERE id = $1",
+        "UPDATE voice_instrument SET instrument_id = $2 WHERE voice_id = $1 AND position = 1",
         book.first_trumpet_1,
         book.trumpet
     )
@@ -1228,4 +1228,54 @@ async fn only_part_assigners_may_preview_or_apply_and_other_orgs_see_404() {
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+/// #57: part identity uses a voice's primary instrument. "Flute 2 / Piccolo"
+/// is the second flute part that also plays piccolo, so assigning the 2nd
+/// flute across a collection takes it, and assigning a "Piccolo 2" does not.
+#[tokio::test]
+async fn bulk_assignment_matches_on_the_primary_instrument_only() {
+    let (ctx, tok, _) = setup(membership::Role::Archivist).await;
+    let player = create_user(&ctx.pool, "flautist").await;
+    let flute = instrument(&ctx.pool, "flute").await;
+    let piccolo = instrument(&ctx.pool, "piccolo").await;
+    let coll = create_collection(&ctx.pool, ctx.org, "program").await;
+    let a = create_arrangement(&ctx.pool, ctx.org, "one").await;
+    let b = create_arrangement(&ctx.pool, ctx.org, "two").await;
+    create_item(&ctx.pool, coll, a, 1).await;
+    create_item(&ctx.pool, coll, b, 2).await;
+    lied::domain::voice::create(
+        &ctx.pool,
+        Uuid::now_v7(),
+        a,
+        "Flute 2 / Piccolo",
+        "flute-2-piccolo",
+        &[flute, piccolo],
+        lied::domain::voice::NewPartNumber::Set(Some(2)),
+        None,
+    )
+    .await
+    .expect("voice");
+    voice(&ctx.pool, b, "Piccolo 2", piccolo, Some(2)).await;
+
+    let preview = |instrument: Uuid| {
+        let app = ctx.app.clone();
+        let request = req(
+            "GET",
+            &preview_url(ctx.org, coll, player, instrument, Some(2)),
+            &tok,
+            None,
+        );
+        async move { send(&app, request).await.1 }
+    };
+    assert_eq!(
+        outcomes(&preview(flute).await),
+        vec!["assign", "noMatch"],
+        "the doubling part is Flute 2"
+    );
+    assert_eq!(
+        outcomes(&preview(piccolo).await),
+        vec!["noMatch", "assign"],
+        "the piccolo it also plays does not make it the piccolo part"
+    );
 }

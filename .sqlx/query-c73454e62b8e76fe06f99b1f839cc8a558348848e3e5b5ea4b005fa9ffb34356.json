@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.id as collection_id,\n            ci.id as \"item_id?\",\n            ci.position as \"item_position?\",\n            ci.label as \"item_label?\",\n            a.id as \"arrangement_id?\",\n            a.title as \"arrangement_title?\",\n            a.slug as \"arrangement_slug?\",\n            (a.deleted_at IS NOT NULL) as \"arrangement_removed?\",\n            v.id as \"voice_id?\",\n            v.name as \"voice_name?\",\n            CASE WHEN v.id IS NULL THEN NULL ELSE ARRAY(\n                SELECT vi.instrument_id FROM voice_instrument vi\n                WHERE vi.voice_id = v.id ORDER BY vi.position\n            ) END as \"instrument_ids?: Vec<Uuid>\",\n            pa.id as \"assignment_id?\",\n            pa.user_id as \"assignee_user_id?\",\n            u.username as \"assignee_username?\",\n            u.display_name as \"assignee_display_name?\",\n            pa.notified_at as \"notified_at?: DateTime<Utc>\",\n            pa.acknowledged_at as \"acknowledged_at?: DateTime<Utc>\"\n        FROM collection c\n        LEFT JOIN collection_item ci\n          ON ci.collection_id = c.id AND ci.deleted_at IS NULL\n        LEFT JOIN arrangement a ON a.id = ci.arrangement_id\n        LEFT JOIN voice v\n          ON v.arrangement_id = a.id\n         AND v.deleted_at IS NULL\n         -- The section view: a voice belongs to a principal's section when\n         -- any of its instruments does, so a doubling part (\"Flute 2 /\n         -- Piccolo\") counts for both sections (#57).\n         AND ($2::uuid[] IS NULL OR EXISTS (\n               SELECT 1 FROM voice_instrument vi\n               WHERE vi.voice_id = v.id AND vi.instrument_id = ANY($2)))\n        LEFT JOIN part_assignment pa\n          ON pa.collection_item_id = ci.id AND pa.voice_id = v.id\n        LEFT JOIN \"user\" u ON u.id = pa.user_id\n        WHERE c.organization_id = $1 AND c.deleted_at IS NULL\n        ORDER BY c.name ASC, c.id ASC, ci.position ASC, ci.id ASC, v.name ASC, v.id ASC,\n                 pa.created_at ASC, pa.id ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "item_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "item_position?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "item_label?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "arrangement_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 5,
+        "name": "arrangement_title?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "arrangement_slug?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "arrangement_removed?",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "voice_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "voice_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "instrument_ids?: Vec<Uuid>",
+        "type_info": "UuidArray"
+      },
+      {
+        "ordinal": 11,
+        "name": "assignment_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 12,
+        "name": "assignee_user_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "assignee_username?",
+        "type_info": {
+          "Custom": {
+            "name": "citext",
+            "kind": "Simple"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "assignee_display_name?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "notified_at?: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "acknowledged_at?: DateTime<Utc>",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "c73454e62b8e76fe06f99b1f839cc8a558348848e3e5b5ea4b005fa9ffb34356"
+}

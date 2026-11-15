@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ci.id\n        FROM unnest($2::uuid[], $3::uuid[]) AS p(item_id, voice_id)\n        JOIN collection_item ci\n          ON ci.id = p.item_id\n         AND ci.collection_id = $1\n         AND ci.deleted_at IS NULL\n        JOIN collection c ON c.id = ci.collection_id AND c.deleted_at IS NULL\n        JOIN arrangement a ON a.id = ci.arrangement_id AND a.deleted_at IS NULL\n        JOIN voice v\n          ON v.id = p.voice_id\n         AND v.arrangement_id = a.id\n         AND v.deleted_at IS NULL\n         AND EXISTS (\n               SELECT 1 FROM voice_instrument vi\n               WHERE vi.voice_id = v.id AND vi.position = 1 AND vi.instrument_id = $4)\n         AND v.part_number IS NOT DISTINCT FROM $5\n        ORDER BY ci.id, v.id\n        FOR SHARE OF ci, v\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "UuidArray",
+        "Uuid",
+        "Int2"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5a44ed9d7622266338f1a23dbc878031ddd90530999d7228021f8b74f8df0f0d"
+}

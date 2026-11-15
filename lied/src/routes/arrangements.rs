@@ -1109,10 +1109,12 @@ pub(crate) struct VoiceResponse {
     pub arrangement_id: Uuid,
     pub name: String,
     pub slug: String,
-    pub instrument_id: Uuid,
+    /// The instruments this part is read on, in order and never empty; the
+    /// first is the primary ("Flute 2 / Piccolo" is `[flute, piccolo]`).
+    pub instrument_ids: Vec<Uuid>,
     /// Which part of its instrument this is (the `1` of "Trumpet in Bb 1");
     /// `null` for parts that carry no number. Bulk assignment across a
-    /// collection matches on `(instrumentId, partNumber)`.
+    /// collection matches on the primary instrument and `partNumber`.
     pub part_number: Option<i16>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -1126,7 +1128,7 @@ impl From<voice::Voice> for VoiceResponse {
             arrangement_id: v.arrangement_id,
             name: v.name,
             slug: v.slug,
-            instrument_id: v.instrument_id,
+            instrument_ids: v.instrument_ids,
             part_number: v.part_number,
             created_at: v.created_at,
             updated_at: v.updated_at,
@@ -1140,7 +1142,9 @@ impl From<voice::Voice> for VoiceResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateVoiceRequest {
     name: String,
-    instrument_id: Uuid,
+    /// The instruments this part is read on, primary first: at least one,
+    /// none twice.
+    instrument_ids: Vec<Uuid>,
     /// Which part of its instrument this is: at least 1, or `null` for a part
     /// with no number (Timpani, Harp).
     ///
@@ -1160,7 +1164,9 @@ struct CreateVoiceRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateVoiceRequest {
     name: Option<String>,
-    instrument_id: Option<Uuid>,
+    /// Replaces the whole list when sent (primary first, at least one, none
+    /// twice); omitted keeps it.
+    instrument_ids: Option<Vec<Uuid>>,
     #[serde(default, deserialize_with = "present_or_null")]
     #[schema(value_type = Option<i16>, nullable)]
     part_number: Option<Option<i16>>,
@@ -1173,13 +1179,10 @@ fn voice_error_to_app_error(err: voice::VoiceError) -> AppError {
             "a voice with a slug derived from this name already exists in this arrangement"
                 .to_string(),
         ),
-        voice::VoiceError::UnknownInstrument => {
-            let mut report = garde::Report::new();
-            report.append(
-                garde::Path::new("instrumentId"),
-                garde::Error::new("instrumentId does not reference a live instrument"),
-            );
-            AppError::Validation(report)
+        err @ (voice::VoiceError::UnknownInstrument
+        | voice::VoiceError::NoInstrument
+        | voice::VoiceError::DuplicateInstrument) => {
+            AppError::field("instrumentIds", &err.to_string())
         }
         voice::VoiceError::InvalidPartNumber => {
             let mut report = garde::Report::new();
@@ -1335,7 +1338,7 @@ async fn create_voice(
         arrangement_id,
         &body.name,
         &slug,
-        body.instrument_id,
+        &body.instrument_ids,
         match body.part_number {
             None => voice::NewPartNumber::FromName,
             Some(n) => voice::NewPartNumber::Set(n),
@@ -1359,7 +1362,7 @@ async fn create_voice(
             "name": created.name,
             "slug": created.slug,
             "arrangementId": arrangement_id,
-            "instrumentId": created.instrument_id,
+            "instrumentIds": created.instrument_ids,
             "partNumber": created.part_number,
         }),
     )
@@ -1475,9 +1478,11 @@ async fn update_voice(
 
     reject_blank("name", body.name.as_deref())?;
     let name = body.name.unwrap_or_else(|| current.name.clone());
-    let instrument_id = body.instrument_id.unwrap_or(current.instrument_id);
+    let instrument_ids = body
+        .instrument_ids
+        .unwrap_or_else(|| current.instrument_ids.clone());
     if name == current.name
-        && instrument_id == current.instrument_id
+        && instrument_ids == current.instrument_ids
         && body.part_number.is_none_or(|n| n == current.part_number)
     {
         let updated_at = current.updated_at;
@@ -1489,7 +1494,7 @@ async fn update_voice(
         id,
         Some(listing::version_of(current.updated_at)),
         &name,
-        instrument_id,
+        &instrument_ids,
         body.part_number.into(),
     )
     .await
@@ -1513,12 +1518,12 @@ async fn update_voice(
         serde_json::json!({
             "before": {
                 "name": current.name,
-                "instrumentId": current.instrument_id,
+                "instrumentIds": current.instrument_ids,
                 "partNumber": current.part_number,
             },
             "after": {
                 "name": updated.name,
-                "instrumentId": updated.instrument_id,
+                "instrumentIds": updated.instrument_ids,
                 "partNumber": updated.part_number,
             },
         }),
