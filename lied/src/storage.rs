@@ -35,6 +35,40 @@ pub enum StorageError {
     S3(String),
 }
 
+/// What [`ensure_bucket`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketStatus {
+    Existed,
+    Created,
+}
+
+/// Make sure `bucket` exists, creating it only when `HeadBucket` says it is
+/// missing (issue #91) — so credentials that may not create buckets still
+/// work against one the operator made. A concurrent start that creates it
+/// first is not an error.
+pub async fn ensure_bucket(s3: &S3Client, bucket: &str) -> Result<BucketStatus, StorageError> {
+    match s3.head_bucket().bucket(bucket).send().await {
+        Ok(_) => return Ok(BucketStatus::Existed),
+        Err(e) => {
+            let svc = e.into_service_error();
+            if !svc.is_not_found() {
+                return Err(StorageError::S3(format!("head_bucket: {svc}")));
+            }
+        }
+    }
+    match s3.create_bucket().bucket(bucket).send().await {
+        Ok(_) => Ok(BucketStatus::Created),
+        Err(e) => {
+            let svc = e.into_service_error();
+            if svc.is_bucket_already_owned_by_you() {
+                Ok(BucketStatus::Existed)
+            } else {
+                Err(StorageError::S3(format!("create_bucket: {svc}")))
+            }
+        }
+    }
+}
+
 /// A single chunk source for [`upload_streaming`]: yields the next chunk of
 /// the body, `Ok(None)` at end of stream. Implemented for axum's
 /// `Multipart` field in the route layer so this module stays HTTP-agnostic.
