@@ -51,10 +51,75 @@ pub struct CollectionItem {
     /// The number players are called by: `12`, or `12a` for a piece slipped
     /// in later. In a program it is always `position` as text. Display it.
     pub label: String,
+    /// The section the piece's number falls into (the one with the greatest
+    /// start at or below it); `null` before the first section, in a
+    /// collection without sections, and always in a program.
+    pub section: Option<ItemSection>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub created_by: Option<Uuid>,
     pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// The section an item falls into, as much as a client needs to show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemSection {
+    pub id: Uuid,
+    pub name: String,
+}
+
+/// A `collection_item` row joined with the section its label falls into.
+///
+/// Every item query finds the section with the same join (`ci` the item):
+/// the section of the collection with the greatest start at or below the
+/// label's number (`65a` → 65). The `sqlx` macros take a string literal, so
+/// each query spells it out; keep them in step:
+///
+/// ```sql
+/// LEFT JOIN LATERAL (
+///     SELECT s.id, s.name FROM collection_section s
+///     WHERE s.collection_id = ci.collection_id
+///       AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+///     ORDER BY s.starts_at DESC LIMIT 1
+/// ) s ON true
+/// ```
+struct ItemRow {
+    id: Uuid,
+    collection_id: Uuid,
+    arrangement_id: Uuid,
+    position: i32,
+    label: String,
+    section_id: Option<Uuid>,
+    section_name: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    created_by: Option<Uuid>,
+    deleted_at: Option<DateTime<Utc>>,
+}
+
+impl From<ItemRow> for CollectionItem {
+    fn from(r: ItemRow) -> Self {
+        CollectionItem {
+            id: r.id,
+            collection_id: r.collection_id,
+            arrangement_id: r.arrangement_id,
+            position: r.position,
+            label: r.label,
+            section: item_section(r.section_id, r.section_name),
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            created_by: r.created_by,
+            deleted_at: r.deleted_at,
+        }
+    }
+}
+
+fn item_section(id: Option<Uuid>, name: Option<String>) -> Option<ItemSection> {
+    Some(ItemSection {
+        id: id?,
+        name: name?,
+    })
 }
 
 /// A collection item plus its referenced arrangement's display info, so a
@@ -182,13 +247,30 @@ pub enum LabelRefusal {
     NotAllowed,
 }
 
+/// A section of a standing collection, as the numbering rule sees it: a
+/// heading whose range runs from `starts_at` to the next section's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionBound {
+    pub id: Uuid,
+    pub name: String,
+    pub starts_at: u16,
+}
+
 /// The numbering of a standing collection's live pieces, and the rule for
 /// which label a piece may take (docs/design.md, *Which labels a new piece
-/// may take*). #103 extends it with sections.
+/// may take*).
+///
+/// The rule works per **range**: each section covers its start up to the
+/// next section's start, and the numbers before the first section form one
+/// more range (without sections, the whole collection is one range from 1).
+/// Within a range, a new piece takes a gap below the range's highest number
+/// or the number after it; a range without pieces offers its start.
 #[derive(Debug, Clone)]
 pub struct Numbering {
     labels: BTreeSet<Label>,
     width: i16,
+    /// Sorted by `starts_at`.
+    sections: Vec<SectionBound>,
 }
 
 /// The labels a new piece can choose from, for a form to offer.
@@ -197,8 +279,32 @@ pub struct LabelChoices {
     /// Highest number + 1 (or `1` in an empty collection); `None` when that
     /// no longer fits the collection's width.
     pub suggested: Option<Label>,
-    /// Free numbers below the highest one, ascending.
+    /// Free numbers below the highest one of their range, ascending.
     pub gaps: Vec<Label>,
+    /// Per range, the next number: one entry per section, plus one for the
+    /// numbers before the first section when that section does not start at
+    /// 1. Empty when the collection has no sections.
+    pub sections: Vec<SectionChoice>,
+}
+
+/// The next number a range offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionChoice {
+    /// `None` for the numbers before the first section.
+    pub section: Option<SectionBound>,
+    pub starts_at: u16,
+    /// The range's start while it holds no piece, else its highest number +
+    /// 1; `None` when that would be the next section's start (the section
+    /// is **full**: take a gap, a letter label, or renumber) or past the
+    /// collection's width.
+    pub next: Option<Label>,
+}
+
+/// One range of numbers, `[start, end)`; `end` is the next section's start.
+struct Range<'a> {
+    section: Option<&'a SectionBound>,
+    start: u16,
+    end: Option<u16>,
 }
 
 impl Numbering {
@@ -206,7 +312,15 @@ impl Numbering {
         Numbering {
             labels: labels.into_iter().collect(),
             width,
+            sections: Vec::new(),
         }
+    }
+
+    /// The same numbering, divided into `sections`.
+    pub fn with_sections(mut self, sections: impl IntoIterator<Item = SectionBound>) -> Self {
+        self.sections = sections.into_iter().collect();
+        self.sections.sort_by_key(|s| s.starts_at);
+        self
     }
 
     /// The same numbering without `label`: for moving a piece, which must
@@ -217,6 +331,7 @@ impl Numbering {
         Numbering {
             labels,
             width: self.width,
+            sections: self.sections.clone(),
         }
     }
 
@@ -228,14 +343,57 @@ impl Numbering {
         self.labels.iter().any(|l| l.number == number)
     }
 
+    fn ranges(&self) -> Vec<Range<'_>> {
+        let mut ranges = Vec::with_capacity(self.sections.len() + 1);
+        let first = self.sections.first().map(|s| s.starts_at);
+        if first.is_none_or(|start| start > 1) {
+            ranges.push(Range {
+                section: None,
+                start: 1,
+                end: first,
+            });
+        }
+        for (i, section) in self.sections.iter().enumerate() {
+            ranges.push(Range {
+                section: Some(section),
+                start: section.starts_at,
+                end: self.sections.get(i + 1).map(|s| s.starts_at),
+            });
+        }
+        ranges
+    }
+
+    fn range_of(&self, number: u16) -> Range<'_> {
+        self.ranges()
+            .into_iter()
+            .rev()
+            .find(|r| r.start <= number)
+            // Unreachable: the first range starts at 1 and numbers are ≥ 1.
+            .unwrap_or(Range {
+                section: None,
+                start: 1,
+                end: None,
+            })
+    }
+
+    fn highest_in(&self, range: &Range<'_>) -> Option<u16> {
+        self.labels
+            .iter()
+            .map(Label::number)
+            .filter(|n| *n >= range.start && range.end.is_none_or(|end| *n < end))
+            .max()
+    }
+
     /// Whether `candidate` may be given to a piece:
-    /// - a free plain number below the highest one (a gap), or the highest
-    ///   + 1 (`1` in an empty collection);
+    /// - a free plain number below the highest one of its range (a gap), or
+    ///   that highest + 1; in a range without pieces, its start (`1` in an
+    ///   empty collection without sections);
     /// - a free letter label `Na` whose number `N` some live piece carries
     ///   (`12b` needs a `12` or `12a`, not both).
     ///
-    /// Everything else is refused: a number far past the end is usually a
-    /// typo, and would leave a gap nobody chose.
+    /// Everything else is refused: a number far past the end of its range
+    /// is usually a typo, and would leave a gap nobody chose. Starting a
+    /// section past the end is what makes a far number allowed.
     pub fn check(&self, candidate: Label) -> Result<(), LabelRefusal> {
         if !candidate.fits(self.width) {
             return Err(LabelRefusal::TooWide);
@@ -244,7 +402,13 @@ impl Numbering {
             return Err(LabelRefusal::Taken);
         }
         let allowed = match candidate.letter {
-            None => candidate.number <= self.highest_number() + 1,
+            None => {
+                let range = self.range_of(candidate.number);
+                match self.highest_in(&range) {
+                    None => candidate.number == range.start,
+                    Some(highest) => candidate.number <= highest + 1,
+                }
+            }
             Some(_) => self.number_in_use(candidate.number),
         };
         if allowed {
@@ -254,16 +418,34 @@ impl Numbering {
         }
     }
 
-    /// The suggestion and the gaps, for a form.
+    /// The suggestion, the gaps and each range's next number, for a form.
     pub fn choices(&self) -> LabelChoices {
-        let highest = self.highest_number();
-        let next = Label::plain(highest + 1);
+        let next = Label::plain(self.highest_number() + 1);
+        let mut gaps = Vec::new();
+        let mut sections = Vec::new();
+        for range in self.ranges() {
+            let highest = self.highest_in(&range);
+            if let Some(highest) = highest {
+                gaps.extend(
+                    (range.start..highest)
+                        .map(Label::plain)
+                        .filter(|l| !self.labels.contains(l)),
+                );
+            }
+            if !self.sections.is_empty() {
+                let candidate = Label::plain(highest.map_or(range.start, |h| h + 1));
+                let in_range = range.end.is_none_or(|end| candidate.number < end);
+                sections.push(SectionChoice {
+                    section: range.section.cloned(),
+                    starts_at: range.start,
+                    next: (in_range && candidate.fits(self.width)).then_some(candidate),
+                });
+            }
+        }
         LabelChoices {
-            suggested: next.fits(self.width).then_some(next),
-            gaps: (1..highest)
-                .map(Label::plain)
-                .filter(|l| !self.labels.contains(l))
-                .collect(),
+            suggested: self.check(next).is_ok().then_some(next),
+            gaps,
+            sections,
         }
     }
 }
@@ -309,8 +491,9 @@ pub enum CollectionItemError {
     /// No room for another piece at the collection's number width.
     #[error("the collection is full at its number width; widen it or renumber")]
     CollectionFull,
-    /// Renumber is for standing collections; a program is always dense.
-    #[error("only a standing collection can be renumbered")]
+    /// Renumber and label choices are for standing collections; a
+    /// program's numbers are its running order, always dense.
+    #[error("only a standing collection has labels to choose or renumber; a program's numbers are its running order")]
     NotStanding,
     /// Reorder is for programs; a standing collection's order follows its
     /// labels.
@@ -459,6 +642,60 @@ async fn write_layout(
     Ok(())
 }
 
+/// A collection's sections, by start.
+pub(crate) async fn live_sections(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+) -> Result<Vec<SectionBound>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"SELECT id, name, starts_at FROM collection_section
+           WHERE collection_id = $1
+           ORDER BY starts_at ASC"#,
+        collection_id,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SectionBound {
+            id: r.id,
+            name: r.name,
+            // The column's CHECK keeps it in 1..=9999.
+            starts_at: u16::try_from(r.starts_at).unwrap_or(MAX_LABEL_NUMBER),
+        })
+        .collect())
+}
+
+/// The numbering of a standing collection's live pieces and its sections,
+/// under the collection lock.
+async fn numbering_of(
+    tx: &mut Tx<'_>,
+    collection_id: Uuid,
+    width: i16,
+    slots: &[Slot],
+) -> Result<Numbering, sqlx::Error> {
+    let sections = live_sections(tx, collection_id).await?;
+    Ok(Numbering::new(slots.iter().map(|s| s.label), width).with_sections(sections))
+}
+
+/// The labels a new piece of a standing collection can take: the
+/// suggestion, the gaps and each section's next number. A program has none
+/// ([`CollectionItemError::NotStanding`]).
+pub async fn label_choices(
+    pool: &PgPool,
+    collection_id: Uuid,
+) -> Result<LabelChoices, CollectionItemError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_collection(&mut tx, collection_id).await?;
+    if locked.kind != Kind::Standing {
+        return Err(CollectionItemError::NotStanding);
+    }
+    let slots = live_slots(&mut tx, collection_id).await?;
+    let numbering = numbering_of(&mut tx, collection_id, locked.number_width, &slots).await?;
+    tx.rollback().await?;
+    Ok(numbering.choices())
+}
+
 /// Sort a standing collection's slots by label, the order its positions
 /// follow.
 fn by_label(mut slots: Vec<Slot>) -> Vec<Slot> {
@@ -488,43 +725,59 @@ fn program_fits(count: usize, width: i16) -> bool {
 
 async fn fetch_item(tx: &mut Tx<'_>, id: Uuid) -> Result<CollectionItem, sqlx::Error> {
     sqlx::query_as!(
-        CollectionItem,
+        ItemRow,
         r#"
         SELECT
-            id, collection_id, arrangement_id, position, label,
-            created_at as "created_at: DateTime<Utc>",
-            updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            deleted_at as "deleted_at: DateTime<Utc>"
-        FROM collection_item
-        WHERE id = $1
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
+            s.id as "section_id?", s.name as "section_name?",
+            ci.created_at as "created_at: DateTime<Utc>",
+            ci.updated_at as "updated_at: DateTime<Utc>",
+            ci.created_by,
+            ci.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item ci
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
+        WHERE ci.id = $1
         "#,
         id,
     )
     .fetch_one(&mut **tx)
     .await
+    .map(CollectionItem::from)
 }
 
 // ── Reads ───────────────────────────────────────────────────────────────────
 
 /// Look up a live item by id (soft-deleted hidden).
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<CollectionItem>, sqlx::Error> {
-    sqlx::query_as!(
-        CollectionItem,
+    Ok(sqlx::query_as!(
+        ItemRow,
         r#"
         SELECT
-            id, collection_id, arrangement_id, position, label,
-            created_at as "created_at: DateTime<Utc>",
-            updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            deleted_at as "deleted_at: DateTime<Utc>"
-        FROM collection_item
-        WHERE id = $1 AND deleted_at IS NULL
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
+            s.id as "section_id?", s.name as "section_name?",
+            ci.created_at as "created_at: DateTime<Utc>",
+            ci.updated_at as "updated_at: DateTime<Utc>",
+            ci.created_by,
+            ci.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item ci
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
+        WHERE ci.id = $1 AND ci.deleted_at IS NULL
         "#,
         id,
     )
     .fetch_optional(pool)
-    .await
+    .await?
+    .map(CollectionItem::from))
 }
 
 /// Look up an item by id including soft-deleted rows (undelete flow).
@@ -532,22 +785,30 @@ pub async fn find_by_id_including_deleted(
     pool: &PgPool,
     id: Uuid,
 ) -> Result<Option<CollectionItem>, sqlx::Error> {
-    sqlx::query_as!(
-        CollectionItem,
+    Ok(sqlx::query_as!(
+        ItemRow,
         r#"
         SELECT
-            id, collection_id, arrangement_id, position, label,
-            created_at as "created_at: DateTime<Utc>",
-            updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            deleted_at as "deleted_at: DateTime<Utc>"
-        FROM collection_item
-        WHERE id = $1
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
+            s.id as "section_id?", s.name as "section_name?",
+            ci.created_at as "created_at: DateTime<Utc>",
+            ci.updated_at as "updated_at: DateTime<Utc>",
+            ci.created_by,
+            ci.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item ci
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
+        WHERE ci.id = $1
         "#,
         id,
     )
     .fetch_optional(pool)
-    .await
+    .await?
+    .map(CollectionItem::from))
 }
 
 /// List a collection's live items in position order, each with its
@@ -571,12 +832,19 @@ pub async fn list_for_collection(
             ci.updated_at as "updated_at: DateTime<Utc>",
             ci.created_by,
             ci.deleted_at as "deleted_at: DateTime<Utc>",
+            s.id as "section_id?", s.name as "section_name?",
             a.slug as arrangement_slug,
             a.title as arrangement_title,
             (a.deleted_at IS NOT NULL) as "arrangement_removed!"
         FROM collection_item ci
         JOIN collection c ON c.id = ci.collection_id
         JOIN arrangement a ON a.id = ci.arrangement_id
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
         ORDER BY ci.position ASC, ci.id ASC
         "#,
@@ -594,6 +862,7 @@ pub async fn list_for_collection(
                 arrangement_id: r.arrangement_id,
                 position: r.position,
                 label: r.label,
+                section: item_section(r.section_id, r.section_name),
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 created_by: r.created_by,
@@ -633,12 +902,19 @@ pub async fn list_deleted_for_collection(
             ci.updated_at as "updated_at: DateTime<Utc>",
             ci.created_by,
             ci.deleted_at as "deleted_at: DateTime<Utc>",
+            s.id as "section_id?", s.name as "section_name?",
             a.slug as arrangement_slug,
             a.title as arrangement_title,
             (a.deleted_at IS NOT NULL) as "arrangement_removed!"
         FROM collection_item ci
         JOIN collection c ON c.id = ci.collection_id
         JOIN arrangement a ON a.id = ci.arrangement_id
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NOT NULL AND c.deleted_at IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM collection_item live
@@ -695,6 +971,7 @@ pub async fn list_deleted_for_collection(
                 arrangement_id: r.arrangement_id,
                 position: r.position,
                 label: r.label,
+                section: item_section(r.section_id, r.section_name),
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 created_by: r.created_by,
@@ -778,7 +1055,8 @@ pub async fn create(
             (label, order)
         }
         Kind::Standing => {
-            let numbering = Numbering::new(slots.iter().map(|s| s.label), locked.number_width);
+            let numbering =
+                numbering_of(&mut tx, collection_id, locked.number_width, &slots).await?;
             let label = match placement.label {
                 Some(text) => {
                     let label = parse_label(text)?;
@@ -826,26 +1104,34 @@ async fn lock_item(
     item_id: Uuid,
     expected_version: Option<i64>,
 ) -> Result<Option<CollectionItem>, sqlx::Error> {
-    sqlx::query_as!(
-        CollectionItem,
+    Ok(sqlx::query_as!(
+        ItemRow,
         r#"
         SELECT
-            id, collection_id, arrangement_id, position, label,
-            created_at as "created_at: DateTime<Utc>",
-            updated_at as "updated_at: DateTime<Utc>",
-            created_by,
-            deleted_at as "deleted_at: DateTime<Utc>"
-        FROM collection_item
-        WHERE id = $1 AND collection_id = $2 AND deleted_at IS NULL
-          AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
-        FOR UPDATE
+            ci.id, ci.collection_id, ci.arrangement_id, ci.position, ci.label,
+            s.id as "section_id?", s.name as "section_name?",
+            ci.created_at as "created_at: DateTime<Utc>",
+            ci.updated_at as "updated_at: DateTime<Utc>",
+            ci.created_by,
+            ci.deleted_at as "deleted_at: DateTime<Utc>"
+        FROM collection_item ci
+        LEFT JOIN LATERAL (
+            SELECT s.id, s.name FROM collection_section s
+            WHERE s.collection_id = ci.collection_id
+              AND s.starts_at <= rtrim(ci.label, 'abcdefghijklmnopqrstuvwxyz')::int
+            ORDER BY s.starts_at DESC LIMIT 1
+        ) s ON true
+        WHERE ci.id = $1 AND ci.collection_id = $2 AND ci.deleted_at IS NULL
+          AND ($3::bigint IS NULL OR floor(extract(epoch FROM ci.updated_at) * 1000)::bigint = $3)
+        FOR UPDATE OF ci
         "#,
         item_id,
         collection_id,
         expected_version,
     )
     .fetch_optional(&mut **tx)
-    .await
+    .await?
+    .map(CollectionItem::from))
 }
 
 /// Move a piece.
@@ -898,8 +1184,9 @@ pub async fn move_item(
             if label == own {
                 return Ok(Some(current));
             }
-            let numbering =
-                Numbering::new(slots.iter().map(|s| s.label), locked.number_width).without(&own);
+            let numbering = numbering_of(&mut tx, collection_id, locked.number_width, &slots)
+                .await?
+                .without(&own);
             numbering.check(label).map_err(|r| refused(label, r))?;
             let order = slots
                 .into_iter()
@@ -1105,7 +1392,8 @@ pub async fn restore(
             (Label::plain(1), order)
         }
         Kind::Standing => {
-            let numbering = Numbering::new(slots.iter().map(|s| s.label), locked.number_width);
+            let numbering =
+                numbering_of(&mut tx, collection_id, locked.number_width, &slots).await?;
             let old = Label::parse(&target.label);
             let old_is_free = old.is_some_and(|l| {
                 !matches!(
@@ -1168,6 +1456,15 @@ pub struct RenumberChange {
     pub to: String,
 }
 
+/// One section's start before and after a renumber.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionRenumberChange {
+    pub section_id: Uuid,
+    pub from: i32,
+    pub to: i32,
+}
+
 /// What a renumber would do, and the token that applies exactly that.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1175,18 +1472,26 @@ pub struct RenumberPreview {
     /// Every live piece, in order, with its label now and after the
     /// renumber (equal where it does not change).
     pub changes: Vec<RenumberChange>,
+    /// Every section, in order, with its start now and after the renumber.
+    pub section_changes: Vec<SectionRenumberChange>,
     /// Pass it back to apply this preview; it no longer matches once the
-    /// collection's pieces or labels change.
+    /// collection's pieces, labels or sections change.
     pub preview_token: String,
 }
 
-/// The token for a collection's current pieces: a hash of every live
-/// (item id, label) in order.
-fn preview_token(slots: &[Slot]) -> String {
+/// The token for a collection's current numbering: a hash of every live
+/// (item id, label) in order and every (section id, start).
+fn preview_token(slots: &[Slot], sections: &[SectionBound]) -> String {
     let mut hasher = Sha256::new();
     for slot in slots {
         hasher.update(slot.id.as_bytes());
         hasher.update(slot.label.to_string().as_bytes());
+        hasher.update(b";");
+    }
+    hasher.update(b"|");
+    for section in sections {
+        hasher.update(section.id.as_bytes());
+        hasher.update(section.starts_at.to_be_bytes());
         hasher.update(b";");
     }
     hasher
@@ -1196,20 +1501,75 @@ fn preview_token(slots: &[Slot]) -> String {
         .collect()
 }
 
-fn renumber_changes(slots: &[Slot]) -> Vec<RenumberChange> {
-    slots
-        .iter()
-        .enumerate()
-        .map(|(index, slot)| RenumberChange {
-            item_id: slot.id,
-            from: slot.label.to_string(),
-            to: (index + 1).to_string(),
-        })
-        .collect()
+/// What a renumber does: the pieces in their order, and the new numbers.
+struct RenumberPlan {
+    order: Vec<Slot>,
+    changes: Vec<RenumberChange>,
+    section_changes: Vec<SectionRenumberChange>,
 }
 
-/// Preview a renumber of a standing collection: 1..n in the current order,
-/// letters dropped. Programs are always dense, so they refuse with
+/// Plan a renumber of a standing collection: the pieces get 1..n in their
+/// order, letters dropped; each section starts at the new number of its
+/// first piece. A section without pieces keeps one number, its start, right
+/// after the pieces before it, so the sections stay in order and every
+/// start stays distinct (two empty sections at the end become last + 1 and
+/// last + 2). `slots` are in label order, `sections` by start.
+fn plan_renumber(
+    slots: &[Slot],
+    sections: &[SectionBound],
+    width: i16,
+) -> Result<RenumberPlan, CollectionItemError> {
+    let mut next: u32 = 1;
+    let mut order = Vec::with_capacity(slots.len());
+    let mut changes = Vec::with_capacity(slots.len());
+    let mut section_changes = Vec::with_capacity(sections.len());
+    let mut rest = slots.iter().peekable();
+
+    let mut take_until = |end: Option<u16>, next: &mut u32| -> bool {
+        let mut took = false;
+        while let Some(slot) = rest.next_if(|s| end.is_none_or(|e| s.label.number() < e)) {
+            let to = Label::plain(u16::try_from(*next).unwrap_or(u16::MAX));
+            changes.push(RenumberChange {
+                item_id: slot.id,
+                from: slot.label.to_string(),
+                to: to.to_string(),
+            });
+            order.push(Slot {
+                id: slot.id,
+                label: to,
+            });
+            *next += 1;
+            took = true;
+        }
+        took
+    };
+
+    // The pieces before the first section.
+    take_until(sections.first().map(|s| s.starts_at), &mut next);
+    for (i, section) in sections.iter().enumerate() {
+        let start = next;
+        if !take_until(sections.get(i + 1).map(|s| s.starts_at), &mut next) {
+            next += 1;
+        }
+        section_changes.push(SectionRenumberChange {
+            section_id: section.id,
+            from: i32::from(section.starts_at),
+            to: i32::try_from(start).unwrap_or(i32::MAX),
+        });
+    }
+
+    if next - 1 > u32::from(max_number(width)) {
+        return Err(CollectionItemError::CollectionFull);
+    }
+    Ok(RenumberPlan {
+        order,
+        changes,
+        section_changes,
+    })
+}
+
+/// Preview a renumber of a standing collection (see [`plan_renumber`]).
+/// Programs are always dense, so they refuse with
 /// [`CollectionItemError::NotStanding`].
 pub async fn renumber_preview(
     pool: &PgPool,
@@ -1221,11 +1581,21 @@ pub async fn renumber_preview(
         return Err(CollectionItemError::NotStanding);
     }
     let slots = live_slots(&mut tx, collection_id).await?;
+    let sections = live_sections(&mut tx, collection_id).await?;
     tx.rollback().await?;
+    let plan = plan_renumber(&slots, &sections, locked.number_width)?;
     Ok(RenumberPreview {
-        changes: renumber_changes(&slots),
-        preview_token: preview_token(&slots),
+        changes: plan.changes,
+        section_changes: plan.section_changes,
+        preview_token: preview_token(&slots, &sections),
     })
+}
+
+/// What an applied renumber changed.
+#[derive(Debug, Clone)]
+pub struct RenumberOutcome {
+    pub changes: Vec<RenumberChange>,
+    pub section_changes: Vec<SectionRenumberChange>,
 }
 
 /// Apply the renumber a [`renumber_preview`] showed, if the collection has
@@ -1236,20 +1606,35 @@ pub async fn renumber(
     pool: &PgPool,
     collection_id: Uuid,
     token: &str,
-) -> Result<Vec<RenumberChange>, CollectionItemError> {
+) -> Result<RenumberOutcome, CollectionItemError> {
     let mut tx = pool.begin().await?;
     let locked = lock_collection(&mut tx, collection_id).await?;
     if locked.kind != Kind::Standing {
         return Err(CollectionItemError::NotStanding);
     }
     let slots = live_slots(&mut tx, collection_id).await?;
-    if preview_token(&slots) != token {
+    let sections = live_sections(&mut tx, collection_id).await?;
+    if preview_token(&slots, &sections) != token {
         return Err(CollectionItemError::StaleRenumber);
     }
-    let changes = renumber_changes(&slots);
-    close_gaps(&mut tx, collection_id, slots).await?;
+    let plan = plan_renumber(&slots, &sections, locked.number_width)?;
+    write_layout(&mut tx, collection_id, Kind::Standing, &plan.order).await?;
+    for change in plan.section_changes.iter().filter(|c| c.from != c.to) {
+        sqlx::query!(
+            r#"UPDATE collection_section SET starts_at = $2, updated_at = now()
+               WHERE id = $1 AND collection_id = $3"#,
+            change.section_id,
+            change.to,
+            collection_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     commit(tx).await?;
-    Ok(changes)
+    Ok(RenumberOutcome {
+        changes: plan.changes,
+        section_changes: plan.section_changes,
+    })
 }
 
 /// Labels 1..n in the current order, inside an open transaction that holds
@@ -1381,7 +1766,8 @@ mod tests {
             n.choices(),
             LabelChoices {
                 suggested: Some(l("1")),
-                gaps: vec![]
+                gaps: vec![],
+                sections: vec![],
             }
         );
     }
@@ -1394,6 +1780,7 @@ mod tests {
             LabelChoices {
                 suggested: Some(l("10")),
                 gaps: vec![l("3"), l("4"), l("6"), l("7"), l("8")],
+                sections: vec![],
             }
         );
         let full = numbering(&["999"]);
@@ -1410,5 +1797,185 @@ mod tests {
             Err(LabelRefusal::NotAllowed)
         );
         assert_eq!(n.without(&l("2")).check(l("2")), Ok(()));
+    }
+
+    fn section(name: &str, starts_at: u16) -> SectionBound {
+        SectionBound {
+            // Deterministic ids, so plans compare across calls.
+            id: Uuid::from_u128(u128::from(starts_at)),
+            name: name.to_string(),
+            starts_at,
+        }
+    }
+
+    /// Märsche 1–3 (no section heading before 61), Polkas from 61 holding
+    /// 61–63, and the given sections on top.
+    fn folder(extra: &[SectionBound]) -> Numbering {
+        let mut sections = vec![section("Polkas", 61)];
+        sections.extend_from_slice(extra);
+        numbering(&["1", "2", "3", "61", "63"]).with_sections(sections)
+    }
+
+    #[test]
+    fn a_new_section_past_the_end_makes_its_start_allowed() {
+        let without = folder(&[]);
+        assert_eq!(
+            without.check(l("101")),
+            Err(LabelRefusal::NotAllowed),
+            "past the end without a section: a typo"
+        );
+        let n = folder(&[section("Modern", 101)]);
+        assert_eq!(n.check(l("101")), Ok(()), "the empty section's start");
+        assert_eq!(
+            n.check(l("102")),
+            Err(LabelRefusal::NotAllowed),
+            "an empty section offers its start only"
+        );
+        assert_eq!(n.check(l("64")), Ok(()), "the next polka");
+        assert_eq!(n.check(l("62")), Ok(()), "a gap among the polkas");
+        assert_eq!(
+            n.check(l("80")),
+            Err(LabelRefusal::NotAllowed),
+            "below the highest overall, but far past the polkas"
+        );
+        assert_eq!(n.check(l("4")), Ok(()), "the next march");
+        assert_eq!(n.check(l("5")), Err(LabelRefusal::NotAllowed));
+    }
+
+    #[test]
+    fn a_section_can_divide_the_numbers_in_use() {
+        // "Polkas" now starts at 3, inside the marches: 3 falls into it.
+        let n = numbering(&["1", "2", "3", "4"]).with_sections([section("Polkas", 3)]);
+        assert_eq!(n.check(l("5")), Ok(()), "the next polka");
+        assert_eq!(n.check(l("3")), Err(LabelRefusal::Taken));
+        assert_eq!(
+            n.check(l("6")),
+            Err(LabelRefusal::NotAllowed),
+            "still no number past the end"
+        );
+        // 3 is the next march number, but it is the polkas' start and taken.
+        let choices = n.choices();
+        assert_eq!(choices.sections.len(), 2);
+        assert_eq!(choices.sections[0].section, None);
+        assert_eq!(choices.sections[0].next, None, "the marches are full");
+        assert_eq!(choices.sections[1].next, Some(l("5")));
+    }
+
+    #[test]
+    fn a_full_section_offers_no_next_number() {
+        let n = numbering(&["1", "2", "60", "61"])
+            .with_sections([section("Märsche", 1), section("Polkas", 61)]);
+        assert_eq!(n.check(l("61")), Err(LabelRefusal::Taken));
+        assert_eq!(n.check(l("60a")), Ok(()), "a letter label still fits");
+        assert_eq!(n.check(l("3")), Ok(()), "a gap still fits");
+        let choices = n.choices();
+        assert_eq!(
+            choices.sections,
+            vec![
+                SectionChoice {
+                    section: Some(section("Märsche", 1)),
+                    starts_at: 1,
+                    next: None,
+                },
+                SectionChoice {
+                    section: Some(section("Polkas", 61)),
+                    starts_at: 61,
+                    next: Some(l("62")),
+                },
+            ],
+            "no entry before a section starting at 1"
+        );
+        assert_eq!(choices.gaps.first(), Some(&l("3")));
+        assert_eq!(choices.gaps.len(), 57, "3..=59");
+        assert_eq!(choices.suggested, Some(l("62")));
+    }
+
+    #[test]
+    fn choices_list_each_sections_next_number() {
+        let n = folder(&[section("Modern", 101)]);
+        let choices = n.choices();
+        assert_eq!(choices.suggested, Some(l("64")));
+        assert_eq!(choices.gaps, vec![l("62")]);
+        let next: Vec<(u16, Option<Label>)> = choices
+            .sections
+            .iter()
+            .map(|c| (c.starts_at, c.next))
+            .collect();
+        assert_eq!(
+            next,
+            vec![
+                (1, Some(l("4"))),
+                (61, Some(l("64"))),
+                (101, Some(l("101")))
+            ]
+        );
+    }
+
+    fn slots(labels: &[&str]) -> Vec<Slot> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Slot {
+                id: Uuid::from_u128(1000 + i as u128),
+                label: l(t),
+            })
+            .collect()
+    }
+
+    fn plan_labels(plan: &RenumberPlan) -> Vec<String> {
+        plan.changes.iter().map(|c| c.to.clone()).collect()
+    }
+
+    fn plan_starts(plan: &RenumberPlan) -> Vec<(i32, i32)> {
+        plan.section_changes
+            .iter()
+            .map(|c| (c.from, c.to))
+            .collect()
+    }
+
+    #[test]
+    fn renumber_moves_section_starts_to_their_first_piece() {
+        let plan = plan_renumber(
+            &slots(&["1", "1a", "3", "61", "61a", "70"]),
+            &[section("Polkas", 61)],
+            3,
+        )
+        .unwrap();
+        assert_eq!(plan_labels(&plan), ["1", "2", "3", "4", "5", "6"]);
+        assert_eq!(plan_starts(&plan), [(61, 4)]);
+    }
+
+    #[test]
+    fn renumber_keeps_one_number_for_each_empty_section() {
+        // Märsche 1–3, an empty "Modern" from 50 between them and the
+        // polkas, the polkas from 61, and two empty sections at the end.
+        let plan = plan_renumber(
+            &slots(&["1", "2", "3", "61", "62"]),
+            &[
+                section("Modern", 50),
+                section("Polkas", 61),
+                section("Choräle", 200),
+                section("Hymnen", 300),
+            ],
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            plan_labels(&plan),
+            ["1", "2", "3", "5", "6"],
+            "4 stays free for the empty section between"
+        );
+        assert_eq!(
+            plan_starts(&plan),
+            [(50, 4), (61, 5), (200, 7), (300, 8)],
+            "starts stay in order and distinct"
+        );
+    }
+
+    #[test]
+    fn renumber_without_sections_is_one_to_n() {
+        let plan = plan_renumber(&slots(&["2", "5", "5a"]), &[], 3).unwrap();
+        assert_eq!(plan_labels(&plan), ["1", "2", "3"]);
+        assert!(plan.section_changes.is_empty());
     }
 }

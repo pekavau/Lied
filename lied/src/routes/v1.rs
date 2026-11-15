@@ -435,6 +435,9 @@ pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
         .merge(crate::routes::files::router())
         // Collections + CollectionItems (issue #9) — see `routes::collections`.
         .merge(crate::routes::collections::router())
+        // Sections of a standing collection (issue #103) — see
+        // `routes::collection_sections`.
+        .merge(crate::routes::collection_sections::router())
         // Part assignments (issue #10) — see `routes::part_assignments`.
         .merge(crate::routes::part_assignments::router())
         // One player on one part across a whole collection (issue #55).

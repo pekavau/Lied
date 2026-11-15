@@ -135,6 +135,10 @@ const EXPECTED_PATHS: &[&str] = &[
     "/v1/orgs/{orgId}/collections/{collectionId}/undelete",
     "/v1/orgs/{orgId}/collections/{collectionId}/reorder",
     "/v1/orgs/{orgId}/collections/{collectionId}/renumber",
+    "/v1/orgs/{orgId}/collections/{collectionId}/label-choices",
+    // Collection sections (issue #103)
+    "/v1/orgs/{orgId}/collections/{collectionId}/sections",
+    "/v1/orgs/{orgId}/collections/{collectionId}/sections/{sectionId}",
     // Collection items
     "/v1/orgs/{orgId}/collections/{collectionId}/items",
     "/v1/orgs/{orgId}/collections/{collectionId}/coverage",
@@ -973,6 +977,10 @@ fn unpaginated_lists_are_named_exceptions() {
         (
             "/v1/orgs/{orgId}/collections/{collectionId}/items",
             "a collection's running order, read as a whole",
+        ),
+        (
+            "/v1/orgs/{orgId}/collections/{collectionId}/sections",
+            "a standing collection's few headings, read as a whole to place its pieces",
         ),
         (
             "/v1/orgs/{orgId}/arrangements/{arrangementId}/tags",

@@ -68,9 +68,9 @@ fn collection_error_to_app_error(err: collection::CollectionError) -> AppError {
         collection::CollectionError::DuplicateSlug => {
             AppError::Conflict("a collection with this name already exists".into())
         }
-        err @ collection::CollectionError::LabelsTooWide { .. } => {
-            AppError::Conflict(err.to_string())
-        }
+        err @ (collection::CollectionError::LabelsTooWide { .. }
+        | collection::CollectionError::SectionsTooWide { .. }
+        | collection::CollectionError::HasSections) => AppError::Conflict(err.to_string()),
         collection::CollectionError::Database(e) => AppError::Database(e),
     }
 }
@@ -87,7 +87,7 @@ fn validate_number_width(width: Option<i16>) -> Result<(), AppError> {
 /// How a numbering refusal reaches the client: a field error (400) when the
 /// request itself is wrong, a conflict (409) when the collection's current
 /// state stands in the way.
-fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppError {
+pub(crate) fn item_error_to_app_error(err: collection_item::CollectionItemError) -> AppError {
     use collection_item::{CollectionItemError as E, LabelRefusal};
     match err {
         E::Database(e) => AppError::Database(e),
@@ -1159,7 +1159,9 @@ async fn swap_item(
 
 /// Preview a renumber of a standing collection (owner/archivist/conductor):
 /// every piece's label now and after (1..n in the current order, letters
-/// dropped), and the token that applies exactly this.
+/// dropped), every section's start now and after (its first piece's new
+/// number; a section without pieces keeps one number right after the pieces
+/// before it), and the token that applies exactly this.
 ///
 /// A program is always numbered 1..n, so it answers 409.
 #[utoipa::path(
@@ -1209,10 +1211,14 @@ struct RenumberCollectionRequest {
 struct RenumberResult {
     /// Every piece, in order, with its label before and after.
     changes: Vec<collection_item::RenumberChange>,
+    /// Every section, in order, with its start before and after.
+    section_changes: Vec<collection_item::SectionRenumberChange>,
 }
 
 /// Renumber a standing collection (owner/archivist/conductor): labels 1..n
-/// in the current order, closing every gap and dropping letters.
+/// in the current order, closing every gap and dropping letters. Each
+/// section then starts at its first piece's new number; a section without
+/// pieces keeps one number, right after the pieces before it.
 ///
 /// This changes the numbers printed in the players' folders, so it applies
 /// only the preview the client showed: a `previewToken` from a collection
@@ -1247,9 +1253,13 @@ async fn renumber_collection(
 ) -> Result<Json<RenumberResult>, AppError> {
     require_collection_editor_v1(&state, &auth, org_id).await?;
     find_collection_scoped(&state, org_id, collection_id).await?;
-    let changes = collection_item::renumber(&state.db, collection_id, &body.preview_token)
+    let outcome = collection_item::renumber(&state.db, collection_id, &body.preview_token)
         .await
         .map_err(item_error_to_app_error)?;
+    let collection_item::RenumberOutcome {
+        changes,
+        section_changes,
+    } = outcome;
 
     audit(
         &state.db,
@@ -1261,11 +1271,14 @@ async fn renumber_collection(
         "collection.renumber",
         "collection",
         Some(collection_id),
-        serde_json::json!({ "changes": changes }),
+        serde_json::json!({ "changes": changes, "sectionChanges": section_changes }),
     )
     .await;
 
-    Ok(Json(RenumberResult { changes }))
+    Ok(Json(RenumberResult {
+        changes,
+        section_changes,
+    }))
 }
 
 /// Coverage for a collection: which required voices are assigned, and which are

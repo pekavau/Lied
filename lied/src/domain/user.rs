@@ -282,7 +282,7 @@ pub async fn list(
 ///   `membership.user_id`, `part_assignment.user_id`,
 ///   `global_annotation.author_id`, `app_password.user_id`, and the
 ///   `created_by` columns of work, arrangement, voice, file, collection,
-///   collection item, part assignment, tag and global annotation. A delete
+///   collection item, collection section, part assignment, tag and global annotation. A delete
 ///   while any such row exists violates the FK and errors, which the routes
 ///   report as `409` — a hard stop rather than silently deleting a user
 ///   whose work is still on record.

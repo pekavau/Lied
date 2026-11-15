@@ -241,7 +241,7 @@ pub async fn update_name(
 
 /// Hard-delete an organization, cascading in the FK-safe order documented in
 /// docs/design.md ("Cascade order"): PartAssignments -> CollectionItems ->
-/// Collections -> ArrangementTags -> Tags -> GlobalAnnotations -> Files ->
+/// CollectionSections -> Collections -> ArrangementTags -> Tags -> GlobalAnnotations -> Files ->
 /// Voices -> Arrangements -> Memberships -> the Organization row. Phase 1 has
 /// no File/Voice/Arrangement/Collection/etc. domain modules yet (later
 /// items), but the *tables* already exist (issue #3 migrations), so this
@@ -293,6 +293,16 @@ pub async fn delete(
     sqlx::query!(
         r#"
         DELETE FROM collection_item
+        WHERE collection_id IN (SELECT id FROM collection WHERE organization_id = $1)
+        "#,
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        r#"
+        DELETE FROM collection_section
         WHERE collection_id IN (SELECT id FROM collection WHERE organization_id = $1)
         "#,
         id
