@@ -67,10 +67,9 @@ fn map_write_error(err: sqlx::Error) -> ArrangementError {
 
 /// Slugify an arrangement title (docs/design.md: slugs are generated from the
 /// title/name at creation and are immutable thereafter). Reuses the
-/// shared ASCII/lowercase/hyphenate algorithm — see
-/// [`crate::domain::user::slugify`].
+/// shared transliterating algorithm — see [`crate::slug::slugify`].
 pub fn slugify(input: &str) -> String {
-    crate::domain::user::slugify(input)
+    crate::slug::slugify(input, "arrangement")
 }
 
 /// Mutable fields shared by create/update — bundled so positional args don't

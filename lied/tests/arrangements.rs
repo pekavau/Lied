@@ -272,6 +272,36 @@ async fn archivist_creates_an_arrangement_with_a_slug_and_it_is_audited() {
     assert_eq!(audit_count(&db.pool, "arrangement.create").await, 1);
 }
 
+/// Non-ASCII titles get readable, distinct slugs (#42). Before, "Boléro"
+/// became `bol-ro`, and every title with no ASCII letters became the literal
+/// `user`, so the second such arrangement in an org failed with a 409.
+#[tokio::test]
+async fn non_ascii_titles_get_transliterated_distinct_slugs() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let (org_id, token) =
+        org_with_member(&db.pool, &state, "Org", "arch", membership::Role::Archivist).await;
+
+    let cases = [
+        ("Boléro", "bolero"),
+        ("Märsche", "maersche"),
+        ("序曲", "xu-qu"),
+        ("终曲", "zhong-qu"),
+        ("Щелкунчик", "shchelkunchik"),
+    ];
+    for (title, slug) in cases {
+        let body = create_arrangement_json(&app, &token, org_id, title).await;
+        assert_eq!(body["slug"], slug, "{title}");
+        assert_eq!(body["title"], title, "the title keeps its Unicode");
+    }
+
+    // Two titles with nothing to transliterate still get distinct slugs.
+    let a = create_arrangement_json(&app, &token, org_id, "!!!").await;
+    let b = create_arrangement_json(&app, &token, org_id, "???").await;
+    assert_ne!(a["slug"], b["slug"]);
+    assert!(a["slug"].as_str().unwrap().starts_with("arrangement-"));
+}
+
 #[tokio::test]
 async fn musician_cannot_create_an_arrangement() {
     let db = TestDb::create_and_migrate().await;

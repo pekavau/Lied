@@ -539,12 +539,8 @@ async fn create_collection(
             "Choose a collection type: program or standing.",
         );
     };
-    // NOTE: the shared `slugify` never yields an empty string — a name with no
-    // ASCII alphanumerics falls back to the literal "user" (see
-    // `domain::user::slugify`, which every entity delegates to). That fallback
-    // reads oddly on a collection, but it is pre-existing behaviour shared with
-    // orgs and arrangements, so it is not re-specified here; issue #42 is the
-    // place where slug generation gets revisited.
+    // Never empty: a name with nothing transliterable becomes
+    // `collection-<hash>` (see `crate::slug`).
     let slug = collection::slugify(&name);
 
     match collection::create(
