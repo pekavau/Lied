@@ -48,7 +48,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
     let session_layer =
         crate::auth::session::build_session_layer(state.db.clone(), state.config.secure_cookies);
 
-    // The login POST gets its own per-IP rate-limit bucket (CLAUDE.md
+    // The login POST gets its own per-IP rate-limit bucket (docs/design.md
     // Security baseline: "Login / password endpoints: 10 req/min per IP");
     // scoped to just this route, not the whole `/admin` tree, since HTMX
     // UIs fire several requests per interaction on the rest of the tree.
@@ -258,7 +258,7 @@ struct LoginForm {
 }
 
 /// `POST /admin/login` — verifies username+password and, on success,
-/// stores the user id in the session (CLAUDE.md: "on success put user id
+/// stores the user id in the session (docs/design.md: "on success put user id
 /// into the session"). The login *form post itself* is deliberately
 /// exempt from the CSRF header check below since the form is rendered
 /// server-side with no prior HTMX-driven page load to source an `HX-CSRF`
@@ -299,7 +299,7 @@ async fn login_submit(
 }
 
 /// `POST /admin/logout` — clears the session only. Does not touch any
-/// bearer token or app password (CLAUDE.md acceptance criterion: the three
+/// bearer token or app password (docs/design.md acceptance criterion: the three
 /// auth paths are independent).
 async fn logout_submit(
     State(state): State<AppState>,

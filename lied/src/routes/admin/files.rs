@@ -180,7 +180,7 @@ async fn files_page(
     };
     let can_edit = ctx.can_edit_arrangements();
 
-    // One screenful is the operator-configured page ceiling (CLAUDE.md: every
+    // One screenful is the operator-configured page ceiling (docs/design.md: every
     // limit is documented and configurable — never a literal here). The total
     // is kept so a list longer than the page says so instead of silently
     // truncating.

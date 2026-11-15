@@ -1,4 +1,4 @@
-//! argon2id password hashing for local accounts (CLAUDE.md "Auth &
+//! argon2id password hashing for local accounts (docs/design.md "Auth &
 //! access": "Local accounts (username/password, argon2id hashing)").
 //!
 //! Used for `User.password_hash` (local login) only. App-password tokens

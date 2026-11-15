@@ -1,5 +1,5 @@
 # The /v1 JSON tree must answer every error as RFC 7807 Problem Details
-# (CLAUDE.md, HTTP & REST API conventions). axum's own extractors reject a bad
+# (docs/design.md, HTTP & REST API conventions). axum's own extractors reject a bad
 # request in plain text, so /v1 uses the crate's wrappers instead
 # (`routes::json::ApiJson`, `routes::params::{ApiPath, ApiQuery}`). The HTMX
 # console renders HTML and is exempt (`routes::admin`). `axum::Json` is not

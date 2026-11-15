@@ -1,7 +1,7 @@
 //! `/admin/orgs`, `/admin/orgs/{id}`, `/admin/users` — the **system-admin**
 //! provisioning screens (issue #5): org and user create/delete, plus a
 //! **read-only** member roster on the org-detail page. Server-rendered HTML
-//! fragments per CLAUDE.md's HTMX admin-UI convention.
+//! fragments per docs/design.md's HTMX admin-UI convention.
 //!
 //! Member *management* (add / role / instruments / remove) is **not** here —
 //! it moved to the per-org console ([`crate::routes::admin::members`], issue
@@ -10,7 +10,7 @@
 //! Authorization mirrors the `/v1` handlers in [`crate::routes::orgs`]: org
 //! create/delete and user create/delete are system-admin-gated. A caller who
 //! fails a check gets a small HTML error fragment (not Problem Details — the
-//! HTMX tree is exempt from RFC 7807 per CLAUDE.md) with the same status code.
+//! HTMX tree is exempt from RFC 7807 per docs/design.md) with the same status code.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -48,7 +48,7 @@ pub fn router() -> Router<AppState> {
 
 /// Render a small HTML error fragment carrying `status`, for use by every
 /// handler in this module — the `/admin` tree's equivalent of `AppError`'s
-/// Problem Details (CLAUDE.md: "HTMX error responses are HTML fragments,
+/// Problem Details (docs/design.md: "HTMX error responses are HTML fragments,
 /// not Problem Details").
 fn error_fragment(status: StatusCode, message: &str) -> Response {
     (status, Html(format!("<p class=\"error\">{message}</p>"))).into_response()
@@ -184,7 +184,7 @@ async fn create_org_submit(
 /// `POST /admin/orgs/{id}/delete` — hard-delete an organization
 /// (system-admin-only). No `If-Match` in the admin UI: this form has no
 /// ETag to carry, and the HTMX tree isn't bound by the `/v1` optimistic-
-/// concurrency contract (CLAUDE.md scopes that convention to the JSON tree).
+/// concurrency contract (docs/design.md scopes that convention to the JSON tree).
 async fn delete_org_submit(
     AuthSession(actor): AuthSession,
     State(state): State<AppState>,

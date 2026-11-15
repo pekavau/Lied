@@ -3,7 +3,7 @@
 //! (Org/User/Membership management).
 //!
 //! This module is the first to apply the full REST convention set from
-//! CLAUDE.md "HTTP & REST API conventions" end to end: allowlisted sort/
+//! docs/design.md "HTTP & REST API conventions" end to end: allowlisted sort/
 //! filter (`crate::listing`), ETag/`If-Match` optimistic concurrency, and
 //! `is_system_admin`/`Membership.role`-gated authorization
 //! (`crate::auth::authz`). Every later phase-1 item's list/detail/mutate
@@ -440,7 +440,7 @@ async fn delete_org(
 }
 
 // ---------------------------------------------------------------------------
-// Users — system-admin-gated create/delete; open list/get (CLAUDE.md: no
+// Users — system-admin-gated create/delete; open list/get (docs/design.md: no
 // `deleted_at` on User, deletion is admin-gated hard delete).
 // ---------------------------------------------------------------------------
 

@@ -14,7 +14,7 @@ tokio::task_local! {
     /// The id of the request being served, set for the whole request by the
     /// router's request-ID middleware so an error rendered anywhere below it
     /// (handler, extractor rejection) can carry it as the Problem Details
-    /// `instance` — the log-correlation key CLAUDE.md asks for.
+    /// `instance` — the log-correlation key docs/design.md asks for.
     pub static REQUEST_ID: uuid::Uuid;
 }
 
@@ -66,7 +66,7 @@ pub enum AppError {
 
     /// A write would violate a business invariant that isn't a simple
     /// validation failure on the request body — e.g. demoting/removing the
-    /// last `owner` of an organization (CLAUDE.md: "every org keeps >=1
+    /// last `owner` of an organization (docs/design.md: "every org keeps >=1
     /// owner; demoting the last owner is rejected"). `409 Conflict` (rather
     /// than `422`) was chosen because the request is syntactically and
     /// semantically valid on its own; it only conflicts with the *current

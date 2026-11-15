@@ -1,7 +1,7 @@
-//! `create_admin`: bootstrap the first `is_system_admin` user (CLAUDE.md
+//! `create_admin`: bootstrap the first `is_system_admin` user (docs/design.md
 //! Auth & access; backs the `lied-server create-admin` CLI subcommand).
 //!
-//! Lives in the library (not the binary) per CLAUDE.md's "thin binary"
+//! Lives in the library (not the binary) per docs/design.md's "thin binary"
 //! convention, and so it's directly testable without spawning a process.
 
 use serde_json::json;

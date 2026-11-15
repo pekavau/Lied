@@ -90,7 +90,7 @@ fn is_param(pair: &str, param: &str) -> bool {
 /// [`SetRequestIdLayer`] stamps on every inbound request (and that the trace
 /// span logs). Handlers take this extractor and pass it into [`audit`] so the
 /// audit row's `request_id` correlates with the tracing span — that is the
-/// whole reason the column exists (CLAUDE.md Security baseline: audit
+/// whole reason the column exists (docs/design.md Security baseline: audit
 /// `request_id` "correlates with the tracing span").
 ///
 /// Falls back to a fresh id only if the header is somehow absent or

@@ -1,7 +1,7 @@
 -- File: an actual file representing a voice or full score, in a specific
--- format (CLAUDE.md Entities: File). `voice_id` is nullable for full-score
+-- format (docs/design.md Entities: File). `voice_id` is nullable for full-score
 -- files. The MinIO object key is derived from the entity tree, not stored
--- (see CLAUDE.md Decisions: Files & storage).
+-- (see docs/design.md Decisions: Files & storage).
 CREATE TABLE file (
     id                      uuid PRIMARY KEY,
     arrangement_id          uuid NOT NULL REFERENCES arrangement (id),
@@ -23,7 +23,7 @@ CREATE INDEX file_arrangement_id_idx ON file (arrangement_id);
 CREATE INDEX file_voice_id_idx ON file (voice_id);
 CREATE INDEX file_derived_from_file_id_idx ON file (derived_from_file_id);
 
--- Unique constraints table (CLAUDE.md): two partial indexes, since
+-- Unique constraints table (docs/design.md): two partial indexes, since
 -- Postgres treats NULL as distinct in a unique index and a single index
 -- over (arrangement_id, voice_id, name, format) would not collapse
 -- multiple full-score rows (voice_id IS NULL) the way we want compared

@@ -39,7 +39,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
 }
 
 /// Authenticates every request under `/orgs` and `/users` via HTTP Basic +
-/// app password (CLAUDE.md AppPassword entity). On success, the
+/// app password (docs/design.md AppPassword entity). On success, the
 /// authenticated user id/username are inserted into the request
 /// extensions for downstream handlers; on failure, short-circuits with
 /// `401` + `WWW-Authenticate: Basic` (RFC 7617) without reaching any

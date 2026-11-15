@@ -7,11 +7,11 @@
 //! with `409` if the collection changed in between, so a client never assigns
 //! something it was not shown.
 //!
-//! Both require `owner`/`archivist`/`conductor` (CLAUDE.md Permission matrix:
+//! Both require `owner`/`archivist`/`conductor` (docs/design.md Permission matrix:
 //! "Part assignments") — the preview included, since it reveals which parts a
 //! named user holds across the collection. Neither is paginated: both are
 //! bounded by the collection's size, like the coverage report — an exception to
-//! the list-endpoint envelope recorded in CLAUDE.md.
+//! the list-endpoint envelope recorded in docs/design.md.
 
 use axum::extract::State;
 use axum::Json;

@@ -1,9 +1,9 @@
-//! Work: the abstract musical work (CLAUDE.md Entities: Work). Instance-wide
-//! — no `organization_id`, no `deleted_at` (CLAUDE.md: "Works are durable
+//! Work: the abstract musical work (docs/design.md Entities: Work). Instance-wide
+//! — no `organization_id`, no `deleted_at` (docs/design.md: "Works are durable
 //! references, orphans are not garbage-collected"). No unique constraint:
 //! duplicates allowed in phase 1.
 //!
-//! Permissions (CLAUDE.md Decisions): *creating* a Work is open to any
+//! Permissions (docs/design.md Decisions): *creating* a Work is open to any
 //! authenticated user with >= 1 `Membership` in any org; *editing* is
 //! restricted to `created_by` or `is_system_admin` — enforced by
 //! [`crate::routes::arrangements`], not here (this module is pure data
@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of a `work` row. `camelCase` per CLAUDE.md's JSON-
+/// Wire representation of a `work` row. `camelCase` per docs/design.md's JSON-
 /// casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -31,7 +31,7 @@ pub struct Work {
 
 impl Work {
     /// Whether `user_id` (and whether they are a system admin) may edit/
-    /// delete this Work (CLAUDE.md: "editing a Work is restricted to its
+    /// delete this Work (docs/design.md: "editing a Work is restricted to its
     /// original creator ... or any `is_system_admin`").
     pub fn is_editable_by(&self, user_id: Uuid, is_system_admin: bool) -> bool {
         is_system_admin || self.created_by == Some(user_id)
@@ -39,7 +39,7 @@ impl Work {
 }
 
 /// Insert a new Work row. Creation has no slug/uniqueness constraint
-/// (CLAUDE.md: "no unique constraint -- duplicates allowed in phase 1").
+/// (docs/design.md: "no unique constraint -- duplicates allowed in phase 1").
 pub async fn create(
     pool: &PgPool,
     id: Uuid,
@@ -228,7 +228,7 @@ pub async fn update(
     }))
 }
 
-/// Hard-delete a Work row. CLAUDE.md gives Work no `deleted_at`, and the
+/// Hard-delete a Work row. docs/design.md gives Work no `deleted_at`, and the
 /// only FK referencing it (`arrangement.work_id`) is nullable with no
 /// `ON DELETE` clause, so deleting a Work still referenced by a live
 /// Arrangement fails the FK constraint — callers should map that to a `409`

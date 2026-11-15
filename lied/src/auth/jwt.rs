@@ -1,5 +1,5 @@
 //! Bearer tokens: HS256 JWTs with a `kid` header and a keyring that can
-//! honor an old signing key during a rotation grace window (CLAUDE.md
+//! honor an old signing key during a rotation grace window (docs/design.md
 //! "Tech stack": jsonwebtoken section).
 //!
 //! Phase 1 seeds the keyring from the single `config.jwt_signing_key` — see
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Claims carried by every Lied bearer token (CLAUDE.md: "Claims: `sub`
+/// Claims carried by every Lied bearer token (docs/design.md: "Claims: `sub`
 /// (user id), `org` (active org id, nullable...), `iat`, `exp`, `jti`").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -61,7 +61,7 @@ struct KeyEntry {
 /// (current + any still-honored old ones) usable for *verification*. New
 /// tokens are always signed with [`Keyring::current_kid`]; verification
 /// selects the matching key by the token's `kid` header rather than trying
-/// every key in turn (CLAUDE.md: "the verifier selects by `kid` rather than
+/// every key in turn (docs/design.md: "the verifier selects by `kid` rather than
 /// trial-verifying against each").
 pub struct Keyring {
     current_kid: String,

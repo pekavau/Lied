@@ -1,6 +1,6 @@
 //! Collection: a named, indexed set of arrangements belonging to an
-//! organization (CLAUDE.md Entities: Collection). Issue #9 adds CRUD +
-//! soft-delete/undelete, gated to `owner`/`archivist`/`conductor` (CLAUDE.md
+//! organization (docs/design.md Entities: Collection). Issue #9 adds CRUD +
+//! soft-delete/undelete, gated to `owner`/`archivist`/`conductor` (docs/design.md
 //! Permission matrix: "Build/edit collections").
 //!
 //! A collection is a `program` (fixed concert sequence) or `standing`
@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// The two collection kinds (CLAUDE.md: `program` | `standing`). Stored as
+/// The two collection kinds (docs/design.md: `program` | `standing`). Stored as
 /// `text` + `CHECK` per the enum convention; validated before write.
 pub const COLLECTION_TYPES: &[&str] = &["program", "standing"];
 
@@ -27,7 +27,7 @@ pub fn is_valid_type(value: &str) -> bool {
     COLLECTION_TYPES.contains(&value)
 }
 
-/// Wire representation of a `collection` row. `camelCase` per CLAUDE.md's
+/// Wire representation of a `collection` row. `camelCase` per docs/design.md's
 /// JSON-casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +62,7 @@ fn map_write_error(err: sqlx::Error) -> CollectionError {
     CollectionError::Database(err)
 }
 
-/// Slugify a collection name (immutable once created, per CLAUDE.md).
+/// Slugify a collection name (immutable once created, per docs/design.md).
 pub fn slugify(input: &str) -> String {
     crate::domain::user::slugify(input)
 }

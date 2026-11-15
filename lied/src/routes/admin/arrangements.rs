@@ -11,7 +11,7 @@
 //! **Optimistic concurrency:** edit forms carry the arrangement's
 //! `updated_at` (ms epoch) in a hidden `expected_version` field; a stale value
 //! on submit yields a friendly `412` retry page rather than a silent
-//! overwrite (CLAUDE.md HTTP conventions: "HTMX forms carry the ETag in a
+//! overwrite (docs/design.md HTTP conventions: "HTMX forms carry the ETag in a
 //! hidden field").
 
 use axum::extract::{Path, Query, State};
@@ -68,7 +68,7 @@ pub fn router() -> Router<AppState> {
         .route("/orgs/:org_id/works/:work_id", post(update_work))
 }
 
-/// Difficulty scales offered in the ratings editor (CLAUDE.md: "UI suggests
+/// Difficulty scales offered in the ratings editor (docs/design.md: "UI suggests
 /// known scales ... via autocomplete"). `abrsm` is special-cased — it must
 /// agree with the numeric `difficulty` column.
 const RATING_SCALES: &[(&str, &str)] = &[
@@ -120,7 +120,7 @@ pub(crate) fn audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
 }
 
 /// Audit context for a write to an **instance-wide** entity (a `Work`), whose
-/// events are not attributed to an org (CLAUDE.md: "instance-wide events are
+/// events are not attributed to an org (docs/design.md: "instance-wide events are
 /// not attributed to an org"; `org_id` is `NULL`). Mirrors the `/v1` Work
 /// handlers, which pass `org_id: None`.
 fn instance_audit_ctx(ctx: &ConsoleCtx, request_id: Uuid) -> AuditContext {
@@ -311,7 +311,7 @@ impl ArrangementForm {
         // The ABRSM rating maps to the numeric `difficulty` column, so validate
         // it independently of whether `difficulty` is set: it must be a number
         // on the 1–8 grade scale (unlike the other, free-form scales). Then, if
-        // `difficulty` is also present, the two must agree (rounded) — CLAUDE.md
+        // `difficulty` is also present, the two must agree (rounded) — docs/design.md
         // difficulty_ratings rule. Validating only in the agreement branch let a
         // blank difficulty pass any garbage ("99", "x") straight into storage.
         if let Some(serde_json::Value::String(abrsm)) = ratings.get("abrsm") {

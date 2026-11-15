@@ -11,7 +11,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Host-mounted per the phase-1 backup posture (CLAUDE.md): `just backup`
+      # Host-mounted per the phase-1 backup posture (docs/design.md): `just backup`
       # and disaster recovery operate directly on these directories.
       - ./.data/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -38,7 +38,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      # Host-mounted per the phase-1 backup posture (CLAUDE.md).
+      # Host-mounted per the phase-1 backup posture (docs/design.md).
       - ./.data/minio:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
@@ -77,7 +77,7 @@ services:
 volumes:
   # Postgres data, MinIO data, and the backup target dir (./backup, used by
   # `just backup`) are intentionally host-mounted bind paths above, not
-  # named volumes, per the phase-1 backup posture in CLAUDE.md — required
+  # named volumes, per the phase-1 backup posture in docs/design.md — required
   # so `pg_dump`/`mc mirror` and disaster-recovery tooling can reach them
   # directly from the host. Only the cargo build caches below are named
   # volumes, since they hold no data that needs backing up.

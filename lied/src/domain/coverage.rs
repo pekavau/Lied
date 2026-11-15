@@ -7,7 +7,7 @@
 //!
 //!   * **unassigned** — nobody is down to play it;
 //!   * **assigned** — someone is, but they have not acknowledged;
-//!   * **rehearsed** — `acknowledged_at` is set, which is CLAUDE.md's
+//!   * **rehearsed** — `acknowledged_at` is set, which is docs/design.md's
 //!     definition of rehearsed coverage.
 //!
 //! `notified_at` is carried alongside rather than folded into those states,

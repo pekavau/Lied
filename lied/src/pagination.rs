@@ -1,6 +1,6 @@
 //! Shared offset/limit pagination envelope for `/v1` list endpoints.
 //!
-//! Per CLAUDE.md's "HTTP & REST API conventions": list endpoints use
+//! Per docs/design.md's "HTTP & REST API conventions": list endpoints use
 //! offset/limit query params and respond with `{ items, total, limit,
 //! offset }`. Default `limit` is the configured default page size, max is
 //! `LIED_MAX_PAGE_SIZE` (both come from [`crate::config::AppConfig`]).

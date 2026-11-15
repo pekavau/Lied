@@ -337,7 +337,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire representation of an `instrument` row. `camelCase` per CLAUDE.md's\nJSON-casing convention.",
+                        "description": "Wire representation of an `instrument` row. `camelCase` per docs/design.md's\nJSON-casing convention.",
                         "required": [
                           "id",
                           "key",
@@ -3048,7 +3048,7 @@
           "files"
         ],
         "summary": "Upload a full-score file",
-        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type` (see the format table in CLAUDE.md).\nThe file is streamed directly to MinIO — server memory per upload is a\nfixed chunk buffer, not proportional to file size.",
+        "description": "The request body must be `multipart/form-data` with a single part that\ncarries a recognised `Content-Type` (see the format table in docs/design.md).\nThe file is streamed directly to MinIO — server memory per upload is a\nfixed chunk buffer, not proportional to file size.",
         "operationId": "upload_score_file",
         "parameters": [
           {
@@ -6016,7 +6016,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire representation of a `collection` row. `camelCase` per CLAUDE.md's\nJSON-casing convention.",
+                        "description": "Wire representation of a `collection` row. `camelCase` per docs/design.md's\nJSON-casing convention.",
                         "required": [
                           "id",
                           "organizationId",
@@ -11458,7 +11458,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "Wire representation of a `work` row. `camelCase` per CLAUDE.md's JSON-\ncasing convention.",
+                        "description": "Wire representation of a `work` row. `camelCase` per docs/design.md's JSON-\ncasing convention.",
                         "required": [
                           "id",
                           "title",
@@ -12064,7 +12064,7 @@
     "schemas": {
       "AppPasswordSummary": {
         "type": "object",
-        "description": "Wire representation of an `app_password` row. Never carries `hash` or\nthe plaintext token — only metadata, per CLAUDE.md's \"shown ONCE on\ncreation\" rule.",
+        "description": "Wire representation of an `app_password` row. Never carries `hash` or\nthe plaintext token — only metadata, per docs/design.md's \"shown ONCE on\ncreation\" rule.",
         "required": [
           "id",
           "name",
@@ -12289,7 +12289,7 @@
       },
       "Collection": {
         "type": "object",
-        "description": "Wire representation of a `collection` row. `camelCase` per CLAUDE.md's\nJSON-casing convention.",
+        "description": "Wire representation of a `collection` row. `camelCase` per docs/design.md's\nJSON-casing convention.",
         "required": [
           "id",
           "organizationId",
@@ -13107,7 +13107,7 @@
               "null"
             ],
             "format": "uuid",
-            "description": "Optional active org id to scope the token to (CLAUDE.md JWT claims:\n`org`, nullable). Not validated against Membership in this item —\norg-scoping enforcement is a later authorization concern; minting\njust records the claim."
+            "description": "Optional active org id to scope the token to (docs/design.md JWT claims:\n`org`, nullable). Not validated against Membership in this item —\norg-scoping enforcement is a later authorization concern; minting\njust records the claim."
           },
           "password": {
             "type": [
@@ -13587,7 +13587,7 @@
       },
       "UpdateAssignmentRequest": {
         "type": "object",
-        "description": "Request body for `PATCH .../assignments/{assignmentId}` — sets or clears\n`notifiedAt`/`acknowledgedAt`. The notification/acknowledgement\n*workflow* is deferred (CLAUDE.md phase-1 cut), but the fields are\nsettable now. A partial update: an omitted field is kept, `null` clears it.",
+        "description": "Request body for `PATCH .../assignments/{assignmentId}` — sets or clears\n`notifiedAt`/`acknowledgedAt`. The notification/acknowledgement\n*workflow* is deferred (docs/design.md phase-1 cut), but the fields are\nsettable now. A partial update: an omitted field is kept, `null` clears it.",
         "properties": {
           "acknowledgedAt": {
             "type": [
@@ -13938,7 +13938,7 @@
       },
       "Work": {
         "type": "object",
-        "description": "Wire representation of a `work` row. `camelCase` per CLAUDE.md's JSON-\ncasing convention.",
+        "description": "Wire representation of a `work` row. `camelCase` per docs/design.md's JSON-\ncasing convention.",
         "required": [
           "id",
           "title",

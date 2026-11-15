@@ -1,4 +1,4 @@
-//! Shared HTML shell for `/admin` pages, built with `maud` (CLAUDE.md Admin
+//! Shared HTML shell for `/admin` pages, built with `maud` (docs/design.md Admin
 //! UI: "`maud` for templates"). This item (issue #5) is the first to render a
 //! real page (vs. the hand-rolled login-page string in `routes::admin`), so
 //! the page shell and the CSRF field helper live here once, for every later
@@ -18,7 +18,7 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 /// CSRF middleware compares this field against the session value on every
 /// state-changing submit. maud auto-escapes the value.
 /// An instant as a machine-readable `<time>` whose text is explicitly UTC.
-/// CLAUDE.md: the server never guesses a display time zone, so it says which
+/// docs/design.md: the server never guesses a display time zone, so it says which
 /// one it used rather than printing a bare date that reads as local.
 pub fn utc_time(at: chrono::DateTime<chrono::Utc>) -> Markup {
     maud::html! {

@@ -1,6 +1,6 @@
 //! Per-role visibility for the WebDAV arrangements tree (issue #8, step 2).
 //!
-//! Implements the read-filtering and PROPFIND root-scope rules from CLAUDE.md
+//! Implements the read-filtering and PROPFIND root-scope rules from docs/design.md
 //! ("WebDAV layout" → collections-subtree visibility + PROPFIND scope):
 //!
 //! - **Staff** (`owner` / `archivist` / `conductor`) see every arrangement in
@@ -158,7 +158,7 @@ pub async fn has_assignment_on_arrangement(
 
 /// Whether a user holds a part assignment on a specific voice. Restricted
 /// users may only see voices (and their files) they are assigned to
-/// (CLAUDE.md: "musician sees only the files for voices where they have a
+/// (docs/design.md: "musician sees only the files for voices where they have a
 /// PartAssignment").
 pub async fn has_assignment_on_voice(
     pool: &PgPool,
@@ -182,7 +182,7 @@ pub async fn has_assignment_on_voice(
 
 // ── collections subtree (read-only computed view, issue #10) ───────────────
 //
-// The collections subtree is "not a separate permission domain" (CLAUDE.md):
+// The collections subtree is "not a separate permission domain" (docs/design.md):
 // whatever a restricted user may see under `arrangements/` they may see here,
 // scoped to *this specific collection item* rather than "any item ever". A
 // restricted user (musician member, or guest with no membership) sees only
@@ -318,7 +318,7 @@ pub async fn visible_collection_slugs(
 /// A live collection item as seen through the WebDAV collections tree: its id,
 /// index, and its arrangement's slug (the item's WebDAV directory name is
 /// `<index>-<arrangementSlug>`). An item whose arrangement is soft-deleted is
-/// excluded — unlike the REST hide-with-references view (CLAUDE.md
+/// excluded — unlike the REST hide-with-references view (docs/design.md
 /// `CollectionItemView::arrangement_removed`), there is no meaningful
 /// directory to show for a filesystem view with no live files behind it.
 pub struct VisibleCollectionItem {

@@ -1,7 +1,7 @@
 -- PartAssignment: which user plays which voice for a specific item in a
--- collection (CLAUDE.md Entities: PartAssignment). Does not require the
+-- collection (docs/design.md Entities: PartAssignment). Does not require the
 -- user to hold a Membership in the org -- this is how guest/substitute
--- musicians are modeled. Not in the soft-delete entity list in CLAUDE.md;
+-- musicians are modeled. Not in the soft-delete entity list in docs/design.md;
 -- reassignment replaces the row (per the Unique-constraints table note),
 -- so no `deleted_at` here.
 CREATE TABLE part_assignment (
@@ -20,7 +20,7 @@ CREATE INDEX part_assignment_collection_item_id_idx ON part_assignment (collecti
 CREATE INDEX part_assignment_user_id_idx ON part_assignment (user_id);
 CREATE INDEX part_assignment_voice_id_idx ON part_assignment (voice_id);
 
--- Unique constraints table (CLAUDE.md): PartAssignment (collection_item_id,
+-- Unique constraints table (docs/design.md): PartAssignment (collection_item_id,
 -- voice_id) -- one assignee per voice per item; reassignment replaces the
 -- row. No soft-delete on this entity, so a plain unique index.
 CREATE UNIQUE INDEX part_assignment_collection_item_id_voice_id_key

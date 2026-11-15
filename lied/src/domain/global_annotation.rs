@@ -1,9 +1,9 @@
 //! GlobalAnnotation: a conductor's note on an arrangement that applies to the
-//! whole ensemble — a tempo decision, a cut, a dynamic shape (CLAUDE.md
+//! whole ensemble — a tempo decision, a cut, a dynamic shape (docs/design.md
 //! Entities: GlobalAnnotation; UC-16). Issue #36 activates the authoring half;
 //! musicians read them in the phase-3 client, not over WebDAV.
 //!
-//! **Hard delete.** `global_annotation` has no `deleted_at` (CLAUDE.md
+//! **Hard delete.** `global_annotation` has no `deleted_at` (docs/design.md
 //! Unique-constraints table), so [`delete`] removes the row and returns what it
 //! removed; the caller records that in the audit log, which is then the only
 //! copy.

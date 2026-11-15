@@ -1,4 +1,4 @@
-//! WebDAV app-password token generation and verification (CLAUDE.md
+//! WebDAV app-password token generation and verification (docs/design.md
 //! Entities: AppPassword).
 //!
 //! Token format: `lied_<base64url(32 random bytes)>`. The plaintext is
@@ -6,7 +6,7 @@
 //! plus an 8-character `prefix` (the first 8 characters of the *full* token
 //! string, i.e. `lied_xx`) are persisted. The prefix lets WebDAV Basic-auth
 //! narrow `SELECT ... WHERE user_id = ? AND prefix = ?` to a small candidate
-//! set before paying argon2's intentionally slow verify cost (CLAUDE.md
+//! set before paying argon2's intentionally slow verify cost (docs/design.md
 //! AppPassword entity notes).
 
 use argon2::password_hash::rand_core::OsRng as PasswordOsRng;
@@ -18,7 +18,7 @@ use rand::RngCore;
 
 pub const TOKEN_PREFIX: &str = "lied_";
 /// Length, in characters, of the stored `AppPassword.prefix` column — the
-/// first 8 characters of the full token string (CLAUDE.md: "first 8 chars
+/// first 8 characters of the full token string (docs/design.md: "first 8 chars
 /// of the token"), including the `lied_` literal.
 pub const PREFIX_LEN: usize = 8;
 
@@ -54,7 +54,7 @@ pub fn generate() -> Result<GeneratedToken, AppPasswordError> {
 
 /// Hash a plaintext app-password token with argon2id. Separate from
 /// [`crate::auth::password::hash_password`] only by call site/intent — same
-/// algorithm choice (CLAUDE.md: "argon2id of the random token").
+/// algorithm choice (docs/design.md: "argon2id of the random token").
 pub fn hash_token(plaintext: &str) -> Result<String, AppPasswordError> {
     let salt = SaltString::generate(&mut PasswordOsRng);
     let hash = Argon2::default()

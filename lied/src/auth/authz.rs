@@ -1,11 +1,11 @@
-//! Authorization helpers enforcing the CLAUDE.md Permission matrix.
+//! Authorization helpers enforcing the docs/design.md Permission matrix.
 //!
 //! Issue #5 (Org/User/Membership management) is the first item to need
 //! authorization beyond "is there a logged-in user" — every later phase-1
 //! item that gates a route by org role reuses these helpers, so the shape
 //! is deliberately generic rather than copy-pasted per handler.
 //!
-//! Two checks, matching the two halves of CLAUDE.md's authorization model:
+//! Two checks, matching the two halves of docs/design.md's authorization model:
 //! - **Instance-level**: [`require_system_admin`] — `User.is_system_admin`
 //!   short-circuits instance ops (org/user provisioning). There is no
 //!   "system-wide role" beyond this single boolean.
@@ -40,7 +40,7 @@ impl Role {
     /// while conductor can do global annotations but archivist cannot) — so
     /// a single numeric rank would misrepresent the matrix. This helper
     /// covers the owner-only chain; other capability checks should match
-    /// CLAUDE.md's Permission matrix table directly with a `matches!` rather
+    /// docs/design.md's Permission matrix table directly with a `matches!` rather
     /// than extending this into a general lattice.
     pub fn at_least(&self, minimum: Role) -> bool {
         match minimum {
@@ -53,9 +53,9 @@ impl Role {
 }
 
 /// Require the authenticated user to be `is_system_admin`. Used by instance-
-/// level operations (CLAUDE.md: "create/delete Organizations, create/delete
+/// level operations (docs/design.md: "create/delete Organizations, create/delete
 /// Users"). Returns the user on success; `403 Forbidden` Problem Details
-/// otherwise (not `404`, even though it also hides existence — per CLAUDE.md
+/// otherwise (not `404`, even though it also hides existence — per docs/design.md
 /// the matrix violation itself, not resource existence, is the point).
 pub fn require_system_admin(user: &User) -> Result<(), AppError> {
     if user.is_system_admin {
@@ -67,7 +67,7 @@ pub fn require_system_admin(user: &User) -> Result<(), AppError> {
 
 /// Require the authenticated user to hold a `Membership` in `organization_id`
 /// with a role satisfying `Role::at_least(minimum)`. `is_system_admin`
-/// short-circuits to success regardless of membership (CLAUDE.md:
+/// short-circuits to success regardless of membership (docs/design.md:
 /// "`is_system_admin` short-circuits instance ops" — extended here to org
 /// ops too, since an instance admin must be able to fix any org's broken
 /// membership state, e.g. a wiped-out owner). Returns the caller's
@@ -120,7 +120,7 @@ pub enum CoverageScope {
 
 /// Resolve the caller's coverage scope, or `403`.
 ///
-/// This is the one non-staff-facing view phase 2 adds (CLAUDE.md, Phase 2 cut):
+/// This is the one non-staff-facing view phase 2 adds (docs/design.md, Phase 2 cut):
 /// a `musician` with `is_principal` may read their section's coverage and
 /// nothing else. A plain musician, and a non-member, get `403`.
 ///
@@ -164,7 +164,7 @@ pub async fn coverage_scope_for(
 }
 
 /// Require the caller to be able to **build/edit collections** in the org
-/// (CLAUDE.md Permission matrix: `owner`, `archivist`, *or* `conductor`). This
+/// (docs/design.md Permission matrix: `owner`, `archivist`, *or* `conductor`). This
 /// is not a single `at_least` threshold — archivist and conductor are
 /// incomparable — so it delegates to [`Role::can_build_collections`], the one
 /// place that matrix row lives (shared with the `/admin` console gate).

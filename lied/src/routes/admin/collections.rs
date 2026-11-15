@@ -633,7 +633,7 @@ async fn update_collection(
         );
     };
 
-    // The slug is immutable by design (CLAUDE.md: renaming a slug is a separate
+    // The slug is immutable by design (docs/design.md: renaming a slug is a separate
     // admin operation), so only name and type move here.
     match collection::update(
         &state.db,
@@ -1280,7 +1280,7 @@ async fn assignments_page(
         .unwrap_or_else(|| "[removed]".to_string());
     // Members are offered as a convenience list; the field itself accepts any
     // username, which is how a guest or substitute with no membership gets a
-    // part (CLAUDE.md: a PartAssignment grants read access on its own).
+    // part (docs/design.md: a PartAssignment grants read access on its own).
     let member_usernames =
         membership::member_usernames(&state.db, org_id, i64::from(state.config.max_page_size))
             .await

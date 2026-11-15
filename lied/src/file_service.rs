@@ -2,7 +2,7 @@
 //! tree ([`crate::routes::files`]) and the `/admin` console
 //! ([`crate::routes::admin::files`]). Keeping the create-then-stream, key
 //! derivation, provenance, format rules, and rollback in one place stops the
-//! two surfaces (and a future MCP tool) from diverging — CLAUDE.md: business
+//! two surfaces (and a future MCP tool) from diverging — docs/design.md: business
 //! logic lives in the domain/service layer, not duplicated in HTTP handlers.
 //!
 //! Each caller maps [`UploadError`] to its own response style (RFC 7807 for

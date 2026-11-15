@@ -1,4 +1,4 @@
--- Let `audit_log` rows outlive the org/user they reference, per CLAUDE.md.
+-- Let `audit_log` rows outlive the org/user they reference, per docs/design.md.
 --
 -- The original 0018 schema declared `org_id` and `actor_user_id` as plain
 -- `REFERENCES` columns with the default ON DELETE action (NO ACTION /
@@ -6,7 +6,7 @@
 -- RESTRICT FK makes that impossible while any audit row references them — yet
 -- the audit log is exactly the record that must survive the deletion.
 --
--- Two columns, two different intents (CLAUDE.md spells them out separately):
+-- Two columns, two different intents (docs/design.md spells them out separately):
 --
 --   * `org_id` — Organization entity, "Not cascaded": audit_log rows are
 --     "retained with their `org_id` so the deletion itself stays forensically

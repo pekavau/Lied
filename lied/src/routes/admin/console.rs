@@ -13,7 +13,7 @@
 //! the phase-1 `/admin` and `/v1` trees already use — no session-stored
 //! "active org".
 //!
-//! **Authorization** mirrors the CLAUDE.md permission matrix. Access to the
+//! **Authorization** mirrors the docs/design.md permission matrix. Access to the
 //! console at all requires either a staff role (`owner`/`archivist`/
 //! `conductor`), `is_system_admin` (owner-equivalent, matching
 //! [`crate::auth::authz::require_org_role`]), or the **principal carve-out**:

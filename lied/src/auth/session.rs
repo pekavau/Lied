@@ -1,4 +1,4 @@
-//! Postgres-backed web sessions (CLAUDE.md "Auth & access" /
+//! Postgres-backed web sessions (docs/design.md "Auth & access" /
 //! `tower-sessions`).
 //!
 //! Wires `tower_sessions_sqlx_store::PostgresStore` (over the
@@ -6,7 +6,7 @@
 //! `tower_sessions::SessionManagerLayer`, and provides the login/logout
 //! handlers for the `/admin` tree.
 //!
-//! Per CLAUDE.md's infrastructure-pluggability rule, nothing in this module
+//! Per docs/design.md's infrastructure-pluggability rule, nothing in this module
 //! (or anywhere else in the app) JOINs the `tower_sessions.session` table
 //! with domain tables — all access goes through the `SessionStore` trait
 //! that `PostgresStore` implements. The only thing we read out of a
@@ -30,7 +30,7 @@ pub const SESSION_USER_ID_KEY: &str = "user_id";
 pub const SESSION_COOKIE_NAME: &str = "lied_session";
 
 /// Build the session store + manager layer. `secure` should come from
-/// `config.secure_cookies` (see CLAUDE.md note in `config.rs`).
+/// `config.secure_cookies` (see docs/design.md note in `config.rs`).
 ///
 /// Does not call `PostgresStore::migrate()` — the session table is created
 /// by our own numbered migration (`0002_tower_sessions.sql`), not by the
@@ -140,7 +140,7 @@ pub async fn login(
 
 /// Clear the session (logout). Audits `auth.logout`. Does not touch any
 /// app password or bearer token — the three auth paths are independent
-/// (CLAUDE.md acceptance criterion).
+/// (docs/design.md acceptance criterion).
 pub async fn logout(
     pool: &PgPool,
     session: &Session,

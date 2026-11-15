@@ -1,7 +1,7 @@
--- Instrument: instance-wide controlled vocabulary (CLAUDE.md Entities:
+-- Instrument: instance-wide controlled vocabulary (docs/design.md Entities:
 -- Instrument). Seeded with ~150 standard instruments in
 -- 0019_seed_instruments.sql. No `deleted_at` in phase 1 -- referenced by
--- Voice/Membership and never hard-deleted (see CLAUDE.md Decisions).
+-- Voice/Membership and never hard-deleted (see docs/design.md Decisions).
 CREATE TABLE instrument (
     id              uuid PRIMARY KEY,
     key             text NOT NULL,
@@ -15,6 +15,6 @@ CREATE TABLE instrument (
     created_by      uuid
 );
 
--- Unique constraints table (CLAUDE.md): Instrument.key. No soft-delete on
+-- Unique constraints table (docs/design.md): Instrument.key. No soft-delete on
 -- this entity, so a plain (non-partial) unique index is correct.
 CREATE UNIQUE INDEX instrument_key_key ON instrument (key);

@@ -2,7 +2,7 @@
 //! issue #10 (Part assignments + the archivist→musician loop).
 //!
 //! Adds a user as a player of a voice on a `CollectionItem`; a part takes as
-//! many players as the section has (CLAUDE.md Unique-constraints:
+//! many players as the section has (docs/design.md Unique-constraints:
 //! `(collection_item_id, voice_id, user_id)`, issue #53). The assignment is
 //! what grants a guest/substitute (no `Membership`) read access to that voice's
 //! files via the WebDAV collections subtree — see `webdav::access` /
@@ -10,7 +10,7 @@
 //!
 //! Reads require any org membership (`musician`+); writes (add/remove a player,
 //! set `notifiedAt`/`acknowledgedAt`, unassign) require
-//! `owner`/`archivist`/`conductor` (CLAUDE.md Permission matrix: "Part
+//! `owner`/`archivist`/`conductor` (docs/design.md Permission matrix: "Part
 //! assignments"), enforced via [`require_collection_editor_v1`]. Optimistic
 //! concurrency (ETag/`If-Match`), RFC 7807 errors, and an `audit()` on every
 //! write, per the API guidelines. `part_assignment` has no soft-delete —
@@ -90,7 +90,7 @@ async fn find_item_scoped(
 
 /// Resolve an assignment, verifying the whole `org -> collection -> item ->
 /// assignment` chain. `part_assignment` carries no `organization_id` — the
-/// only path to the org is through its `collection_item` (CLAUDE.md: "Every
+/// only path to the org is through its `collection_item` (docs/design.md: "Every
 /// scoped finder MUST verify the collection_item belongs to the org in the
 /// path, else an archivist of org B could assign into org A").
 async fn find_assignment_scoped(
@@ -291,7 +291,7 @@ async fn get_assignment(
 
 /// Request body for `PATCH .../assignments/{assignmentId}` — sets or clears
 /// `notifiedAt`/`acknowledgedAt`. The notification/acknowledgement
-/// *workflow* is deferred (CLAUDE.md phase-1 cut), but the fields are
+/// *workflow* is deferred (docs/design.md phase-1 cut), but the fields are
 /// settable now. A partial update: an omitted field is kept, `null` clears it.
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

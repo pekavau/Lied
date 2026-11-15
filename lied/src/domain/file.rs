@@ -1,11 +1,11 @@
 //! File: a stored representation of a voice or full score in a specific
-//! format (CLAUDE.md Entities: File). Issue #7 adds upload/download with the
+//! format (docs/design.md Entities: File). Issue #7 adds upload/download with the
 //! content streamed to/from MinIO; this module owns the DB rows and the
 //! derived-storage-key computation. The actual byte streaming lives in
 //! [`crate::storage`].
 //!
 //! **Derived storage key.** The MinIO object key is NOT stored — it is
-//! computed from the entity tree (CLAUDE.md Decisions: storage path), so the
+//! computed from the entity tree (docs/design.md Decisions: storage path), so the
 //! REST view and the WebDAV view always agree:
 //!   - voice file:      `orgs/<org>/arrangements/<arr>/voices/<voice>/<name>.<ext>`
 //!   - full-score file: `orgs/<org>/arrangements/<arr>/score/<name>.<ext>`
@@ -13,7 +13,7 @@
 //! **Atomic replacement.** Replacing a file is never an in-place mutation:
 //! [`replace`] inserts a new row and soft-deletes the old one in one
 //! transaction, preserving the `derived_from_file_id` chain and audit history
-//! (CLAUDE.md Decisions: atomic file replacement).
+//! (docs/design.md Decisions: atomic file replacement).
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -21,7 +21,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of a `file` row. `camelCase` per CLAUDE.md's JSON
+/// Wire representation of a `file` row. `camelCase` per docs/design.md's JSON
 /// convention. The MinIO key is derived, not a column — see [`derived_key`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -63,7 +63,7 @@ pub enum FileError {
 }
 
 /// Map a MIME type to the coarse `format` routing key and the canonical file
-/// extension used in the derived MinIO key (CLAUDE.md: `format` is derived
+/// extension used in the derived MinIO key (docs/design.md: `format` is derived
 /// from `mime_type` via a lookup table; the invariant is they must agree).
 /// Returns `None` for an unrecognized type so the caller can 415/400.
 pub fn format_and_ext_for_mime(mime: &str) -> Option<(&'static str, &'static str)> {
@@ -480,7 +480,7 @@ pub async fn list_deleted(
 
 /// Atomically replace a file: soft-delete `old_id` and insert a new row that
 /// records `derived_from_file_id = old_id`-chain continuity, in ONE
-/// transaction (CLAUDE.md: never in-place). The new row's
+/// transaction (docs/design.md: never in-place). The new row's
 /// `derived_from_file_id` is carried from `new.derived_from_file_id` (callers
 /// pass the source-of-derivation, not the replaced row — replacement is an
 /// identity swap, not a derivation). Returns the new row.
@@ -541,7 +541,7 @@ pub async fn replace(
     Ok(row)
 }
 
-/// Soft-delete a file (DB row hidden; MinIO object retained per CLAUDE.md:
+/// Soft-delete a file (DB row hidden; MinIO object retained per docs/design.md:
 /// "DB is source of truth for existence; MinIO versioning is content
 /// history"). Returns `true` if a live row was hidden.
 pub async fn soft_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {

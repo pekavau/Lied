@@ -1,4 +1,4 @@
-//! Instrument: instance-wide controlled vocabulary (CLAUDE.md Entities:
+//! Instrument: instance-wide controlled vocabulary (docs/design.md Entities:
 //! Instrument). Read-only from the application's perspective in phase 1 —
 //! only `GET /v1/instruments` exists; admin add/edit lands later behind
 //! `is_system_admin`.
@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of an `instrument` row. `camelCase` per CLAUDE.md's
+/// Wire representation of an `instrument` row. `camelCase` per docs/design.md's
 /// JSON-casing convention.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -48,7 +48,7 @@ pub async fn list(
     // its own session-expiry column), and when both are present the
     // `query!` macro defaults `timestamptz` columns to
     // `time::OffsetDateTime`. The `as "col: Type"` cast syntax pins the
-    // mapping to `chrono` explicitly, per CLAUDE.md's "Datetime crate:
+    // mapping to `chrono` explicitly, per docs/design.md's "Datetime crate:
     // chrono" decision. The `total!` cast asserts the window count is
     // non-null (it always is).
     let rows = sqlx::query!(

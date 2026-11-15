@@ -1,7 +1,7 @@
 //! MinIO (S3) object streaming for file upload/download (issue #7).
 //!
 //! Both directions are bounded by a fixed buffer, never the file size
-//! (CLAUDE.md NFR: "Uploads stream end-to-end … server memory per upload is
+//! (docs/design.md NFR: "Uploads stream end-to-end … server memory per upload is
 //! fixed at the chunk buffer size"):
 //!   - **Upload** accumulates incoming chunks into ~8 MiB parts and flushes
 //!     each via the S3 `UploadPart` API (`MULTIPART`), enforcing the byte
@@ -386,7 +386,7 @@ pub async fn upload_bytes(
 }
 
 /// Best-effort delete of every version of an object (hard delete only).
-/// Soft delete keeps the object per CLAUDE.md, so phase-1 #7 does not call
+/// Soft delete keeps the object per docs/design.md, so phase-1 #7 does not call
 /// this; it exists for the admin hard-delete flow.
 pub async fn delete_object(s3: &S3Client, bucket: &str, key: &str) -> Result<(), StorageError> {
     s3.delete_object()

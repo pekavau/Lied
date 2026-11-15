@@ -1,5 +1,5 @@
 -- Arrangement: a specific arrangement for specific instrumentation, owned
--- by an organization (CLAUDE.md Entities: Arrangement). Also the
+-- by an organization (docs/design.md Entities: Arrangement). Also the
 -- edition/variant unit: multiple editions of one Work are multiple
 -- Arrangement rows. `slug` is immutable per arrangement; `status` lets an
 -- org retire an edition without deleting it.
@@ -31,7 +31,7 @@ CREATE TABLE arrangement (
 CREATE INDEX arrangement_organization_id_idx ON arrangement (organization_id);
 CREATE INDEX arrangement_work_id_idx ON arrangement (work_id);
 
--- Unique constraints table (CLAUDE.md): Arrangement (organization_id,
+-- Unique constraints table (docs/design.md): Arrangement (organization_id,
 -- slug), live rows only.
 CREATE UNIQUE INDEX arrangement_organization_id_slug_key
     ON arrangement (organization_id, slug)

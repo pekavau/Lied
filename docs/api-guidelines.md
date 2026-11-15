@@ -1,8 +1,9 @@
 # Adding or changing a `/v1` endpoint
 
 The *rules* of the `/v1` contract — pagination, ETags, Problem Details,
-sort/filter allowlists, UUID paths, `camelCase` — live in CLAUDE.md
-("HTTP & REST API conventions" and "Implementation conventions"). This page is
+sort/filter allowlists, UUID paths, `camelCase` — live in
+[`design.md`](design.md) ("HTTP & REST API conventions") and
+[`CLAUDE.md`](../CLAUDE.md) ("Implementation conventions"). This page is
 only the *how*: which pieces of the codebase to reach for so a new endpoint
 follows those rules. The OpenAPI spec (`/openapi.json`, rendered at `/docs`)
 is the published contract and is built from the code, so the code is the
@@ -42,7 +43,7 @@ one `routes!(…)`; the module's router is merged into `v1::api_router`.
   for no auth at all), and must be listed in `ANONYMOUS_OPERATIONS`
   (`only_allowlisted_operations_admit_anonymous_callers`).
   Take the user through `BearerOrSession`: it also enforces the CSRF header on
-  cookie-authenticated writes (CLAUDE.md, CSRF), so a handler that reads the
+  cookie-authenticated writes (design.md, CSRF), so a handler that reads the
   session itself must check it the same way (`csrf::verify_header`, as
   `POST /v1/tokens` does through its `SessionCsrf` guard).
 - **Success responses.** At least one `2xx`
@@ -100,7 +101,7 @@ of the handler side.
 
 ## 5. `PATCH` bodies
 
-`PATCH` is a partial update (CLAUDE.md, issue #23). Give it its own body type,
+`PATCH` is a partial update (design.md, issue #23). Give it its own body type,
 separate from the create body, with `deny_unknown_fields` and every field
 optional (`patch_request_bodies_have_no_required_fields`). The helpers are in
 `lied/src/routes/patch.rs` (module docs state the rules): `present_or_null` to
@@ -112,7 +113,7 @@ changes nothing returns the current entity without writing.
 
 Handlers authorize, extract, call a `domain/*` function, audit and respond.
 Business rules belong in `domain/*` so the console and any later consumer
-(CLAUDE.md, "MCP server") call the same functions instead of going through
+(design.md, "MCP server") call the same functions instead of going through
 HTTP.
 
 ## 7. Update the contract snapshot
