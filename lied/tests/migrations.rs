@@ -351,3 +351,74 @@ async fn tower_sessions_table_exists_and_is_writable() {
     .unwrap_or(0);
     assert_eq!(count, 1);
 }
+
+/// Production startup (`AppState::connect`, shared by the server and the
+/// `create-admin` CLI) must bring an empty database up to the full schema —
+/// issue #87, where nothing outside the tests ever ran the migrations — and
+/// a second start against the now-current schema must be a no-op.
+#[tokio::test]
+async fn startup_migrates_an_empty_database_and_restarting_is_a_no_op() {
+    use lied::config::{AppConfig, Secret};
+    use lied::state::{AppState, MIGRATOR};
+
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("container port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let config = || AppConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        database_url: Secret::from(url.clone()),
+        s3_endpoint: "http://localhost:9000".to_string(),
+        s3_bucket: "lied-test".to_string(),
+        s3_access_key_id: Secret::from("test".to_string()),
+        s3_secret_access_key: Secret::from("test".to_string()),
+        s3_region: "us-east-1".to_string(),
+        jwt_signing_key: Secret::from("test-signing-key-material-for-startup".to_string()),
+        jwt_lifetime_days: 30,
+        max_upload_bytes: 1,
+        max_request_bytes: 256 * 1024,
+        max_files_per_voice: 1,
+        max_arrangements_per_org: None,
+        max_page_size: 200,
+        default_page_size: 50,
+        ratelimit_auth_per_min: 120,
+        ratelimit_anon_per_min: 20,
+        ratelimit_login_per_min: 10,
+        metrics_enabled: false,
+        docs_enabled: true,
+        tracing_pretty: false,
+        secure_cookies: false,
+    };
+
+    let applied = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(r#"SELECT count(*) FROM _sqlx_migrations WHERE success"#)
+            .fetch_one(&pool)
+            .await
+            .expect("migration ledger exists")
+    };
+
+    let state = AppState::connect(config())
+        .await
+        .expect("startup migrates an empty database");
+    let expected = MIGRATOR.iter().count() as i64;
+    assert_eq!(applied(state.db.clone()).await, expected);
+    // The schema is really there, seed included.
+    let instruments: i64 = sqlx::query_scalar("SELECT count(*) FROM instrument")
+        .fetch_one(&state.db)
+        .await
+        .expect("instrument table exists");
+    assert!(instruments > 100, "instrument seed applied");
+
+    let restarted = AppState::connect(config())
+        .await
+        .expect("starting against a current schema succeeds");
+    assert_eq!(applied(restarted.db.clone()).await, expected);
+}
