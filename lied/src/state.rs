@@ -43,10 +43,10 @@ pub enum StateError {
 impl AppState {
     /// Connect to Postgres and construct the S3 client from config.
     ///
-    /// Does not verify MinIO connectivity at startup — `/readyz` is
-    /// responsible for live health checks; an unreachable MinIO at boot
-    /// should not crash the process (it may come up slightly later in
-    /// `docker compose up`).
+    /// Creates the configured bucket if it is missing (issue #91), but an
+    /// unreachable MinIO at boot does not crash the process (it may come up
+    /// slightly later in `docker compose up`): that is logged, and `/readyz`
+    /// is responsible for live health checks.
     pub async fn connect(config: AppConfig) -> Result<Self, StateError> {
         let db = PgPoolOptions::new()
             .max_connections(10)
@@ -84,6 +84,27 @@ impl AppState {
                 .force_path_style(true)
                 .build(),
         );
+
+        // A fresh deployment has no bucket (issue #91). Object storage may
+        // still be starting, so a failure here is logged, not fatal; /readyz
+        // keeps reporting it until it is reachable.
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::storage::ensure_bucket(&s3, &config.s3_bucket),
+        )
+        .await
+        {
+            Ok(Ok(crate::storage::BucketStatus::Created)) => {
+                tracing::info!(bucket = %config.s3_bucket, "created object-storage bucket");
+            }
+            Ok(Ok(crate::storage::BucketStatus::Existed)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(bucket = %config.s3_bucket, %error, "could not ensure the object-storage bucket exists");
+            }
+            Err(_) => {
+                tracing::warn!(bucket = %config.s3_bucket, "object storage did not answer at startup; the bucket was not checked");
+            }
+        }
 
         // Install the global Prometheus recorder once, here at startup, only
         // when metrics are enabled. `install_recorder` both registers the
