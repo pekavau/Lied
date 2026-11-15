@@ -18,6 +18,7 @@ pub mod annotations;
 pub mod app_passwords;
 pub mod arrangements;
 pub mod bulk_assign;
+pub mod collection_pieces;
 pub mod collections;
 pub mod console;
 pub mod coverage;
