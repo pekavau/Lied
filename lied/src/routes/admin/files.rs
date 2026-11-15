@@ -509,6 +509,12 @@ fn upload_error_page(ctx: &ConsoleCtx, err: file_service::UploadError) -> Respon
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("That file is too large (limit {limit} bytes)."),
         ),
+        E::TooManyFiles { limit } => (
+            StatusCode::CONFLICT,
+            format!(
+                "This already holds the maximum of {limit} files. Delete one, or replace an existing file instead."
+            ),
+        ),
         E::Db(error) => {
             tracing::error!(%error, "file store db error");
             (
@@ -677,7 +683,7 @@ async fn do_undelete(
     ) {
         return response;
     }
-    match file::undelete(&state.db, file_id).await {
+    match file::undelete(&state.db, file_id, state.config.max_files_per_voice).await {
         Ok(true) => {
             audit(
                 &state.db,
@@ -695,6 +701,13 @@ async fn do_undelete(
             &ctx,
             StatusCode::CONFLICT,
             "A current file already holds that name and format — delete or replace it first.",
+        ),
+        Err(file::FileError::TooManyFiles { limit }) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            &format!(
+                "This already holds the maximum of {limit} files, so this one can't be restored. Delete one first."
+            ),
         ),
         Err(file::FileError::Superseded) => error_page(
             &ctx,

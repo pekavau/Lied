@@ -55,6 +55,14 @@ impl Ctx {
     }
 
     async fn with_page_size(max_upload_bytes: u64, max_page_size: u32) -> Self {
+        Self::build(max_upload_bytes, max_page_size, 50).await
+    }
+
+    async fn with_max_files(max_files_per_voice: u32) -> Self {
+        Self::build(200 * 1024 * 1024, 200, max_files_per_voice).await
+    }
+
+    async fn build(max_upload_bytes: u64, max_page_size: u32, max_files_per_voice: u32) -> Self {
         let pg = Postgres::default()
             .with_tag("16-alpine")
             .start()
@@ -91,7 +99,12 @@ impl Ctx {
 
         let state = test_state(
             pool.clone(),
-            test_config(endpoint, max_upload_bytes, max_page_size),
+            test_config(
+                endpoint,
+                max_upload_bytes,
+                max_page_size,
+                max_files_per_voice,
+            ),
         );
         state
             .s3
@@ -112,7 +125,12 @@ impl Ctx {
     }
 }
 
-fn test_config(s3_endpoint: String, max_upload_bytes: u64, max_page_size: u32) -> AppConfig {
+fn test_config(
+    s3_endpoint: String,
+    max_upload_bytes: u64,
+    max_page_size: u32,
+    max_files_per_voice: u32,
+) -> AppConfig {
     AppConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url: Secret::from("postgres://unused/unused".to_string()),
@@ -125,7 +143,7 @@ fn test_config(s3_endpoint: String, max_upload_bytes: u64, max_page_size: u32) -
         jwt_lifetime_days: 30,
         max_upload_bytes,
         max_request_bytes: 256 * 1024,
-        max_files_per_voice: 50,
+        max_files_per_voice,
         max_arrangements_per_org: None,
         max_page_size,
         default_page_size: 50,
@@ -1097,6 +1115,7 @@ async fn a_file_id_from_another_org_is_not_found() {
             conversion_quality: None,
             created_by: None,
         },
+        50,
     )
     .await
     .expect("foreign file");
@@ -1283,4 +1302,86 @@ async fn restoring_a_file_whose_storage_slot_was_taken_is_refused() {
     let (live, _) = file::list(&ctx.pool, fx.arr_id, None, 50, 0).await.unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].id, replacement.id);
+}
+
+/// `LIED_MAX_FILES_PER_VOICE` in the console (#45): at a low configured
+/// ceiling a new upload is refused with a friendly 409, a replace still
+/// works, a soft-deleted file frees its place, and restoring into a full
+/// voice is refused too.
+#[tokio::test]
+async fn a_full_voice_refuses_new_files_but_not_replacements() {
+    let ctx = Ctx::with_max_files(2).await;
+    let fx = seed(&ctx.state).await;
+    let browser = Browser::login(&ctx.app, "arch").await;
+    let files_url = format!(
+        "/admin/orgs/{}/arrangements/{}/voices/{}/files",
+        fx.org_id, fx.arr_id, fx.voice_id
+    );
+    upload(&ctx.app, &browser, &files_url, "a.pdf").await;
+    upload(&ctx.app, &browser, &files_url, "b.pdf").await;
+
+    // A third file is refused, and the page says why.
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let token = upload_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}?csrf={token}"),
+            "c.pdf",
+            "application/pdf",
+            PDF,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let page = body_text(response).await;
+    assert!(page.contains("maximum of 2 files"), "got: {page}");
+
+    // Replacing one of the two still works at the ceiling.
+    let (files, _) = file::list(&ctx.pool, fx.arr_id, Some(fx.voice_id), 50, 0)
+        .await
+        .unwrap();
+    let a = files.iter().find(|f| f.name == "a").unwrap().id;
+    let b = files.iter().find(|f| f.name == "b").unwrap().id;
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_file(
+            &format!("{files_url}/{a}/replace?csrf={token}"),
+            "a.pdf",
+            "application/pdf",
+            PDF_V2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+
+    // Deleting b frees its place: soft-deleted rows do not count.
+    let (_, html) = load_page(&ctx.app, &browser, &files_url).await;
+    let form_token = form_csrf(&html);
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_form(
+            &format!("{files_url}/{b}/delete"),
+            format!("csrf_token={form_token}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::SEE_OTHER);
+    upload(&ctx.app, &browser, &files_url, "c.pdf").await;
+
+    // Full again: restoring b would make three.
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(browser.post_form(
+            &format!("{files_url}/{b}/undelete"),
+            format!("csrf_token={form_token}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert!(body_text(response).await.contains("maximum of 2 files"));
 }

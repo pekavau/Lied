@@ -30,6 +30,10 @@ struct Ctx {
 
 impl Ctx {
     async fn new() -> Self {
+        Self::with_max_files(50).await
+    }
+
+    async fn with_max_files(max_files_per_voice: u32) -> Self {
         let pg = Postgres::default()
             .with_tag("16-alpine")
             .start()
@@ -62,7 +66,7 @@ impl Ctx {
             .expect("start minio");
         let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
         let endpoint = format!("http://127.0.0.1:{minio_port}");
-        let state = test_state(pool.clone(), endpoint);
+        let state = test_state(pool.clone(), endpoint, max_files_per_voice);
         state
             .s3
             .create_bucket()
@@ -81,7 +85,7 @@ impl Ctx {
     }
 }
 
-fn test_state(pool: PgPool, s3_endpoint: String) -> AppState {
+fn test_state(pool: PgPool, s3_endpoint: String, max_files_per_voice: u32) -> AppState {
     let config = AppConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url: Secret::from("postgres://unused/unused".to_string()),
@@ -94,7 +98,7 @@ fn test_state(pool: PgPool, s3_endpoint: String) -> AppState {
         jwt_lifetime_days: 30,
         max_upload_bytes: 200 * 1024 * 1024,
         max_request_bytes: 256 * 1024,
-        max_files_per_voice: 50,
+        max_files_per_voice,
         max_arrangements_per_org: None,
         max_page_size: 200,
         default_page_size: 50,
@@ -392,6 +396,71 @@ async fn archivist_put_creates_file_row_and_webdav_get_roundtrips() {
     let (status, body) = send(&ctx.app, request("GET", uri, &basic(&arch), vec![])).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(body, pdf);
+}
+
+/// `LIED_MAX_FILES_PER_VOICE` over WebDAV (#45): a PUT that would add a file
+/// to a full voice is refused with 507 and leaves no row behind; a PUT over
+/// an existing file is a replace and still succeeds.
+#[tokio::test]
+async fn put_into_a_full_voice_is_refused_but_overwriting_succeeds() {
+    let ctx = Ctx::with_max_files(1).await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let arr = seed_arr(&ctx.pool, org, "bolero").await;
+    let voice = seed_voice(&ctx.pool, arr, "flute-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let dir = "/orgs/acme/arrangements/bolero/voices/flute-1";
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/a.pdf"),
+            &basic(&arch),
+            b"%PDF a".to_vec(),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "first PUT, got {status}");
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/b.pdf"),
+            &basic(&arch),
+            b"%PDF b".to_vec(),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::INSUFFICIENT_STORAGE);
+    assert!(
+        domain::file::find_by_location(&ctx.pool, arr, Some(voice), "b", "pdf")
+            .await
+            .unwrap()
+            .is_none(),
+        "the refused PUT left no row"
+    );
+
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "PUT",
+            &format!("{dir}/a.pdf"),
+            &basic(&arch),
+            b"%PDF a2".to_vec(),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "overwrite at the ceiling, got {status}"
+    );
+    let (_, body) = send(
+        &ctx.app,
+        request("GET", &format!("{dir}/a.pdf"), &basic(&arch), vec![]),
+    )
+    .await;
+    assert_eq!(body, b"%PDF a2");
 }
 
 #[tokio::test]
