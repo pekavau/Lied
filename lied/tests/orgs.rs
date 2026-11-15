@@ -1170,3 +1170,73 @@ async fn a_stale_membership_write_is_stale_before_it_is_the_last_owner() {
         Err(membership::MembershipError::LastOwner)
     ));
 }
+
+/// Two owners acting at once must not leave the org ownerless (#67). Each
+/// write touches a *different* membership row, so the ETag guard cannot
+/// catch it; the last-owner check and the write have to be one serialized
+/// step per organization. Repeated, because a single round can miss the race.
+#[tokio::test]
+async fn concurrent_demotions_and_removals_keep_an_owner() {
+    let db = TestDb::create_and_migrate().await;
+    let demote = || membership::MembershipFields {
+        role: membership::Role::Musician,
+        instrument_ids: &[],
+        is_principal: false,
+        principal_instrument_ids: &[],
+    };
+    for round in 0..20 {
+        let a = create_plain_user(&db.pool, &format!("a{round}"), "correct horse battery").await;
+        let b = create_plain_user(&db.pool, &format!("b{round}"), "correct horse battery").await;
+        let org = create_org(&db.pool, &format!("Duo {round}")).await;
+        let ma = add_member(&db.pool, org.id, a.id, membership::Role::Owner).await;
+        let mb = add_member(&db.pool, org.id, b.id, membership::Role::Owner).await;
+
+        // Alternate the shapes: demote+demote, delete+delete, demote+delete.
+        let (first, second) = match round % 3 {
+            0 => tokio::join!(
+                async {
+                    membership::update(&db.pool, mb.id, None, demote())
+                        .await
+                        .map(|_| ())
+                },
+                async {
+                    membership::update(&db.pool, ma.id, None, demote())
+                        .await
+                        .map(|_| ())
+                },
+            ),
+            1 => tokio::join!(
+                async { membership::delete(&db.pool, mb.id, None).await.map(|_| ()) },
+                async { membership::delete(&db.pool, ma.id, None).await.map(|_| ()) },
+            ),
+            _ => tokio::join!(
+                async {
+                    membership::update(&db.pool, mb.id, None, demote())
+                        .await
+                        .map(|_| ())
+                },
+                async { membership::delete(&db.pool, ma.id, None).await.map(|_| ()) },
+            ),
+        };
+        let results = [first, second];
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "round {round}: exactly one write lands: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(membership::MembershipError::LastOwner))),
+            "round {round}: the other is refused as last owner: {results:?}"
+        );
+        let owners: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM membership WHERE organization_id = $1 AND role = 'owner'",
+        )
+        .bind(org.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(owners, 1, "round {round}: the org keeps an owner");
+    }
+}

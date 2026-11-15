@@ -949,7 +949,10 @@ A user's place in an organization.
 Audit fields.
 
 - **Every org keeps at least one `owner`**: demoting or removing the last one
-  is refused.
+  is refused (409), also when two owners demote or remove each other at the
+  same moment: every membership update and delete locks the organization row
+  first, so the owner count and the write are one step per org (#67;
+  `concurrent_demotions_and_removals_keep_an_owner`).
 - **The arrays are checked in code.** Postgres cannot enforce foreign keys on
   array elements, so both lists are validated against the instrument table on
   write. That is safe while instruments are never deleted; if they ever gain a
