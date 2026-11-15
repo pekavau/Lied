@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::file;
 use crate::domain::membership::Role;
+use crate::file_service;
 use crate::state::AppState;
 use crate::storage;
 use crate::webdav::access::{self, Visibility};
@@ -1057,56 +1058,115 @@ enum WriteTarget {
     Library { key: String, mime: String },
 }
 
-/// An open WebDAV file: an in-memory read buffer, or a write buffer committed
-/// on flush.
-// The `Write` variant is larger than `Read` (it carries the `LiedFs`/`AppState`
-// needed to commit), but a `LiedFile` is always returned boxed as
-// `Box<dyn DavFile>`, so the on-stack size difference never materializes.
-#[allow(clippy::large_enum_variant)]
+/// An open WebDAV file. Neither direction holds the whole file (#26):
+/// a read streams the object from storage, a write streams it there.
 enum LiedFile {
-    Read {
-        data: Bytes,
-        pos: usize,
-        meta: LiedMeta,
-    },
-    Write {
-        fs: LiedFs,
-        target: WriteTarget,
-        buf: BytesMut,
-        max: u64,
-        committed: bool,
-    },
+    Read(ReadFile),
+    Write(WriteFile),
+}
+
+/// A file being read: the object's `GetObject` body, consumed as the client
+/// reads. Memory is the one chunk storage last delivered, whatever the file
+/// size. A seek drops the stream; the next read re-requests from the new
+/// offset with a `Range`.
+struct ReadFile {
+    s3: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    meta: LiedMeta,
+    /// The offset the next read returns bytes from.
+    pos: u64,
+    /// The open body, positioned at `pos + pending.len()`; `None` until the
+    /// first read and after a seek.
+    body: Option<aws_sdk_s3::primitives::ByteStream>,
+    /// Bytes received from `body` but not yet returned.
+    pending: Bytes,
+}
+
+/// A file being written: the bytes go to storage part by part as they
+/// arrive (an [`storage::ObjectWriter`]), and become visible on `flush`.
+struct WriteFile {
+    fs: LiedFs,
+    target: WriteTarget,
+    /// `None` once committed. Dropped without a flush (the client went away
+    /// mid-body), it aborts its multipart upload itself.
+    writer: Option<storage::ObjectWriter>,
 }
 
 impl std::fmt::Debug for LiedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LiedFile::Read { data, pos, .. } => f
+            LiedFile::Read(r) => f
                 .debug_struct("LiedFile::Read")
-                .field("len", &data.len())
-                .field("pos", pos)
+                .field("key", &r.key)
+                .field("len", &r.meta.len)
+                .field("pos", &r.pos)
                 .finish(),
-            LiedFile::Write { buf, committed, .. } => f
+            LiedFile::Write(w) => f
                 .debug_struct("LiedFile::Write")
-                .field("buffered", &buf.len())
-                .field("committed", committed)
+                .field("writer", &w.writer)
                 .finish(),
         }
     }
 }
 
-impl LiedFile {
-    fn append(&mut self, data: &[u8]) -> FsResult<()> {
-        match self {
-            LiedFile::Write { buf, max, .. } => {
-                if buf.len() as u64 + data.len() as u64 > *max {
-                    return Err(FsError::TooLarge);
-                }
-                buf.extend_from_slice(data);
-                Ok(())
-            }
-            LiedFile::Read { .. } => Err(FsError::Forbidden),
+impl ReadFile {
+    async fn read(&mut self, count: usize) -> FsResult<Bytes> {
+        if self.pos >= self.meta.len || count == 0 {
+            return Ok(Bytes::new());
         }
+        loop {
+            if !self.pending.is_empty() {
+                let n = count.min(self.pending.len());
+                let out = self.pending.split_to(n);
+                self.pos += n as u64;
+                return Ok(out);
+            }
+            if self.body.is_none() {
+                let range = (self.pos > 0).then(|| format!("bytes={}-", self.pos));
+                let obj = storage::get_object(&self.s3, &self.bucket, &self.key, range.as_deref())
+                    .await
+                    .map_err(|e| match e {
+                        storage::StorageError::NotFound => FsError::NotFound,
+                        _ => FsError::GeneralFailure,
+                    })?;
+                self.body = Some(obj.body);
+            }
+            let Some(body) = self.body.as_mut() else {
+                return Err(FsError::GeneralFailure);
+            };
+            match body.next().await {
+                Some(Ok(chunk)) => self.pending = chunk,
+                Some(Err(_)) => {
+                    self.body = None;
+                    return Err(FsError::GeneralFailure);
+                }
+                None => {
+                    // The object ended before its recorded length.
+                    self.body = None;
+                    return Ok(Bytes::new());
+                }
+            }
+        }
+    }
+
+    fn seek(&mut self, whence: SeekFrom) -> FsResult<u64> {
+        let len = self.meta.len as i128;
+        let target = match whence {
+            SeekFrom::Start(n) => n as i128,
+            SeekFrom::End(n) => len + n as i128,
+            SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if target < 0 {
+            return Err(FsError::GeneralFailure);
+        }
+        let target = (target as u64).min(self.meta.len);
+        if target != self.pos {
+            self.body = None;
+            self.pending = Bytes::new();
+            self.pos = target;
+        }
+        Ok(self.pos)
     }
 }
 
@@ -1117,11 +1177,22 @@ fn map_storage_write(e: storage::StorageError) -> FsError {
     }
 }
 
-/// Commit a buffered write: upload the object, then (for org files) create or
-/// replace the `File` row, and audit.
-async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResult<()> {
+/// Commit a write on `flush`. For org files the order is the REST path's:
+/// the `File` row first (identity, the duplicate and #45 checks), then the
+/// bytes become visible ([`storage::ObjectWriter::finish`]). If they do not,
+/// the row write is taken back by the same
+/// [`file_service::undo_unstored_write`] the `/v1` path uses (#109): a new
+/// row is hard-deleted, a replace restores the old file.
+async fn commit_write(
+    fs: &LiedFs,
+    target: &WriteTarget,
+    writer: storage::ObjectWriter,
+) -> FsResult<()> {
     match target {
-        WriteTarget::Noop => Ok(()),
+        WriteTarget::Noop => {
+            writer.abort().await;
+            Ok(())
+        }
         WriteTarget::OrgFile {
             org_id,
             arr_id,
@@ -1131,13 +1202,21 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
             mime,
             key,
         } => {
-            // DB identity first, object bytes second (mirrors the REST path in
-            // routes::files): the safe failure mode is a DB row referencing a
-            // not-yet-uploaded object (a detectable 404), never a mutated object
-            // with a stale/duplicate row. On upload failure we compensate.
-            let existing = file::find_by_location(&fs.state.db, *arr_id, *voice_id, name, format)
-                .await
-                .map_err(db_err)?;
+            let existing = match file::find_by_location(
+                &fs.state.db,
+                *arr_id,
+                *voice_id,
+                name,
+                format,
+            )
+            .await
+            {
+                Ok(found) => found,
+                Err(e) => {
+                    writer.abort().await;
+                    return Err(db_err(e));
+                }
+            };
             let new_id = Uuid::now_v7();
             let new = file::NewFile {
                 arrangement_id: *arr_id,
@@ -1149,51 +1228,45 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
                 conversion_quality: None,
                 created_by: Some(fs.user_id),
             };
-            let old_id = existing.as_ref().map(|f| f.id);
-            let action = match &existing {
-                Some(old) => {
-                    file::replace(&fs.state.db, old.id, new_id, new)
-                        .await
-                        .map_err(|_| FsError::GeneralFailure)?;
-                    "file.replace"
-                }
-                None => {
-                    file::create(
-                        &fs.state.db,
-                        new_id,
-                        new,
-                        fs.state.config.max_files_per_voice,
-                    )
-                    .await
-                    .map_err(|e| match e {
-                        // A full voice: 507, WebDAV's "no room here" (#45).
-                        file::FileError::TooManyFiles { .. } => FsError::InsufficientStorage,
-                        _ => FsError::GeneralFailure,
-                    })?;
-                    "file.create"
-                }
+            let (action, written) = match &existing {
+                Some(old) => match file::replace(&fs.state.db, old.id, new_id, new).await {
+                    Ok(_) => (
+                        "file.replace",
+                        file_service::UnstoredWrite::Replaced {
+                            old_id: old.id,
+                            new_id,
+                        },
+                    ),
+                    Err(_) => {
+                        writer.abort().await;
+                        return Err(FsError::GeneralFailure);
+                    }
+                },
+                None => match file::create(
+                    &fs.state.db,
+                    new_id,
+                    new,
+                    fs.state.config.max_files_per_voice,
+                )
+                .await
+                {
+                    Ok(_) => (
+                        "file.create",
+                        file_service::UnstoredWrite::Created { id: new_id },
+                    ),
+                    Err(e) => {
+                        writer.abort().await;
+                        return Err(match e {
+                            // A full voice: 507, WebDAV's "no room here" (#45).
+                            file::FileError::TooManyFiles { .. } => FsError::InsufficientStorage,
+                            _ => FsError::GeneralFailure,
+                        });
+                    }
+                },
             };
 
-            if let Err(e) = storage::upload_bytes(
-                &fs.state.s3,
-                fs.bucket(),
-                key,
-                mime,
-                fs.state.config.max_upload_bytes,
-                data,
-            )
-            .await
-            {
-                // Roll the DB back to the pre-write state so we never leave a
-                // live row pointing at a missing object.
-                match old_id {
-                    Some(old) => {
-                        let _ = file::restore_replaced(&fs.state.db, old, new_id).await;
-                    }
-                    None => {
-                        let _ = file::soft_delete(&fs.state.db, new_id).await;
-                    }
-                }
+            if let Err(e) = writer.finish().await {
+                file_service::undo_unstored_write(&fs.state.db, written, key).await;
                 return Err(map_storage_write(e));
             }
             audit(
@@ -1217,21 +1290,12 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
             user_slug,
             name,
             key,
-            mime,
+            ..
         } => {
             let existed = storage::head_object(&fs.state.s3, fs.bucket(), key)
                 .await
                 .is_ok();
-            storage::upload_bytes(
-                &fs.state.s3,
-                fs.bucket(),
-                key,
-                mime,
-                fs.state.config.max_upload_bytes,
-                data,
-            )
-            .await
-            .map_err(map_storage_write)?;
+            writer.finish().await.map_err(map_storage_write)?;
             let action = if existed {
                 "personal_annotation.replace"
             } else {
@@ -1252,43 +1316,32 @@ async fn commit_write(fs: &LiedFs, target: &WriteTarget, data: Bytes) -> FsResul
             .await;
             Ok(())
         }
-        WriteTarget::Library { key, mime } => {
+        WriteTarget::Library { .. } => {
             // Deliberately unaudited: `/users/<user>/library/` is a private
             // personal area, not an org-scoped persistent entity. The audit log
             // tracks org content and auth events; private-library writes are
             // outside that scope (unlike personal annotations, which live under
             // an org's arrangement tree and are audited).
-            storage::upload_bytes(
-                &fs.state.s3,
-                fs.bucket(),
-                key,
-                mime,
-                fs.state.config.max_upload_bytes,
-                data,
-            )
-            .await
-            .map_err(map_storage_write)?;
+            writer.finish().await.map_err(map_storage_write)?;
             Ok(())
         }
     }
 }
 
 impl LiedFs {
+    /// Open for reading. Nothing is fetched yet: the first read opens the
+    /// object's stream (#26).
     async fn open_read(&self, rp: &ResolvedPath) -> FsResult<Box<dyn DavFile>> {
         let (key, meta) = self.file_key_for_read(rp).await?;
-        let obj = storage::get_object(&self.state.s3, self.bucket(), &key, None)
-            .await
-            .map_err(|e| match e {
-                storage::StorageError::NotFound => FsError::NotFound,
-                _ => FsError::GeneralFailure,
-            })?;
-        let data = obj
-            .body
-            .collect()
-            .await
-            .map(|d| d.into_bytes())
-            .map_err(|_| FsError::GeneralFailure)?;
-        Ok(Box::new(LiedFile::Read { data, pos: 0, meta }))
+        Ok(Box::new(LiedFile::Read(ReadFile {
+            s3: self.state.s3.clone(),
+            bucket: self.bucket().to_string(),
+            key,
+            meta,
+            pos: 0,
+            body: None,
+            pending: Bytes::new(),
+        })))
     }
 
     async fn file_key_for_read(&self, rp: &ResolvedPath) -> FsResult<(String, LiedMeta)> {
@@ -1385,15 +1438,57 @@ impl LiedFs {
         Ok((key, meta))
     }
 
+    /// Open for writing: authorize, then stream the body to storage as it
+    /// arrives (#26). A new file in a voice or score that is already full is
+    /// refused here, before the client sends the body (#45); `file::create`
+    /// re-checks under its lock on flush.
     async fn open_write(&self, rp: &ResolvedPath) -> FsResult<Box<dyn DavFile>> {
         let target = self.resolve_write_target(rp).await?;
-        Ok(Box::new(LiedFile::Write {
+        let (key, mime) = match &target {
+            WriteTarget::OrgFile {
+                arr_id,
+                voice_id,
+                name,
+                format,
+                mime,
+                key,
+                ..
+            } => {
+                let existing =
+                    file::find_by_location(&self.state.db, *arr_id, *voice_id, name, format)
+                        .await
+                        .map_err(db_err)?;
+                if existing.is_none()
+                    && !file::has_room(
+                        &self.state.db,
+                        *arr_id,
+                        *voice_id,
+                        self.state.config.max_files_per_voice,
+                    )
+                    .await
+                    .map_err(db_err)?
+                {
+                    return Err(FsError::InsufficientStorage);
+                }
+                (key.clone(), mime.to_string())
+            }
+            WriteTarget::Annotation { key, mime, .. } | WriteTarget::Library { key, mime } => {
+                (key.clone(), mime.clone())
+            }
+            WriteTarget::Noop => return Err(FsError::Forbidden),
+        };
+        let writer = storage::ObjectWriter::new(
+            &self.state.s3,
+            self.bucket(),
+            &key,
+            &mime,
+            self.state.config.max_upload_bytes,
+        );
+        Ok(Box::new(LiedFile::Write(WriteFile {
             fs: self.clone(),
             target,
-            buf: BytesMut::new(),
-            max: self.state.config.max_upload_bytes,
-            committed: false,
-        }))
+            writer: Some(writer),
+        })))
     }
 
     async fn resolve_write_target(&self, rp: &ResolvedPath) -> FsResult<WriteTarget> {
@@ -1586,37 +1681,268 @@ impl LiedFs {
     }
 }
 
+// ── remove_dir / rename / copy (#26) ─────────────────────────────────────────
+
+/// Whether a DELETE of `path` (decoded) may reach dav-server at all. For a
+/// directory, dav-server deletes every child before asking the filesystem
+/// to remove the directory itself, so a refusal at that point would come
+/// after the voice's files were gone. Only files and the private library
+/// (where directories are plain prefixes) may be deleted; every structural
+/// directory of the org tree is refused up front.
+///
+/// A path outside the tree's shape is let through: the filesystem answers it
+/// with 404, and there is nothing to delete.
+pub fn delete_permitted(path: &str) -> bool {
+    matches!(
+        ResolvedPath::parse(path),
+        None | Some(
+            ResolvedPath::ScoreFile { .. }
+                | ResolvedPath::VoiceFile { .. }
+                | ResolvedPath::AnnotationFile { .. }
+                | ResolvedPath::LibraryEntry { .. }
+        )
+    )
+}
+
+/// Whether a MOVE (`is_move`) or COPY from `from` to `to` (decoded request
+/// paths) may reach dav-server at all. Checked *before* the request runs,
+/// because dav-server deletes an existing destination (`Overwrite: T`)
+/// before it asks the filesystem to rename: in the org tree that would
+/// remove a file and only then refuse the move. Allowed: within the private
+/// library, and (MOVE only) a personal annotation within its own directory.
+/// Ownership and existence are checked later, by [`LiedFs`]. A path outside
+/// the tree's shape is let through: it cannot exist, so dav-server deletes
+/// nothing and the filesystem answers 404.
+pub fn copy_move_permitted(is_move: bool, from: &str, to: &str) -> bool {
+    match (ResolvedPath::parse(from), ResolvedPath::parse(to)) {
+        (None, _) | (_, None) => true,
+        (Some(ResolvedPath::LibraryEntry { .. }), Some(ResolvedPath::LibraryEntry { .. })) => true,
+        (
+            Some(ResolvedPath::AnnotationFile {
+                org,
+                arr,
+                voice,
+                user,
+                ..
+            }),
+            Some(ResolvedPath::AnnotationFile {
+                org: to_org,
+                arr: to_arr,
+                voice: to_voice,
+                user: to_user,
+                ..
+            }),
+        ) => is_move && (org, arr, voice, user) == (to_org, to_arr, to_voice, to_user),
+        _ => false,
+    }
+}
+//
+// Supported only where storage is plain objects with no database identity:
+// the private library, and (rename) a personal annotation within its own
+// directory. In the org tree a directory is an entity (arrangement, voice)
+// and a file is a `File` row whose name and format are its identity, so
+// MOVE, COPY and directory removal there are refused (403); see
+// docs/design.md, *WebDAV layout*.
+
+impl LiedFs {
+    async fn remove_directory(&self, rp: &ResolvedPath) -> FsResult<()> {
+        match rp {
+            ResolvedPath::LibraryEntry { user, rel } => {
+                self.require_own_library(user)?;
+                let marker = format!("{}/", library_key(user, rel));
+                let keys = storage::list_keys_recursive(&self.state.s3, self.bucket(), &marker)
+                    .await
+                    .map_err(|_| FsError::GeneralFailure)?;
+                // Only an empty directory goes (a DELETE with the default
+                // `Depth: infinity` has removed the children already).
+                if keys.iter().any(|k| k != &marker) {
+                    return Err(FsError::Forbidden);
+                }
+                if keys.iter().any(|k| k == &marker) {
+                    storage::delete_object(&self.state.s3, self.bucket(), &marker)
+                        .await
+                        .map_err(|_| FsError::GeneralFailure)?;
+                }
+                // No marker and no children: an implicit directory whose last
+                // child was just removed. It is gone already.
+                Ok(())
+            }
+            _ => Err(FsError::Forbidden),
+        }
+    }
+
+    async fn rename_path(&self, from: &ResolvedPath, to: &ResolvedPath) -> FsResult<()> {
+        match (from, to) {
+            (
+                ResolvedPath::LibraryEntry { user, rel },
+                ResolvedPath::LibraryEntry {
+                    user: to_user,
+                    rel: to_rel,
+                },
+            ) => {
+                self.require_own_library(user)?;
+                self.require_own_library(to_user)?;
+                let (from_key, to_key) = (library_key(user, rel), library_key(to_user, to_rel));
+                if to_key == from_key || to_key.starts_with(&format!("{from_key}/")) {
+                    return Err(FsError::Forbidden); // into itself
+                }
+                if self.is_object(&from_key).await? {
+                    self.move_object(&from_key, &to_key).await
+                } else {
+                    self.move_prefix(&format!("{from_key}/"), &format!("{to_key}/"))
+                        .await
+                }
+            }
+            (
+                ResolvedPath::AnnotationFile {
+                    org,
+                    arr,
+                    voice,
+                    user,
+                    file,
+                },
+                ResolvedPath::AnnotationFile {
+                    org: to_org,
+                    arr: to_arr,
+                    voice: to_voice,
+                    user: to_user,
+                    file: to_file,
+                },
+            ) if (org, arr, voice, user) == (to_org, to_arr, to_voice, to_user) => {
+                // Author-only, within the author's own annotations directory.
+                if user != &self.user_slug {
+                    return Err(FsError::Forbidden);
+                }
+                let (org_id, _a, voice_id, _v) = self.resolve_voice(org, arr, voice).await?;
+                let from_key = annotation_key(org, arr, voice, user, file);
+                let to_key = annotation_key(org, arr, voice, user, to_file);
+                self.move_object(&from_key, &to_key).await?;
+                audit(
+                    &self.state.db,
+                    &AuditContext {
+                        actor_user_id: Some(self.user_id),
+                        org_id: Some(org_id),
+                        request_id: self.request_id,
+                    },
+                    "personal_annotation.rename",
+                    "personal_annotation",
+                    None,
+                    serde_json::json!({
+                        "voiceId": voice_id, "userSlug": user, "from": file, "to": to_file,
+                    }),
+                )
+                .await;
+                Ok(())
+            }
+            _ => Err(FsError::Forbidden),
+        }
+    }
+
+    async fn copy_path(&self, from: &ResolvedPath, to: &ResolvedPath) -> FsResult<()> {
+        match (from, to) {
+            (
+                ResolvedPath::LibraryEntry { user, rel },
+                ResolvedPath::LibraryEntry {
+                    user: to_user,
+                    rel: to_rel,
+                },
+            ) => {
+                self.require_own_library(user)?;
+                self.require_own_library(to_user)?;
+                // dav-server copies a directory itself (create_dir, then one
+                // `copy` per file), so this only ever sees files.
+                storage::copy_object(
+                    &self.state.s3,
+                    self.bucket(),
+                    &library_key(user, rel),
+                    &library_key(to_user, to_rel),
+                )
+                .await
+                .map_err(|_| FsError::GeneralFailure)
+            }
+            _ => Err(FsError::Forbidden),
+        }
+    }
+
+    async fn is_object(&self, key: &str) -> FsResult<bool> {
+        match storage::head_object(&self.state.s3, self.bucket(), key).await {
+            Ok(_) => Ok(true),
+            Err(storage::StorageError::NotFound) => Ok(false),
+            Err(_) => Err(FsError::GeneralFailure),
+        }
+    }
+
+    /// Copy, then delete: S3 has no rename.
+    async fn move_object(&self, from: &str, to: &str) -> FsResult<()> {
+        if !self.is_object(from).await? {
+            return Err(FsError::NotFound);
+        }
+        storage::copy_object(&self.state.s3, self.bucket(), from, to)
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+        storage::delete_object(&self.state.s3, self.bucket(), from)
+            .await
+            .map_err(|_| FsError::GeneralFailure)
+    }
+
+    /// Move every object under `from` (a directory, marker included) to
+    /// `to`: all copies first, then the deletes, so a failure part-way
+    /// leaves the source complete.
+    async fn move_prefix(&self, from: &str, to: &str) -> FsResult<()> {
+        let keys = storage::list_keys_recursive(&self.state.s3, self.bucket(), from)
+            .await
+            .map_err(|_| FsError::GeneralFailure)?;
+        if keys.is_empty() {
+            return Err(FsError::NotFound);
+        }
+        for key in &keys {
+            let target = format!("{to}{}", &key[from.len()..]);
+            storage::copy_object(&self.state.s3, self.bucket(), key, &target)
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
+        }
+        for key in &keys {
+            storage::delete_object(&self.state.s3, self.bucket(), key)
+                .await
+                .map_err(|_| FsError::GeneralFailure)?;
+        }
+        Ok(())
+    }
+}
+
 // ── DavFile ──────────────────────────────────────────────────────────────────
 
 impl DavFile for LiedFile {
     fn metadata(&mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
         let meta = match self {
-            LiedFile::Read { meta, .. } => meta.clone(),
-            LiedFile::Write { buf, .. } => LiedMeta::file(buf.len() as u64, None),
+            LiedFile::Read(r) => r.meta.clone(),
+            LiedFile::Write(w) => {
+                LiedMeta::file(w.writer.as_ref().map_or(0, |wr| wr.total()), None)
+            }
         };
         async move { Ok(Box::new(meta) as Box<dyn DavMetaData>) }.boxed()
     }
 
     fn read_bytes(&mut self, count: usize) -> FsFuture<'_, Bytes> {
-        let res = match self {
-            LiedFile::Read { data, pos, .. } => {
-                let start = (*pos).min(data.len());
-                let end = start.saturating_add(count).min(data.len());
-                let chunk = data.slice(start..end);
-                *pos = end;
-                Ok(chunk)
-            }
-            LiedFile::Write { .. } => Err(FsError::Forbidden),
-        };
-        async move { res }.boxed()
+        match self {
+            LiedFile::Read(r) => r.read(count).boxed(),
+            LiedFile::Write(_) => async move { Err(FsError::Forbidden) }.boxed(),
+        }
     }
 
     fn write_bytes(&mut self, buf: Bytes) -> FsFuture<'_, ()> {
-        let res = self.append(&buf);
-        async move { res }.boxed()
+        match self {
+            LiedFile::Write(w) => async move {
+                let writer = w.writer.as_mut().ok_or(FsError::GeneralFailure)?;
+                writer.write(buf).await.map_err(map_storage_write)
+            }
+            .boxed(),
+            LiedFile::Read(_) => async move { Err(FsError::Forbidden) }.boxed(),
+        }
     }
 
     fn write_buf(&mut self, mut buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
+        // One frame of the request body, so bounded by the frame size.
         let mut collected = BytesMut::with_capacity(buf.remaining());
         while buf.has_remaining() {
             let chunk = buf.chunk();
@@ -1624,55 +1950,36 @@ impl DavFile for LiedFile {
             let n = chunk.len();
             buf.advance(n);
         }
-        let res = self.append(&collected);
-        async move { res }.boxed()
+        self.write_bytes(collected.freeze())
     }
 
     fn seek(&mut self, whence: SeekFrom) -> FsFuture<'_, u64> {
         let res = match self {
-            LiedFile::Read { data, pos, .. } => {
-                let len = data.len() as i64;
-                let target = match whence {
-                    SeekFrom::Start(n) => n as i64,
-                    SeekFrom::End(n) => len + n,
-                    SeekFrom::Current(n) => *pos as i64 + n,
-                };
-                if target < 0 {
-                    Err(FsError::GeneralFailure)
-                } else {
-                    *pos = (target as usize).min(data.len());
-                    Ok(*pos as u64)
-                }
-            }
+            LiedFile::Read(r) => r.seek(whence),
             // Writes are append-only; only a no-op seek to the current end is
             // accepted (some clients issue one before writing).
-            LiedFile::Write { buf, .. } => match whence {
-                SeekFrom::Start(n) if n == buf.len() as u64 => Ok(n),
-                SeekFrom::Current(0) => Ok(buf.len() as u64),
-                _ => Err(FsError::GeneralFailure),
-            },
+            LiedFile::Write(w) => {
+                let end = w.writer.as_ref().map_or(0, |wr| wr.total());
+                match whence {
+                    SeekFrom::Start(n) if n == end => Ok(n),
+                    SeekFrom::Current(0) => Ok(end),
+                    _ => Err(FsError::GeneralFailure),
+                }
+            }
         };
         async move { res }.boxed()
     }
 
     fn flush(&mut self) -> FsFuture<'_, ()> {
         match self {
-            LiedFile::Read { .. } => async move { Ok(()) }.boxed(),
-            LiedFile::Write {
-                fs,
-                target,
-                buf,
-                committed,
-                ..
-            } => {
-                if *committed {
+            LiedFile::Read(_) => async move { Ok(()) }.boxed(),
+            LiedFile::Write(w) => {
+                let Some(writer) = w.writer.take() else {
                     return async move { Ok(()) }.boxed();
-                }
-                *committed = true;
-                let fs = fs.clone();
-                let target = std::mem::replace(target, WriteTarget::Noop);
-                let data = std::mem::take(buf).freeze();
-                async move { commit_write(&fs, &target, data).await }.boxed()
+                };
+                let fs = w.fs.clone();
+                let target = std::mem::replace(&mut w.target, WriteTarget::Noop);
+                async move { commit_write(&fs, &target, writer).await }.boxed()
             }
         }
     }
@@ -1724,6 +2031,30 @@ impl DavFileSystem for LiedFs {
         async move {
             let rp = parse_path(path)?;
             self.remove(&rp).await
+        }
+        .boxed()
+    }
+
+    fn remove_dir<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let rp = parse_path(path)?;
+            self.remove_directory(&rp).await
+        }
+        .boxed()
+    }
+
+    fn rename<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let (from, to) = (parse_path(from)?, parse_path(to)?);
+            self.rename_path(&from, &to).await
+        }
+        .boxed()
+    }
+
+    fn copy<'a>(&'a self, from: &'a DavPath, to: &'a DavPath) -> FsFuture<'a, ()> {
+        async move {
+            let (from, to) = (parse_path(from)?, parse_path(to)?);
+            self.copy_path(&from, &to).await
         }
         .boxed()
     }

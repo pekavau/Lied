@@ -112,6 +112,10 @@ async fn dav(State(state): State<AppState>, request: Request) -> Response {
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    if let Some(refusal) = refuse_before_dav(&request) {
+        return refusal;
+    }
+
     let fs = LiedFs::new(state.clone(), user.user_id, user_slug, request_id);
     let handler = DavHandler::builder()
         .filesystem(Box::new(fs))
@@ -121,4 +125,39 @@ async fn dav(State(state): State<AppState>, request: Request) -> Response {
     let response = handler.handle(request).await;
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, axum::body::Body::new(body))
+}
+
+/// Requests refused with 403 before dav-server runs, because dav-server
+/// would delete things first and ask the filesystem second (#26):
+/// - MOVE and COPY outside the private library (and a personal annotation's
+///   own directory): an existing destination is deleted before the rename,
+///   and in the org tree that is a real file
+///   ([`crate::webdav::fs::copy_move_permitted`]);
+/// - DELETE of an org-tree directory: its files are deleted before the
+///   directory removal is refused ([`crate::webdav::fs::delete_permitted`]).
+fn refuse_before_dav(request: &Request) -> Option<Response> {
+    let decoded = |uri: &axum::http::Uri| -> Option<String> {
+        let path = dav_server::davpath::DavPath::from_uri(uri).ok()?;
+        String::from_utf8(path.as_bytes().to_vec()).ok()
+    };
+    let is_move = match request.method().as_str() {
+        "MOVE" => true,
+        "COPY" => false,
+        "DELETE" => {
+            // An unparsable path is dav-server's (and the filesystem's) 404.
+            let path = decoded(request.uri())?;
+            return (!crate::webdav::fs::delete_permitted(&path))
+                .then(|| StatusCode::FORBIDDEN.into_response());
+        }
+        _ => return None,
+    };
+    // A missing or unparsable Destination is dav-server's to answer (400).
+    let destination = request
+        .headers()
+        .get("destination")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<axum::http::Uri>().ok())?;
+    let (from, to) = (decoded(request.uri())?, decoded(&destination)?);
+    (!crate::webdav::fs::copy_move_permitted(is_move, &from, &to))
+        .then(|| StatusCode::FORBIDDEN.into_response())
 }

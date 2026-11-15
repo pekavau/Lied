@@ -292,6 +292,30 @@ async fn lock_bucket_and_count_live(
     .await
 }
 
+/// Whether a voice (or, with `voice_id = None`, an arrangement's full score)
+/// has room for one more live file under `max_files`. An early, unlocked
+/// answer for a client that should be refused before it sends a body (a
+/// WebDAV PUT, #26); [`create`] makes the authoritative check under the lock.
+pub async fn has_room(
+    pool: &PgPool,
+    arrangement_id: Uuid,
+    voice_id: Option<Uuid>,
+    max_files: u32,
+) -> Result<bool, sqlx::Error> {
+    let live = sqlx::query_scalar!(
+        r#"
+        SELECT count(*) AS "count!" FROM file
+        WHERE arrangement_id = $1 AND voice_id IS NOT DISTINCT FROM $2
+          AND deleted_at IS NULL
+        "#,
+        arrangement_id,
+        voice_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(live < i64::from(max_files))
+}
+
 /// Refuse a write that would take a bucket past `max_files` live files.
 async fn check_room(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -715,20 +739,19 @@ pub async fn hard_delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 /// Compensating action for a [`replace`] whose DB swap committed but whose
 /// subsequent object upload failed: drop the just-inserted `new_id` row and
 /// restore `old_id` as the live file, returning to the pre-replace state.
-/// Soft-deletes the new row *before* undeleting the old one, so the partial
-/// unique index never momentarily sees two live rows for the same key.
+/// The new row is **deleted**, not soft-deleted: it stands for bytes that
+/// never landed, so it must not appear as a restorable removed file (#109).
+/// It goes *before* the old one is undeleted, so the partial unique index
+/// never momentarily sees two live rows for the same key.
 pub async fn restore_replaced(
     pool: &PgPool,
     old_id: Uuid,
     new_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query!(
-        r#"UPDATE file SET deleted_at = now(), updated_at = now() WHERE id = $1"#,
-        new_id,
-    )
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query!(r#"DELETE FROM file WHERE id = $1"#, new_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query!(
         r#"UPDATE file SET deleted_at = NULL, updated_at = now() WHERE id = $1"#,
         old_id,
