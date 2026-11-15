@@ -52,6 +52,7 @@ fn test_state(pool: PgPool) -> lied::state::AppState {
         s3_access_key_id: Secret::from("test".to_string()),
         s3_secret_access_key: Secret::from("test".to_string()),
         s3_region: "us-east-1".to_string(),
+        s3_version_retention_days: 30,
         jwt_signing_key: Secret::from(
             "test-signing-key-material-for-bulk-assign-tests".to_string(),
         ),

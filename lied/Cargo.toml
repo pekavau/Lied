@@ -69,7 +69,7 @@ maud = { workspace = true }
 
 [dev-dependencies]
 testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres", "minio"] }
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
 insta = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tower = { workspace = true, features = ["util"] }

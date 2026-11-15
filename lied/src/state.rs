@@ -108,7 +108,7 @@ impl AppState {
         // A fresh deployment has no bucket (issue #91). Object storage may
         // still be starting, so a failure here is logged, not fatal; /readyz
         // keeps reporting it until it is reachable.
-        match tokio::time::timeout(
+        let bucket_ready = match tokio::time::timeout(
             Duration::from_secs(10),
             crate::storage::ensure_bucket(&s3, &config.s3_bucket),
         )
@@ -116,13 +116,38 @@ impl AppState {
         {
             Ok(Ok(crate::storage::BucketStatus::Created)) => {
                 tracing::info!(bucket = %config.s3_bucket, "created object-storage bucket");
+                true
             }
-            Ok(Ok(crate::storage::BucketStatus::Existed)) => {}
+            Ok(Ok(crate::storage::BucketStatus::Existed)) => true,
             Ok(Err(error)) => {
                 tracing::warn!(bucket = %config.s3_bucket, %error, "could not ensure the object-storage bucket exists");
+                false
             }
             Err(_) => {
                 tracing::warn!(bucket = %config.s3_bucket, "object storage did not answer at startup; the bucket was not checked");
+                false
+            }
+        };
+        // Versioning and the retention of old versions (#59), with the same
+        // posture: a warning, not a failed start.
+        if bucket_ready {
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::storage::ensure_versioning(
+                    &s3,
+                    &config.s3_bucket,
+                    config.s3_version_retention_days,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(bucket = %config.s3_bucket, %error, "could not set bucket versioning and version retention");
+                }
+                Err(_) => {
+                    tracing::warn!(bucket = %config.s3_bucket, "object storage did not answer; bucket versioning was not set");
+                }
             }
         }
 
