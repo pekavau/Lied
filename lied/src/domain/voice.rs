@@ -1,4 +1,4 @@
-//! Voice: an individual instrument part within an arrangement (CLAUDE.md
+//! Voice: an individual instrument part within an arrangement (docs/design.md
 //! Entities: Voice). Issue #6 adds full CRUD, gated to `owner`/`archivist`
 //! (same Permission-matrix row as Arrangement: "Upload/edit arrangements &
 //! files").
@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of a `voice` row. `camelCase` per CLAUDE.md's JSON-
+/// Wire representation of a `voice` row. `camelCase` per docs/design.md's JSON-
 /// casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +88,7 @@ fn map_write_error(err: sqlx::Error) -> VoiceError {
     VoiceError::Database(err)
 }
 
-/// Slugify a voice name (CLAUDE.md: slugs generated at creation, immutable
+/// Slugify a voice name (docs/design.md: slugs generated at creation, immutable
 /// thereafter). Reuses the shared algorithm — see
 /// [`crate::domain::user::slugify`].
 pub fn slugify(input: &str) -> String {
@@ -192,7 +192,7 @@ pub async fn create(
 }
 
 /// Look up a voice by id. Hides the row if it is itself soft-deleted, OR if
-/// its parent Arrangement is soft-deleted (CLAUDE.md hide-with-references:
+/// its parent Arrangement is soft-deleted (docs/design.md hide-with-references:
 /// a soft-deleted parent hides its subtree *through it* without touching
 /// the child's own `deleted_at`).
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Voice>, sqlx::Error> {

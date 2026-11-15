@@ -1,4 +1,4 @@
-//! AppPassword repository functions (CLAUDE.md Entities: AppPassword).
+//! AppPassword repository functions (docs/design.md Entities: AppPassword).
 //!
 //! See [`crate::auth::app_password`] for token generation/hashing; this
 //! module owns the `app_password` table's CRUD plus the WebDAV
@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Wire representation of an `app_password` row. Never carries `hash` or
-/// the plaintext token — only metadata, per CLAUDE.md's "shown ONCE on
+/// the plaintext token — only metadata, per docs/design.md's "shown ONCE on
 /// creation" rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

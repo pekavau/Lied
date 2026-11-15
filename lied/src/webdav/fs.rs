@@ -165,7 +165,7 @@ impl LiedFs {
     }
 
     /// Resolve an arrangement for a *file-writing* op. Only `owner`/`archivist`
-    /// may upload/edit arrangement files (CLAUDE.md permission matrix). Note
+    /// may upload/edit arrangement files (docs/design.md permission matrix). Note
     /// this is stricter than [`Visibility::Staff`], which also covers
     /// `conductor` — a conductor has read + collections but not file writes, so
     /// visibility (a read concept) must not be reused to authorize writes.
@@ -398,7 +398,7 @@ impl LiedFs {
     /// Resolve a voice within a collection item to `(org_id, collection_id,
     /// item_id, arrangement_id, arrangement_slug, voice_id)`. Enforces that a
     /// restricted user is assigned to *this voice on this item specifically*
-    /// (CLAUDE.md: stricter than the arrangements-tree assignment check,
+    /// (docs/design.md: stricter than the arrangements-tree assignment check,
     /// which matches the voice on any item). The ancestor collection/item
     /// assignment checks are skipped — this voice-level check implies both.
     async fn resolve_collection_voice(
@@ -1559,7 +1559,7 @@ impl LiedFs {
             .await
             .map_err(db_err)?
             .ok_or(FsError::NotFound)?;
-        // Soft-delete (MinIO object retained per CLAUDE.md).
+        // Soft-delete (MinIO object retained per docs/design.md).
         file::soft_delete(&self.state.db, row.id)
             .await
             .map_err(db_err)?;

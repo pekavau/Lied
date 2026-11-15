@@ -1,8 +1,8 @@
-//! Organization: an orchestra or ensemble (CLAUDE.md Entities: Organization).
+//! Organization: an orchestra or ensemble (docs/design.md Entities: Organization).
 //!
 //! Issue #5 (Org/User/Membership management) adds full CRUD: create/delete
 //! are system-admin-gated instance operations (no `deleted_at` — deletion is
-//! an admin-gated hard delete per CLAUDE.md); list/get are open to any
+//! an admin-gated hard delete per docs/design.md); list/get are open to any
 //! authenticated user (browsing the org directory is low-sensitivity).
 //! Update is limited to `name` in phase 1 — `slug` is immutable per the
 //! WebDAV-layout decision and renaming is a separate, explicit, audited op
@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of an `organization` row. `camelCase` per CLAUDE.md's
+/// Wire representation of an `organization` row. `camelCase` per docs/design.md's
 /// JSON-casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +112,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Organization>,
     }))
 }
 
-/// Sort allowlist for `GET /v1/orgs` (CLAUDE.md "Sort & filter": per-endpoint
+/// Sort allowlist for `GET /v1/orgs` (docs/design.md "Sort & filter": per-endpoint
 /// allowlist). Default sort is `name:asc`.
 pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
     ("name", "name"),
@@ -127,7 +127,7 @@ pub const DEFAULT_SORT: (&str, crate::listing::SortDirection) =
     ("name", crate::listing::SortDirection::Asc);
 
 /// Filter allowlist for `GET /v1/orgs`: `?filter[name]=` does a case-insensitive
-/// substring match (phase-1 ILIKE search, per CLAUDE.md's basic-search scope).
+/// substring match (phase-1 ILIKE search, per docs/design.md's basic-search scope).
 pub const FILTER_ALLOWLIST: &[&str] = &["name"];
 
 /// Fetch one page of organizations plus the total row count, with an
@@ -241,7 +241,7 @@ pub async fn update_name(
 }
 
 /// Hard-delete an organization, cascading in the FK-safe order documented in
-/// CLAUDE.md ("Cascade order"): PartAssignments -> CollectionItems ->
+/// docs/design.md ("Cascade order"): PartAssignments -> CollectionItems ->
 /// Collections -> ArrangementTags -> Tags -> GlobalAnnotations -> Files ->
 /// Voices -> Arrangements -> Memberships -> the Organization row. Phase 1 has
 /// no File/Voice/Arrangement/Collection/etc. domain modules yet (later

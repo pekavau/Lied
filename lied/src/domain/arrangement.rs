@@ -1,10 +1,10 @@
 //! Arrangement: a specific arrangement for specific instrumentation, owned
-//! by an organization (CLAUDE.md Entities: Arrangement). Issue #6 adds full
-//! CRUD, gated to `owner`/`archivist` (CLAUDE.md Permission matrix:
+//! by an organization (docs/design.md Entities: Arrangement). Issue #6 adds full
+//! CRUD, gated to `owner`/`archivist` (docs/design.md Permission matrix:
 //! "Upload/edit arrangements & files").
 //!
 //! **Soft-delete (hide-with-references):** `deleted_at` hides the row from
-//! `find_by_id`/`list`/search. Undelete clears it. CLAUDE.md: a soft-delete
+//! `find_by_id`/`list`/search. Undelete clears it. docs/design.md: a soft-delete
 //! sets `deleted_at` on the targeted entity ONLY, never its descendants
 //! (Voices) — see [`crate::domain::voice`] for the corresponding
 //! `WHERE arrangement.deleted_at IS NULL` join filter that hides a deleted
@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of an `arrangement` row. `camelCase` per CLAUDE.md's
+/// Wire representation of an `arrangement` row. `camelCase` per docs/design.md's
 /// JSON-casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -65,7 +65,7 @@ fn map_write_error(err: sqlx::Error) -> ArrangementError {
     ArrangementError::Database(err)
 }
 
-/// Slugify an arrangement title (CLAUDE.md: slugs are generated from the
+/// Slugify an arrangement title (docs/design.md: slugs are generated from the
 /// title/name at creation and are immutable thereafter). Reuses the
 /// shared ASCII/lowercase/hyphenate algorithm — see
 /// [`crate::domain::user::slugify`].
@@ -74,7 +74,7 @@ pub fn slugify(input: &str) -> String {
 }
 
 /// Mutable fields shared by create/update — bundled so positional args don't
-/// drift as the field count grows (CLAUDE.md: many provenance/difficulty
+/// drift as the field count grows (docs/design.md: many provenance/difficulty
 /// fields on this entity).
 pub struct ArrangementFields<'a> {
     pub title: &'a str,
@@ -163,7 +163,7 @@ pub fn validate(fields: &ArrangementFields<'_>) -> Result<(), InvalidField> {
 
 /// The ABRSM rating is the one scale tied to the numeric `difficulty`
 /// column: it must be a grade on the 1–8 scale and, when `difficulty` is
-/// set, agree with it (rounded) — CLAUDE.md difficulty_ratings rule.
+/// set, agree with it (rounded) — docs/design.md difficulty_ratings rule.
 fn validate_abrsm(abrsm: &serde_json::Value, difficulty: Option<i16>) -> Result<(), InvalidField> {
     let grade = match abrsm {
         serde_json::Value::Number(n) => n.as_f64(),
@@ -297,7 +297,7 @@ pub async fn create(
     Ok(row.into_arrangement())
 }
 
-/// Look up an arrangement by id. Hides soft-deleted rows (CLAUDE.md soft
+/// Look up an arrangement by id. Hides soft-deleted rows (docs/design.md soft
 /// delete: hidden from REST/WebDAV/search).
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Arrangement>, sqlx::Error> {
     let row = sqlx::query_as!(
@@ -356,7 +356,7 @@ pub async fn find_by_id_including_deleted(
 }
 
 /// Sort allowlist for `GET /v1/orgs/{orgId}/arrangements`. Default sort is
-/// `title:asc` (CLAUDE.md: "arrangements default `title:asc`").
+/// `title:asc` (docs/design.md: "arrangements default `title:asc`").
 pub const SORT_ALLOWLIST: &[(&str, &str)] = &[
     ("title", "a.title"),
     ("createdAt", "a.created_at"),
@@ -384,7 +384,7 @@ const RELEVANCE_FRAGMENT: &str = "(ts_rank(a.search_vector, \
 
 /// Filter allowlist: `status` (exact match) plus the phase-1 `?q=` ILIKE
 /// search is handled separately (not via the `filter[...]` bracket syntax —
-/// CLAUDE.md: "Phase-1 ILIKE search stays a separate `?q=` param").
+/// docs/design.md: "Phase-1 ILIKE search stays a separate `?q=` param").
 pub const FILTER_ALLOWLIST: &[&str] = &[
     "status",
     "difficultyMin",
@@ -630,7 +630,7 @@ pub async fn list_for_org(
 }
 
 /// Update an arrangement's mutable fields. `slug` is immutable and not
-/// accepted here (CLAUDE.md: slug rename is a separate, explicit, audited
+/// accepted here (docs/design.md: slug rename is a separate, explicit, audited
 /// op — not implemented in this item). Returns `None` if no live row
 /// matched `id`.
 ///
@@ -686,7 +686,7 @@ pub async fn update(
     Ok(row.map(Row::into_arrangement))
 }
 
-/// Soft-delete: sets `deleted_at` on this row ONLY (CLAUDE.md
+/// Soft-delete: sets `deleted_at` on this row ONLY (docs/design.md
 /// hide-with-references: never cascades to Voices). Returns `false` if no
 /// live row matched `id`.
 ///

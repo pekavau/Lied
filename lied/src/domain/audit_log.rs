@@ -1,4 +1,4 @@
-//! The single `audit()` write helper (CLAUDE.md Security baseline: Audit
+//! The single `audit()` write helper (docs/design.md Security baseline: Audit
 //! logging) — "Phase 1 implementation is a single `audit(action, target,
 //! payload)` helper called from every write site."
 //!
@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Static deny-list of JSON object keys whose value gets replaced with the
-/// `"[redacted]"` sentinel before write (CLAUDE.md Redaction policy). The
+/// `"[redacted]"` sentinel before write (docs/design.md Redaction policy). The
 /// key is retained so a diff still shows *that* the field changed, just not
 /// its value. Applied recursively since payloads can nest (e.g. a
 /// before/after diff object).
@@ -66,7 +66,7 @@ pub struct AuditContext {
 /// acted on; `payload` is arbitrary JSON context, redacted before storage.
 ///
 /// Errors are logged but never propagated — a failure to write an audit row
-/// must not fail the auth operation it documents (CLAUDE.md's audit rule is
+/// must not fail the auth operation it documents (docs/design.md's audit rule is
 /// "every write is logged", not "every write requires its log to succeed");
 /// an audit outage shouldn't become a login outage.
 pub async fn audit(

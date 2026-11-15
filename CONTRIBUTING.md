@@ -4,7 +4,7 @@ Thanks for your interest in Lied! This is an early-stage project, so the most
 useful contributions right now are bug reports, focused fixes, and feedback from
 anyone self-hosting it. Larger features are best discussed in an issue first —
 the design is deliberately phased (see the roadmap in the [README](README.md)
-and the full rationale in [`CLAUDE.md`](CLAUDE.md)), and it helps to check that a
+and the full rationale in [`docs/design.md`](docs/design.md)), and it helps to check that a
 change fits the current phase before you build it.
 
 ## Getting set up
@@ -55,7 +55,7 @@ A few project-specific rules worth knowing up front:
 - New behavior should come with a test. Coverage isn't gated on a percentage —
   meaningful tests over numbers.
 - The API conventions (pagination, ETags/optimistic concurrency, RFC 7807 error
-  shape) are in `CLAUDE.md` ("HTTP & REST API conventions"); how to add or
+  shape) are in `docs/design.md` ("HTTP & REST API conventions"); how to add or
   change a `/v1` endpoint, including its OpenAPI annotation, is in
   [`docs/api-guidelines.md`](docs/api-guidelines.md).
 - `docs/openapi.json` is the committed `/v1` contract. A change that alters the
@@ -74,7 +74,7 @@ A few project-specific rules worth knowing up front:
   `fixup!` / `squash!` commits before requesting review
   (`git rebase -i --autosquash main`).
 - Reference the issue in the PR and include a short checklist of what you
-  changed. If a design decision shifted, update `CLAUDE.md` in the same PR.
+  changed. If a design decision shifted, update `docs/design.md` in the same PR.
 - Commit messages are free-form and imperative; no conventional-commits
   enforcement.
 

@@ -1,5 +1,5 @@
 //! Axum extractors that resolve an authenticated [`crate::domain::user::User`]
-//! from either a session cookie or a bearer token (CLAUDE.md: "REST API
+//! from either a session cookie or a bearer token (docs/design.md: "REST API
 //! uses session cookies (web client) or bearer tokens (programmatic)").
 //!
 //! Both extractors are `async` `FromRequestParts` impls so handlers simply
@@ -48,7 +48,7 @@ impl FromRequestParts<AppState> for AuthSession {
 }
 
 /// An authenticated user resolved from *either* an `Authorization: Bearer
-/// <jwt>` header or the session cookie, for the `/v1` tree (CLAUDE.md:
+/// <jwt>` header or the session cookie, for the `/v1` tree (docs/design.md:
 /// "session cookie or bearer token").
 ///
 /// **The `Authorization` header wins.** If the request carries one, it alone

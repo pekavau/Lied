@@ -98,7 +98,7 @@ async fn list_instruments(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MintTokenRequest {
-    /// Optional active org id to scope the token to (CLAUDE.md JWT claims:
+    /// Optional active org id to scope the token to (docs/design.md JWT claims:
     /// `org`, nullable). Not validated against Membership in this item —
     /// org-scoping enforcement is a later authorization concern; minting
     /// just records the claim.
@@ -293,7 +293,7 @@ async fn create_app_password(
         .map_err(|err| match err {
             // A clash on the `(user_id, name)` unique index is a conflict with
             // current state, not an `If-Match` precondition failure, so it is a
-            // `409` (CLAUDE.md, HTTP & REST API conventions). The endpoint has no
+            // `409` (docs/design.md, HTTP & REST API conventions). The endpoint has no
             // precondition semantics; `412` was wrong.
             app_password::AppPasswordError::DuplicateName => AppError::Conflict(format!(
                 "an app password named '{}' already exists",
@@ -409,7 +409,7 @@ async fn revoke_app_password(
 pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
     // `POST /v1/tokens` runs the same `find_by_username` + `verify_password`
     // as `/admin/login`, so it is the same brute-force surface and gets
-    // the same per-IP login rate-limit bucket (CLAUDE.md: login/password
+    // the same per-IP login rate-limit bucket (docs/design.md: login/password
     // endpoints 10/min). Scoped to this route only, not the whole tree.
     let token_router = OpenApiRouter::new()
         .routes(routes!(mint_token))
@@ -442,7 +442,7 @@ pub fn api_router(login_per_min: u32) -> OpenApiRouter<AppState> {
 }
 
 pub fn router(state: AppState) -> OpenApiRouter<AppState> {
-    // The `/v1` tree accepts session-cookie *or* bearer auth (CLAUDE.md
+    // The `/v1` tree accepts session-cookie *or* bearer auth (docs/design.md
     // "Route-tree boundary"), so it needs the same `SessionManagerLayer` the
     // `/admin` tree carries: without it the bare `Session` extractor in
     // `mint_token` 500s, and `BearerOrSession` can never resolve a session

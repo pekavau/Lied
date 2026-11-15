@@ -1,4 +1,4 @@
-//! WebDAV `Authorization: Basic` resolution via app passwords (CLAUDE.md
+//! WebDAV `Authorization: Basic` resolution via app passwords (docs/design.md
 //! AppPassword entity: "WebDAV `Authorization: Basic
 //! base64(username:token)` resolves by...").
 //!
@@ -48,7 +48,7 @@ fn decode_basic_auth(header_value: &str) -> Option<(String, String)> {
 /// the matched app password and audits `auth.app_password_used`. On
 /// failure, audits nothing by itself — the caller (see
 /// [`crate::routes::webdav`]) decides whether a failed WebDAV auth attempt
-/// is worth its own row to satisfy "every auth event" from CLAUDE.md.
+/// is worth its own row to satisfy "every auth event" from docs/design.md.
 pub async fn authenticate(
     pool: &PgPool,
     authorization_header: Option<&str>,

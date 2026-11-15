@@ -1,5 +1,5 @@
 //! Reusable sort/filter/ETag helpers for `/v1` list and detail endpoints
-//! (CLAUDE.md "HTTP & REST API conventions": Sort & filter, Optimistic
+//! (docs/design.md "HTTP & REST API conventions": Sort & filter, Optimistic
 //! concurrency).
 //!
 //! This item (issue #5, Org/User/Membership management) is the first to need
@@ -12,7 +12,7 @@
 //! *select* among these fixed fragments via a `match`/lookup — never
 //! interpolated into SQL directly. An unknown field or direction is a `400`
 //! Problem Details ([`AppError::Validation`]) rather than silently ignored,
-//! per CLAUDE.md.
+//! per docs/design.md.
 
 use std::collections::HashMap;
 
@@ -202,7 +202,7 @@ pub fn resolve_filters(
 }
 
 /// Derive the `ETag` header value from an entity's `updated_at`: the
-/// millisecond-epoch timestamp, quoted (CLAUDE.md: "ETags derived from
+/// millisecond-epoch timestamp, quoted (docs/design.md: "ETags derived from
 /// `updated_at` (millisecond epoch)").
 pub fn etag_for(updated_at: DateTime<Utc>) -> String {
     format!("\"{}\"", updated_at.timestamp_millis())
@@ -221,7 +221,7 @@ pub fn parse_if_match(header_value: Option<&str>) -> Option<i64> {
 /// Check an `If-Match` header against an entity's current `updated_at`.
 /// Returns `Ok(())` when they match (millisecond precision); `Err(())` on
 /// any mismatch *or* a missing/unparseable header — callers map `Err` to
-/// [`crate::error::AppError::PreconditionFailed`]. Per CLAUDE.md,
+/// [`crate::error::AppError::PreconditionFailed`]. Per docs/design.md,
 /// `PATCH`/`PUT`/`DELETE` MUST send `If-Match`, so "missing" is itself a
 /// precondition failure, not a pass-through.
 ///

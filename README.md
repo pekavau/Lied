@@ -84,7 +84,7 @@ REST is the music-aware layer on top. MinIO speaks the S3 API, so it can be
 swapped for any S3-compatible store without code changes.
 
 The full design rationale — data model, authorization, non-functional posture,
-and the phased delivery plan — lives in [`CLAUDE.md`](CLAUDE.md), which is the
+and the phased delivery plan — lives in [`docs/design.md`](docs/design.md), which is the
 project's design spec, including the HTTP/API conventions. How to add or
 change a `/v1` endpoint is in [`docs/api-guidelines.md`](docs/api-guidelines.md).
 
@@ -182,7 +182,7 @@ All configuration is via environment variables (each secret `X` also accepts
 | `LIED_RATELIMIT_LOGIN_PER_MIN` | `10` | Brute-force defense on login |
 
 See [`.env.example`](.env.example) for a starting point and the **Default
-limits** table in [`CLAUDE.md`](CLAUDE.md) for the full list — every limit is
+limits** table in [`docs/design.md`](docs/design.md) for the full list — every limit is
 documented and configurable.
 
 ## Running in production
@@ -265,7 +265,7 @@ Lied is built in phases; the data model already accommodates the later ones.
 
 Explicitly **out of scope** (integrate, don't reinvent): notation editing,
 audio/MIDI playback, rights/royalty enforcement, purchasing, and
-personnel/scheduling. See the *Out of scope* section in `CLAUDE.md`.
+personnel/scheduling. See the *Out of scope* section in `docs/design.md`.
 
 ## Contributing & security
 

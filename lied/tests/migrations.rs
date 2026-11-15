@@ -4,11 +4,11 @@
 //! (CLAUDE.md Testing posture: real Postgres, no mocks, a fresh per-test
 //! container so there is no fixture pollution between tests), applies every
 //! migration with `sqlx::migrate!`, and asserts:
-//! - the instrument seed lands ~150+ rows (CLAUDE.md: "Instrument seed
+//! - the instrument seed lands ~150+ rows (docs/design.md: "Instrument seed
 //!   (~150 standard instruments)"),
 //! - partial unique indexes behave as designed: a duplicate *live* row is
 //!   rejected, but a duplicate that includes a soft-deleted row is allowed
-//!   (CLAUDE.md: "Unique constraints... as partial unique indexes `WHERE
+//!   (docs/design.md: "Unique constraints... as partial unique indexes `WHERE
 //!   deleted_at IS NULL`").
 
 use sqlx::postgres::PgPoolOptions;
@@ -91,7 +91,7 @@ async fn migrations_apply_cleanly_and_are_idempotent() {
     let db = TestDb::create_and_migrate().await;
 
     // Re-running the same migration set against an already-migrated
-    // database must be a no-op, not an error (CLAUDE.md acceptance
+    // database must be a no-op, not an error (docs/design.md acceptance
     // criterion: "Re-running migrations is idempotent").
     sqlx::migrate!("../migrations")
         .run(db.pool())
@@ -333,7 +333,7 @@ async fn tower_sessions_table_exists_and_is_writable() {
 
     // Smoke-check the adopted tower-sessions-sqlx-store schema: write then
     // read a row directly (mirrors what `PostgresStore` does internally),
-    // without joining it to any domain table (CLAUDE.md infra-pluggability
+    // without joining it to any domain table (docs/design.md infra-pluggability
     // rule: treat it as an opaque K/V store).
     sqlx::query!(
         r#"INSERT INTO tower_sessions.session (id, data, expiry_date) VALUES ('test-session-id', '\x00', now() + interval '1 hour')"#

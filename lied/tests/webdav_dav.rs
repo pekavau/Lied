@@ -502,7 +502,7 @@ async fn conductor_cannot_write_files() {
     let arr = seed_arr(&ctx.pool, org, "bolero").await;
     let _voice = seed_voice(&ctx.pool, arr, "flute-1").await;
     // Conductor is "staff" for reads but must NOT write files — only
-    // owner/archivist may (CLAUDE.md permission matrix).
+    // owner/archivist may (docs/design.md permission matrix).
     let cond = seed_user(&ctx.pool, org, "connie", Some("conductor")).await;
 
     let uri = "/orgs/acme/arrangements/bolero/voices/flute-1/part.pdf";

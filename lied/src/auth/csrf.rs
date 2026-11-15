@@ -1,4 +1,4 @@
-//! CSRF double-submit protection for the `/admin` HTMX tree (CLAUDE.md
+//! CSRF double-submit protection for the `/admin` HTMX tree (docs/design.md
 //! "HTTP & REST API conventions": CSRF).
 //!
 //! Shape: a random token is generated per session and stored both (a) in
@@ -8,7 +8,7 @@
 //! into an `HX-CSRF` request header on every state-changing request; this
 //! middleware validates that the header matches the session-stored value.
 //! `SameSite=Lax` on the session cookie is a backstop, not the primary
-//! defense, per CLAUDE.md.
+//! defense, per docs/design.md.
 //!
 //! [`csrf_middleware`] is mounted only on the `/admin` tree. `/v1` enforces
 //! the same token through [`verify_header`], called where the auth path is
@@ -160,7 +160,7 @@ pub async fn v1_csrf_cookie_middleware(
 /// victim is already logged in), and a plain server-rendered `<form>` POST
 /// has no opportunity to run the `htmx:configRequest` JS hook that would
 /// populate `HX-CSRF`. `/logout` is exempted for the same plain-form-post
-/// reason; a forced logout is a low-value CSRF target (CLAUDE.md's "client
+/// reason; a forced logout is a low-value CSRF target (docs/design.md's "client
 /// JS handler is later UI work" note covers the gap until the admin UI
 /// switches these to HTMX-driven requests).
 const CSRF_EXEMPT_PATHS: &[&str] = &["/login", "/logout"];

@@ -1,6 +1,6 @@
 //! Infra tree: `/healthz`, `/readyz`, `/metrics`, `/openapi.json`, `/docs`.
 //!
-//! Unauthenticated by design (see CLAUDE.md "Route-tree boundary").
+//! Unauthenticated by design (see docs/design.md "Route-tree boundary").
 //!
 //! `router(api)` takes the fully-populated [`utoipa::openapi::OpenApi`] built
 //! by `routes/mod.rs` via `OpenApiRouter::split_for_parts()` and serves it at

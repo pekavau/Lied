@@ -5,7 +5,7 @@
 //! [`crate::routes::webdav`]. Structural path parsing lives in [`path`]; the
 //! filesystem, per-role visibility, and MinIO/DB wiring build on top of it.
 //!
-//! See CLAUDE.md "WebDAV layout" for the canonical directory contract this
+//! See docs/design.md "WebDAV layout" for the canonical directory contract this
 //! module implements.
 //!
 //! # Implementation plan (issue #8)

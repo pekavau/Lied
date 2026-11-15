@@ -2,7 +2,7 @@
 //! (Collections + CollectionItems: program assembly and standing repertoire).
 //!
 //! Reads require any org membership (`musician`+); writes (build/edit) require
-//! `owner`/`archivist`/`conductor` (CLAUDE.md Permission matrix), enforced via
+//! `owner`/`archivist`/`conductor` (docs/design.md Permission matrix), enforced via
 //! [`require_collection_editor_v1`]. Optimistic concurrency (ETag/`If-Match`),
 //! RFC 7807 errors, and an `audit()` on every write, per the API guidelines.
 

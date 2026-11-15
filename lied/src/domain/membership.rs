@@ -1,8 +1,8 @@
-//! Membership: a user's membership in an organization (CLAUDE.md Entities:
+//! Membership: a user's membership in an organization (docs/design.md Entities:
 //! Membership). Issue #5 adds full CRUD, gated to an org's `owner` role
-//! (CLAUDE.md Permission matrix: "Manage members & roles" — owner only).
+//! (docs/design.md Permission matrix: "Manage members & roles" — owner only).
 //!
-//! Two invariants enforced here rather than in SQL (CLAUDE.md Decisions:
+//! Two invariants enforced here rather than in SQL (docs/design.md Decisions:
 //! "Postgres can't enforce element-level FKs on an array" /
 //! "every org has at least one Membership with role = owner"):
 //! 1. `instrument_ids` / `principal_instrument_ids` must reference live
@@ -49,7 +49,7 @@ impl Role {
         }
     }
 
-    // --- Permission matrix (CLAUDE.md "Permission matrix") ---
+    // --- Permission matrix (docs/design.md "Permission matrix") ---
     //
     // The single source of truth for the org-role capability rows, so the
     // `/v1` authorization helpers ([`crate::auth::authz`]) and the `/admin`
@@ -84,7 +84,7 @@ impl Role {
     }
 }
 
-/// Wire representation of a `membership` row. `camelCase` per CLAUDE.md's
+/// Wire representation of a `membership` row. `camelCase` per docs/design.md's
 /// JSON-casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -160,7 +160,7 @@ fn map_insert_error(err: sqlx::Error) -> MembershipError {
 }
 
 /// Validate that every id in `principal_instrument_ids` also appears in
-/// `instrument_ids` (CLAUDE.md: "principal_instrument_ids ... subset of
+/// `instrument_ids` (docs/design.md: "principal_instrument_ids ... subset of
 /// instrument_ids").
 fn principal_ids_are_subset(instrument_ids: &[Uuid], principal_instrument_ids: &[Uuid]) -> bool {
     principal_instrument_ids
@@ -169,7 +169,7 @@ fn principal_ids_are_subset(instrument_ids: &[Uuid], principal_instrument_ids: &
 }
 
 /// Validate that every id in `ids` references a live `instrument` row
-/// (CLAUDE.md: "validated against the live Instrument set in the service
+/// (docs/design.md: "validated against the live Instrument set in the service
 /// layer on write" — Postgres can't enforce an element-level FK on a `uuid[]`
 /// column). Empty input is trivially valid (no query needed).
 async fn validate_instrument_ids(pool: &PgPool, ids: &[Uuid]) -> Result<bool, sqlx::Error> {
@@ -486,7 +486,7 @@ pub async fn update(
 }
 
 /// Returns `true` if `user_id` holds at least one `Membership` in any
-/// organization. Used to gate Work creation (CLAUDE.md Decisions: "creating
+/// organization. Used to gate Work creation (docs/design.md Decisions: "creating
 /// a Work is open to any authenticated user with at least one Membership in
 /// any org").
 pub async fn has_any_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {

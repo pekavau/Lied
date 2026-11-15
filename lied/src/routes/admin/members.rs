@@ -462,7 +462,7 @@ async fn update_member(
             _ => error_page(&ctx, StatusCode::NOT_FOUND, "Member not found."),
         },
         Ok(Some(_)) => {
-            // Distinguish the security-relevant transitions (CLAUDE.md audit
+            // Distinguish the security-relevant transitions (docs/design.md audit
             // events: "role change, principal-flag change"), matching the /v1
             // membership handler — a plain field edit stays `membership.update`.
             let action = if role != current.role {

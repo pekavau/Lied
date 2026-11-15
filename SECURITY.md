@@ -43,10 +43,10 @@ vulnerabilities:
   Phase 1 assumes every organization sharing an instance trusts the others
   (single-org, allied-federation, and personal self-hosting). Strict
   multi-tenant SaaS isolation is explicitly out of scope for now — see the
-  *Deployment topologies* section of [`CLAUDE.md`](CLAUDE.md).
+  *Deployment topologies* section of [`docs/design.md`](docs/design.md).
 - The bundled `.env.example` contains **development-only placeholder
   credentials**. Any real deployment must set its own secrets (ideally via the
-  `_FILE` / external-command resolvers described in `CLAUDE.md`).
+  `_FILE` / external-command resolvers described in `docs/design.md`).
 - `LIED_SECURE_COOKIES` defaults to `false` for plain-HTTP local use; set it to
   `true` behind HTTPS.
 

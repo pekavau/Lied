@@ -71,7 +71,7 @@ fn write_error(err: WriteError) -> AppError {
 }
 
 /// The version `If-Match` names, if it names the current one. A missing,
-/// unparseable or stale header is a 412 (CLAUDE.md: PATCH/DELETE MUST send
+/// unparseable or stale header is a 412 (docs/design.md: PATCH/DELETE MUST send
 /// `If-Match`). The write re-checks the same version atomically, so this early
 /// answer is a courtesy, not the guarantee.
 fn expected_version(headers: &HeaderMap, current: &GlobalAnnotation) -> Result<i64, AppError> {

@@ -1,4 +1,4 @@
-//! User: a person using the system (CLAUDE.md Entities: User).
+//! User: a person using the system (docs/design.md Entities: User).
 //!
 //! Phase-1 item 4 (auth) needs enough of this entity to bootstrap an admin,
 //! log in, and look up a user by username/id. Full CRUD (admin UI) lands in
@@ -216,7 +216,7 @@ pub const FILTER_ALLOWLIST: &[&str] = &["username"];
 
 /// Fetch one page of users plus the total row count, with an allowlisted
 /// sort and an optional `username` substring filter. System-admin-only
-/// endpoint (CLAUDE.md: instance-level user management); see
+/// endpoint (docs/design.md: instance-level user management); see
 /// [`crate::domain::organization::list`] for why the `format!`-built query
 /// around fixed, allowlisted fragments is safe.
 pub async fn list(
@@ -286,7 +286,7 @@ pub async fn list(
     Ok((items, total))
 }
 
-/// Hard-delete a user (CLAUDE.md: "user deletion is admin-gated hard delete
+/// Hard-delete a user (docs/design.md: "user deletion is admin-gated hard delete
 /// with explicit reassignment-or-anonymization of PartAssignments,
 /// GlobalAnnotations, and audit log entries" — the reassignment/
 /// anonymization flow is not yet built, but this delete still must not

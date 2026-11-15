@@ -1,11 +1,11 @@
 //! CollectionItem: an arrangement within a collection at a local index number
-//! (CLAUDE.md Entities: CollectionItem). Issue #9.
+//! (docs/design.md Entities: CollectionItem). Issue #9.
 //!
 //! **Hide-with-references.** An item whose arrangement has been soft-deleted is
 //! *not* dropped from the collection — it is surfaced as "removed" (the
 //! [`CollectionItemView::arrangement_removed`] flag) with the arrangement slug
 //! still shown, so a broken reference is visible rather than silently missing
-//! (CLAUDE.md soft-delete cascade).
+//! (docs/design.md soft-delete cascade).
 //!
 //! **Unique index.** `(collection_id, index)` is unique among live rows; a
 //! clash maps to [`CollectionItemError::DuplicateIndex`]. [`reorder`] reassigns

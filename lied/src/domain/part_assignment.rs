@@ -1,5 +1,5 @@
 //! PartAssignment: which user plays which voice for a specific item in a
-//! collection (CLAUDE.md Entities: PartAssignment). Issue #10 closes the
+//! collection (docs/design.md Entities: PartAssignment). Issue #10 closes the
 //! archivist→musician loop.
 //!
 //! **No soft-delete.** Unlike most entities, `part_assignment` has no
@@ -16,7 +16,7 @@
 //!
 //! **Implicit read grant.** A `PartAssignment` does not require the assigned
 //! user to hold a `Membership` in the org — this is how guest/substitute
-//! musicians are modeled (CLAUDE.md: "grants the assigned user read access to
+//! musicians are modeled (docs/design.md: "grants the assigned user read access to
 //! that voice's files for as long as the assignment exists"). The WebDAV
 //! collections-subtree visibility (`webdav::access`, `webdav::fs`) is what
 //! actually enforces that grant; this module only owns the row.

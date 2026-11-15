@@ -40,7 +40,7 @@ impl From<String> for Secret {
 
 /// Top-level application configuration.
 ///
-/// All fields here are **operator config** (env-owned per CLAUDE.md's
+/// All fields here are **operator config** (env-owned per docs/design.md's
 /// config-ownership tiers) — never editable via the admin UI or stored in
 /// the DB. Loaded once at process startup.
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,18 +101,18 @@ pub struct AppConfig {
     /// Defaults to `false` so a fresh self-host works out of the box: browsers
     /// silently drop `Secure` cookies on non-TLS origins, so a `true` default
     /// would break login on the LAN/`localhost`/plain-HTTP deployments that
-    /// self-hostability (a hard CLAUDE.md requirement, topologies 1 & 4)
+    /// self-hostability (a hard docs/design.md requirement, topologies 1 & 4)
     /// explicitly targets — with no error, just a redirect loop back to login.
     /// **Any deployment served over HTTPS MUST set `LIED_SECURE_COOKIES=true`**
     /// (documented in `.env.example`); the safe-by-default choice would be
     /// `true`, but a footgun that silently locks users out is worse than one
     /// that requires an opt-in flag behind TLS. `HttpOnly` and `SameSite=Lax`
-    /// are not configurable — CLAUDE.md treats those as non-negotiable baseline
+    /// are not configurable — docs/design.md treats those as non-negotiable baseline
     /// (CSRF backstop + XSS hardening); only `Secure` depends on TLS posture.
     pub secure_cookies: bool,
 }
 
-/// Defaults mirroring the "Default limits" table in CLAUDE.md.
+/// Defaults mirroring the "Default limits" table in docs/design.md.
 ///
 /// Internal plumbing only (figment source + extraction target) — not part
 /// of the wire JSON contract, so it uses plain snake_case field names that

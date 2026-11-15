@@ -42,7 +42,7 @@ image:
     docker build -t lied:latest .
 
 # Back up Postgres (pg_dump --format=custom) and MinIO (mc mirror) against
-# the docker-compose volumes, per the phase-1 backup posture in CLAUDE.md.
+# the docker-compose volumes, per the phase-1 backup posture in docs/design.md.
 # Ordering matters: Postgres first, then MinIO (DB is the existence
 # authority; a DB-references-missing-file is detectable, the reverse is
 # silent dead bytes). Output lands in ./backup, a host-mounted dir.

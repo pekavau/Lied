@@ -1,6 +1,6 @@
 -- GlobalAnnotation.type becomes a controlled vocabulary (issue #36).
 --
--- 0017 created `type` as free text. CLAUDE.md's enum convention stores every
+-- 0017 created `type` as free text. docs/design.md's enum convention stores every
 -- status/type/kind column as text + CHECK (only Tag.kind is free text, by
 -- design), so the vocabulary is fixed here, before any client writes to it:
 --

@@ -1,10 +1,10 @@
 //! Tag: an open-ended classifier scoped to an organization, plus
-//! ArrangementTag, the many-to-many join to Arrangement (CLAUDE.md Entities:
+//! ArrangementTag, the many-to-many join to Arrangement (docs/design.md Entities:
 //! Tag, ArrangementTag). Issue #6 adds full CRUD on Tag and attach/detach on
-//! the join, gated to `owner`/`archivist` (CLAUDE.md Permission matrix:
+//! the join, gated to `owner`/`archivist` (docs/design.md Permission matrix:
 //! "Manage tags").
 //!
-//! `Tag.kind` stays free-text by design (no CHECK) — CLAUDE.md: "orgs can
+//! `Tag.kind` stays free-text by design (no CHECK) — docs/design.md: "orgs can
 //! invent categories without a migration."
 
 use chrono::{DateTime, Utc};
@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// Wire representation of a `tag` row. `camelCase` per CLAUDE.md's JSON-
+/// Wire representation of a `tag` row. `camelCase` per docs/design.md's JSON-
 /// casing convention.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -302,7 +302,7 @@ pub async fn update(
 
 /// Soft-delete a tag (`deleted_at` on this row only). The owning
 /// `arrangement_tag` join rows are left untouched (no soft-delete on that
-/// entity per CLAUDE.md) — a soft-deleted tag's joins become invisible
+/// entity per docs/design.md) — a soft-deleted tag's joins become invisible
 /// through [`list_tags_for_arrangement`]'s `tag.deleted_at IS NULL` filter
 /// without the join row itself being modified, the same hide-with-references
 /// pattern as Arrangement -> Voice.
@@ -336,7 +336,7 @@ pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 
 // ---------------------------------------------------------------------------
 // ArrangementTag: many-to-many join. No soft-delete on the join itself
-// (CLAUDE.md) — attach/detach are real inserts/deletes.
+// (docs/design.md) — attach/detach are real inserts/deletes.
 // ---------------------------------------------------------------------------
 
 #[derive(thiserror::Error, Debug)]

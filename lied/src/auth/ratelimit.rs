@@ -1,4 +1,4 @@
-//! Login rate-limit bucket (CLAUDE.md Security baseline: "Login / password
+//! Login rate-limit bucket (docs/design.md Security baseline: "Login / password
 //! endpoints: 10 req/min per IP" / `LIED_RATELIMIT_LOGIN_PER_MIN`).
 //!
 //! Built on `tower_governor`, keyed by client IP via [`SmartIpKeyExtractor`],

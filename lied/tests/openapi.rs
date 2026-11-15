@@ -950,7 +950,7 @@ fn request_schemas_are_named_after_their_resource() {
 
 /// Issue #74: list endpoints return the `{ items, total, limit, offset }`
 /// envelope. An operation answering a bare array (inline or through a named
-/// schema) must be listed here with the reason; CLAUDE.md names the same
+/// schema) must be listed here with the reason; docs/design.md names the same
 /// exceptions.
 #[test]
 fn unpaginated_lists_are_named_exceptions() {

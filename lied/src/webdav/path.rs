@@ -1,7 +1,7 @@
 //! WebDAV path ↔ entity-tree resolution.
 //!
 //! Parses a request path under the two WebDAV trees into a [`ResolvedPath`]
-//! naming its position in the Lied entity model (CLAUDE.md "WebDAV layout").
+//! naming its position in the Lied entity model (docs/design.md "WebDAV layout").
 //! This is pure structural parsing — it does not touch the database, so slugs
 //! here are *candidate* slugs that the filesystem layer still resolves to live
 //! rows (and applies soft-delete / per-role visibility to).

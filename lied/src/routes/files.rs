@@ -269,7 +269,7 @@ async fn do_upload(
 /// Upload a full-score file to an arrangement (owner/archivist only).
 ///
 /// The request body must be `multipart/form-data` with a single part that
-/// carries a recognised `Content-Type` (see the format table in CLAUDE.md).
+/// carries a recognised `Content-Type` (see the format table in docs/design.md).
 /// The file is streamed directly to MinIO — server memory per upload is a
 /// fixed chunk buffer, not proportional to file size.
 #[utoipa::path(

@@ -334,7 +334,7 @@ async fn system_admin_can_delete_an_organization_with_if_match() {
     .unwrap_or(0);
     assert_eq!(audit_count, 1, "org deletion should be audited");
 
-    // CLAUDE.md (Organization "Not cascaded"): audit rows are "retained with
+    // docs/design.md (Organization "Not cascaded"): audit rows are "retained with
     // their org_id ... after the org is gone". The org_id must persist verbatim
     // on the forensic row — NOT be nulled (which would also conflate it with an
     // instance-wide event, where org_id IS NULL by design).
