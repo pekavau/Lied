@@ -245,7 +245,7 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 - **`jsonwebtoken`** — bearer tokens for programmatic REST clients. **Algorithm: HS256** (symmetric); Lied is the only issuer and verifier, so asymmetric is wasted complexity. The signing secret is 32 random bytes managed via the secrets layer with the hot-rotation flow already specced (new key written, old key honored for a grace window). Every token carries a **`kid` header** naming the signing key; during the rotation grace window both keys live in the verifier's keyring and the verifier selects by `kid` rather than trial-verifying against each (which would be wasteful and ambiguous in logs). New tokens are signed with the newest key. Token lifetime: **30 days, configurable.** Claims: `sub` (user id), `org` (active org id, nullable for system-admin operations), `iat`, `exp`, `jti` (id for future revocation listing). If federation ever needs external verification, switching to ES256 is a contained migration (accept both during cutover, retire HS256).
 - **`tower-governor`** — rate limiting as axum/tower middleware.
 - **`tracing`** + **`tracing-subscriber`** — structured logging.
-- **`figment`** — layered config (file + env + the `_FILE` / `cmd:` secret-source pattern from the NFR section).
+- **`figment`** — layered config (file + env + the `_FILE` / `_CMD` secret-source pattern from the NFR section).
 - **`utoipa`** — derives OpenAPI from the axum routes; the API spec doesn't drift from the code.
 - **`uuid`** (`v7` + `serde` features) — UUIDv7 primary keys (see Implementation conventions).
 - **`garde`** — derive-based input validation; failures map to a 400 Problem Details (see Implementation conventions).
@@ -265,7 +265,7 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 ### Testing
 - **`cargo test`** native runner.
 - **`testcontainers`** for ephemeral Postgres + MinIO in integration tests; no fixture pollution between tests.
-- **`insta`** for snapshot tests of REST response shapes.
+- **Snapshots:** the `/v1` contract is pinned by the committed `docs/openapi.json` (`openapi_snapshot_is_current`). `insta` is a dev-dependency for response-shape snapshots, but no test uses it yet.
 
 ### Deferred (see Phase cuts)
 - **Audiveris** (Java, separate container) — OMR for PDF/image → MusicXML.
@@ -323,7 +323,7 @@ Anything that stands in for "external system that could be swapped" (session sto
 
 **Two tiers of configuration — classify by *who owns the value*, not by what's easiest to edit.**
 
-- **Operator config (env / `_FILE` / `cmd:` via figment; never in the DB or any UI).** Everything that protects the *deployment* — host, process, bandwidth, auth surface: all rate limits, max upload/request bytes, page-size ceiling, JWT lifetime, signing keys, all secrets, the metrics toggle. Owned by whoever runs the container (deploy/filesystem access), not by an org `owner` or even `is_system_admin`. Two reasons it must not move into the admin UI:
+- **Operator config (env / `_FILE` / `_CMD` via figment; never in the DB or any UI).** Everything that protects the *deployment* — host, process, bandwidth, auth surface: all rate limits, max upload/request bytes, page-size ceiling, JWT lifetime, signing keys, all secrets, the metrics toggle. Owned by whoever runs the container (deploy/filesystem access), not by an org `owner` or even `is_system_admin`. Two reasons it must not move into the admin UI:
   1. **Trust boundary.** In the federation/SaaS topology the org admin is exactly the party being rate-limited and size-capped — the limited party must not be able to raise its own ceiling.
   2. **Mechanics.** These are wired into startup middleware (`tower-governor`, body-size layers); read-once-at-boot is trivial, live DB reload is plumbing for zero phase-1 benefit. They change rarely — a restart is acceptable.
 
@@ -348,12 +348,12 @@ Anything that stands in for "external system that could be swapped" (session sto
 
   Storage: `audit_log` Postgres table in the same DB. Columns: `id`, `at` (timestamptz), `actor_user_id` (nullable for system events), `org_id` (nullable for instance-level), `action` (text, e.g. `arrangement.create`, `membership.role_change`), `target_kind`, `target_id`, `payload` (jsonb — diff or context, secrets redacted), `request_id` (correlates with the tracing span). For writes to instance-wide entities (`Work`, `Instrument`), `org_id` is `NULL` regardless of which org the actor was operating from — instance-wide events are not attributed to an org.
 
-  **Redaction policy.** Before any `payload` is written, a single redaction pass in the `audit()` helper replaces a static deny-list of field names with the sentinel `"[redacted]"` (key retained so the diff still shows the field changed): `User.password_hash`, `AppPassword.hash`, `AppPassword` plaintext token, JWT/session signing keys, OIDC client secret, and any value sourced via the `cmd:` / `file:` secret resolvers. This is the second line of defense — secret reads already route through the config layer, which redacts at that boundary (see Secrets management). A deny-list (not allow-list) is used because payloads are arbitrary jsonb; the config-layer redaction backstops anything a new secret field misses.
+  **Redaction policy.** Before any `payload` is written, a single redaction pass in the `audit()` helper replaces a static deny-list of field names with the sentinel `"[redacted]"` (key retained so the diff still shows the field changed): `User.password_hash`, `AppPassword.hash`, `AppPassword` plaintext token, JWT/session signing keys, OIDC client secret, and any value sourced via the `_CMD` / `_FILE` secret resolvers. This is the second line of defense — secret reads already route through the config layer, which redacts at that boundary (see Secrets management). A deny-list (not allow-list) is used because payloads are arbitrary jsonb; the config-layer redaction backstops anything a new secret field misses.
 
   Listing the audit log *(not yet built)*: there is no endpoint or console screen; the table is read with SQL. Append-only by convention; the only mutation is an admin-only redact *(not yet built)* that overwrites `payload` for a single entry and logs the redaction itself. Inline storage keeps the single-binary self-hostable story intact; a later retention/archival policy can ship old rows to a file or S3 if volume warrants. Phase 1 implementation is a single `audit(action, target, payload)` helper called from every write site — discipline + PR review, no macros yet.
 - **Secrets management:**
   - All secrets are read from environment variables. Every secret env var `X` also accepts `X_FILE` pointing at a path — the Docker secrets convention, which works with Docker Compose/Swarm secrets, Kubernetes secrets, and systemd `LoadCredential=`.
-  - The config layer abstracts secret sources so each secret can declare `env:`, `file:`, or `cmd:` (shells out to a helper like `pass`, `op read`, `vault kv get`). Vault / Infisical / 1Password / Bitwarden plug in later without coupling the app to any of them.
+  - The config layer abstracts secret sources: each secret `X` is read from `X`, from the file named by `X_FILE`, or from the trimmed stdout of the command in `X_CMD` (shells out to a helper like `pass`, `op read`, `vault kv get`). Vault / Infisical / 1Password / Bitwarden plug in later without coupling the app to any of them.
   - Secret values are redacted from logs and error responses at the config-layer boundary, not at every call site.
   - Session/JWT signing keys support hot rotation via an admin REST endpoint (new key written, old key honored for a grace window) *(not yet built: the verifier keyring and `kid` selection exist, the endpoint does not)*. DB/MinIO credentials tolerate restart for rotation.
   - **Anti-patterns:** no mandatory Vault dependency, no secrets committed to the repo (provide `.env.example` only), no custom encrypted-secrets-file format.
@@ -381,7 +381,7 @@ Designed to give agentic loops fast, mechanical self-verification, while not add
 - **`rust-toolchain.toml`** at the repo root pins the Rust version explicitly. Example:
   ```toml
   [toolchain]
-  channel = "1.86.0"          # pin a specific release, never "stable"
+  channel = "1.99.1"          # pin a specific release, never "stable"
   components = ["rustfmt", "clippy"]
   profile = "minimal"
   ```
@@ -453,12 +453,13 @@ Structural choices locked before coding so issues don't bake in conflicting deci
 5. Branch rebased clean (no `fixup!` / `squash!` left).
 6. CLAUDE.md updated if a design decision shifted.
 7. If `/v1` behaviour changed: `docs/openapi.json` regenerated (`just openapi`; `openapi_snapshot_is_current` fails otherwise), and if an API convention changed, the test in `lied/tests/openapi.rs` that pins it updated or added. A crate version bump changes `info.version`, so it regenerates the snapshot too. A convention that only lives in prose drifts; one with a test does not.
+8. Public docs checked: does the change affect any public `.md` file — README (features, quickstart, first steps, configuration, production and backup), CONTRIBUTING, SECURITY, `docs/`? If so, update it in the same PR; a stale README is how a new self-hoster first meets a bug.
 
 ### Documentation
 - `rustdoc` on public items in any future library crates.
 - `utoipa` generates OpenAPI from the routes; no separate hand-written API doc.
 - CLAUDE.md is the design spec.
-- README is minimal: clone, `docker compose up`, open the UI.
+- README is the self-hoster's page: what Lied is, quickstart, first steps, configuration, running in production (incl. backup and restore). Design rationale stays here, not there.
 
 ### Security minima (beyond the NFR section)
 - SQL only via `sqlx::query!` / `sqlx::query_as!` (compile-time-checked, parameterized). String-formatted SQL is a PR blocker.
@@ -765,10 +766,12 @@ Smallest version that closes the **archivist → musician loop** end-to-end: an 
 
 #### In scope for phase 1
 
+This is the phase-1 cut as shipped; phase 2 has since replaced the ILIKE search with full-text + fuzzy search and activated global annotations (see Phase 2 cut).
+
 **Backend infrastructure**
 - Postgres + MinIO + REST API + WebDAV server.
 - Local accounts only (argon2id); session cookies + bearer tokens for REST; app passwords for WebDAV.
-- Rate limiting, shallow audit log, env / `_FILE` / `cmd:` secrets layer.
+- Rate limiting, shallow audit log, env / `_FILE` / `_CMD` secrets layer.
 
 **Entities** — full data model from the spec: Organization, User, AppPassword, Membership, Work, Instrument, Arrangement, Voice, File, Collection, CollectionItem, PartAssignment, Tag, ArrangementTag, GlobalAnnotation. Even entities whose flows are deferred get their tables so the schema is stable.
 

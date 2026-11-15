@@ -53,7 +53,8 @@ Two design commitments shape everything:
 - **Collections** — indexed concert programs (fixed sequence) and standing
   repertoire (drawn from by number), assembled from the archive.
 - **Part distribution** — assign a voice in a program to a specific player;
-  guests and substitutes get access without a full account.
+  guests and substitutes get read access to their parts without joining the
+  organization.
 - **Two complementary interfaces over one backend:**
   - a **WebDAV** filesystem view of the music tree — mount it in your OS or open
     it from a tablet reader, MuseScore, or Frescobaldi; and
@@ -106,8 +107,9 @@ cp .env.example .env        # adjust secrets before any non-local use
 docker compose up
 ```
 
-This starts Postgres, MinIO, and the app with schema migrations applied. Then
-create the first system administrator (you'll be prompted for a password if you
+This starts Postgres, MinIO, and the app; on startup the app applies any
+pending schema migrations and creates its storage bucket if it is missing.
+Then create the first system administrator (you'll be prompted for a password if you
 omit `--password`):
 
 ```bash
@@ -132,9 +134,30 @@ Once it's up:
 | WebDAV (personal) | `http://localhost:8080/users/<user-slug>/library/` |
 | MinIO console | `http://localhost:9001` |
 
-Musicians authenticate to WebDAV with a per-device **app password** (created in
-the admin UI), then mount the tree in their OS file manager or open it from a
-reader such as forScore, MobileSheets, or MuseScore.
+Musicians authenticate to WebDAV with a per-device **app password**, which
+any logged-in user creates on the admin UI's **App passwords** page
+(`/admin/app-passwords`), then mount the tree in their OS file manager or open
+it from a reader such as forScore, MobileSheets, or MuseScore.
+
+## First steps
+
+From an empty instance to a musician holding their part:
+
+1. **Log in** at `/admin` as the system administrator you just created.
+2. **Create an organization** under *Organizations*, and **create users** for
+   its people under *Users* (only a system administrator creates accounts).
+3. **Open the workspace** from the home page and add the users as members
+   under *Members*, each with a role — `owner`, `archivist`, `conductor` or
+   `musician` — and, for musicians, the instruments they play.
+4. As an archivist, **add an arrangement** with its voices and **upload** the
+   score and part files under *Arrangements*.
+5. **Build a collection** — a concert program or a standing book — under
+   *Collections*, then **assign parts** to players. A player may be a guest
+   with no membership; the assignment alone lets them read that part.
+6. Each musician logs in once, creates an **app password** on the
+   *App passwords* page, and points their reader app at
+   `http://<host>:8080/orgs/<org-slug>/` with their username and that app
+   password. They see the arrangements they hold parts in.
 
 > Serving over HTTPS? Set `LIED_SECURE_COOKIES=true` — browsers drop `Secure`
 > cookies on plain-HTTP origins, so it defaults to `false` for local/LAN use.
@@ -146,8 +169,11 @@ All configuration is via environment variables (each secret `X` also accepts
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `LIED_BIND_ADDR` | `0.0.0.0:8080` | Listen address |
 | `LIED_DATABASE_URL` | — | Postgres connection string |
-| `LIED_S3_BUCKET` / `LIED_S3_ACCESS_KEY_ID` / `LIED_S3_SECRET_ACCESS_KEY` | — | Object storage |
+| `LIED_S3_ENDPOINT` | `http://localhost:9000` | S3-compatible endpoint (MinIO) |
+| `LIED_S3_BUCKET` | `lied` | Bucket for stored files; created on startup if missing |
+| `LIED_S3_ACCESS_KEY_ID` / `LIED_S3_SECRET_ACCESS_KEY` | — | Object-storage credentials |
 | `LIED_JWT_SIGNING_KEY` | — | HS256 secret for bearer tokens (use `_FILE`/`_CMD` in prod) |
 | `LIED_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
 | `LIED_MAX_UPLOAD_BYTES` | `200 MB` | Single-file upload ceiling |
@@ -158,6 +184,50 @@ All configuration is via environment variables (each secret `X` also accepts
 See [`.env.example`](.env.example) for a starting point and the **Default
 limits** table in [`CLAUDE.md`](CLAUDE.md) for the full list — every limit is
 documented and configurable.
+
+## Running in production
+
+The release image (`just image`, or `docker build .`) is a distroless image
+whose entrypoint is `lied-server`; run it next to Postgres and any
+S3-compatible store.
+
+- **Schema and bucket** are handled on startup: pending migrations are applied
+  before the server listens (safe with several instances starting at once),
+  and the bucket is created if missing. An instance that finds a migration it
+  doesn't know — an older image against a newer database — refuses to start.
+- **Secrets** (`LIED_DATABASE_URL`, `LIED_JWT_SIGNING_KEY`, the S3 keys) should
+  not sit in plain environment variables: each also reads `<NAME>_FILE` (a
+  path, the Docker/Kubernetes secrets convention) or `<NAME>_CMD` (a command
+  whose output is the secret, e.g. `pass`, `op read`, `vault kv get`). The
+  signing key should be 32 random bytes.
+- **HTTPS** belongs in a reverse proxy in front of Lied; set
+  `LIED_SECURE_COOKIES=true` once it is in place.
+- **First administrator:** `lied-server create-admin --username … --display-name … --email …`.
+- `/healthz` (process up) and `/readyz` (Postgres and storage reachable) are
+  for your orchestrator; `/metrics` is off unless `LIED_METRICS_ENABLED=true`.
+
+### Backup and restore
+
+Postgres is the authority on what exists; object storage holds the bytes. Back
+up **Postgres first, then storage**, and restore in the same order: a database
+row whose file was not yet mirrored is a detectable 404, while the reverse
+would leave silent dead bytes.
+
+With the compose stack, `just backup` does both into `./backup/`:
+`postgres-<timestamp>.dump` (`pg_dump --format=custom`) and
+`minio-<timestamp>/` (`mc mirror` of the MinIO server). Run it from cron. To restore,
+stop the app, then:
+
+```bash
+docker compose exec -T postgres pg_restore --clean --if-exists \
+  -U lied -d lied < backup/postgres-<timestamp>.dump
+# then mirror backup/minio-<timestamp>/ back into the bucket with `mc mirror`
+```
+
+Back up the `.env` / secrets files too. Sessions and rate-limit state are
+not worth keeping: after a restore users log in again. This is best effort,
+not a consistent snapshot: there is no point-in-time recovery, WAL streaming or
+restore verification yet.
 
 ## Development
 
