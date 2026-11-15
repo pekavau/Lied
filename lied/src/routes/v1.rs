@@ -14,7 +14,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::app_password::generate as generate_app_password;
 use crate::auth::extractors::{BearerOrSession, SessionCsrf};
 use crate::auth::password::{verify_dummy, verify_password};
 use crate::auth::ratelimit::login_rate_limit_layer;
@@ -289,30 +288,22 @@ async fn create_app_password(
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<CreateAppPasswordRequest>,
 ) -> Result<(StatusCode, Json<CreateAppPasswordResponse>), AppError> {
-    let generated = generate_app_password()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to generate app password")))?;
-
-    let id = Uuid::now_v7();
-    let summary = app_password::create(
-        &state.db,
-        id,
-        auth.user.id,
-        &body.name,
-        &generated.hash,
-        &generated.prefix,
-    )
-    .await
-    .map_err(|err| match err {
-        // A clash on the `(user_id, name)` unique index is a conflict with
-        // current state, not an `If-Match` precondition failure, so it is a
-        // `409` (CLAUDE.md, HTTP & REST API conventions). The endpoint has no
-        // precondition semantics; `412` was wrong.
-        app_password::AppPasswordError::DuplicateName => AppError::Conflict(format!(
-            "an app password named '{}' already exists",
-            body.name
-        )),
-        app_password::AppPasswordError::Database(e) => AppError::Database(e),
-    })?;
+    let (summary, token) = app_password::issue(&state.db, auth.user.id, &body.name)
+        .await
+        .map_err(|err| match err {
+            // A clash on the `(user_id, name)` unique index is a conflict with
+            // current state, not an `If-Match` precondition failure, so it is a
+            // `409` (CLAUDE.md, HTTP & REST API conventions). The endpoint has no
+            // precondition semantics; `412` was wrong.
+            app_password::AppPasswordError::DuplicateName => AppError::Conflict(format!(
+                "an app password named '{}' already exists",
+                body.name
+            )),
+            app_password::AppPasswordError::Generate => {
+                AppError::Internal(anyhow::anyhow!("failed to generate app password"))
+            }
+            app_password::AppPasswordError::Database(e) => AppError::Database(e),
+        })?;
 
     audit(
         &state.db,
@@ -323,17 +314,14 @@ async fn create_app_password(
         },
         "auth.app_password_created",
         "app_password",
-        Some(id),
+        Some(summary.id),
         serde_json::json!({ "name": body.name, "prefix": summary.prefix }),
     )
     .await;
 
     Ok((
         StatusCode::CREATED,
-        Json(CreateAppPasswordResponse {
-            summary,
-            token: generated.plaintext,
-        }),
+        Json(CreateAppPasswordResponse { summary, token }),
     ))
 }
 

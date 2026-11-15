@@ -122,7 +122,7 @@ Lied app (Rust + axum)         ← serves both interfaces
 **Authentication:**
 - Local accounts (username/password, argon2id hashing) are the baseline — required for self-hostable deployments without external dependencies.
 - OIDC is an optional, configurable second auth method for orgs that want SSO. When OIDC is configured, **local login stays available as a fallback by default** — the break-glass path if the IdP is misconfigured or down. Account linking is by matching verified `email`. OIDC itself is deferred (see Phase cuts); a per-org "disable local auth" (SSO-only) policy is a later toggle on top of it, and until then both paths stay to avoid lockout on self-hosted instances.
-- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
+- WebDAV uses per-user **app passwords** (long random tokens, revocable, WebDAV-scoped). A user mints and revokes their own on the console's **App passwords** page (`/admin/app-passwords`, any logged-in user, no org role needed: issue #88) or through `/v1/app-passwords`; both go through `domain::app_password::issue`. App-password authentication establishes no web session cookie, and vice versa — the two auth paths are independent so a revoked app password never logs out a browser session and a web logout never invalidates an app password.
 - REST API uses session cookies (web client) or bearer tokens (programmatic).
 
 **Authorization:**
@@ -820,6 +820,8 @@ This is chosen over building a client first because: (1) the archivist/planner w
 **Scope is management/curation only.** The use-case list splits three ways: desktop/back-office cases are in scope; performance/consumption cases (UC-14 access my parts, UC-15 personal annotations, UC-17/UC-18 performance modes, and the musician-facing side of UC-12/UC-19/UC-20) stay on WebDAV and wait for the phase-3 client; discovery/commerce (UC-4) and the out-of-scope list are untouched.
 
 **One deliberate carve-out to "musicians have no phase-2 UI":** a **principal** (`musician` with `is_principal = true`) may log into the console for the **section-coverage screen only** — this realizes the view the model already grants them (Membership decision: `is_principal` "adds the section-coverage view without changing other permissions"), not a new permission. It is read-only and scoped to their own section. The principal's day-to-day, mobile-first coverage experience is deferred to the phase-3 client; the console screen is the "at my laptop" fallback.
+
+**And one self-service page for everyone:** any logged-in user, a plain musician included, reaches `/admin/app-passwords` to manage their *own* WebDAV app passwords (issue #88). It grants nothing; it only issues the credential WebDAV already required, which before it could be minted only through `/v1`.
 
 #### In scope for phase 2
 

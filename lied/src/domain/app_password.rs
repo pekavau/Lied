@@ -39,6 +39,8 @@ pub enum AppPasswordError {
     Database(#[from] sqlx::Error),
     #[error("an app password with this name already exists")]
     DuplicateName,
+    #[error("failed to generate an app password")]
+    Generate,
 }
 
 fn map_insert_error(err: sqlx::Error) -> AppPasswordError {
@@ -89,6 +91,30 @@ pub async fn create(
         last_used_at: row.last_used_at,
         revoked_at: row.revoked_at,
     })
+}
+
+/// Mint a new app password for `user_id` and store it: generate the token,
+/// keep only its argon2id hash and prefix, and hand back the plaintext —
+/// the one time it exists outside the client. Shared by `POST
+/// /v1/app-passwords` and the console's app-password page (issue #88); the
+/// caller audits and shows the plaintext once.
+pub async fn issue(
+    pool: &PgPool,
+    user_id: Uuid,
+    name: &str,
+) -> Result<(AppPasswordSummary, String), AppPasswordError> {
+    let generated =
+        crate::auth::app_password::generate().map_err(|_| AppPasswordError::Generate)?;
+    let summary = create(
+        pool,
+        Uuid::now_v7(),
+        user_id,
+        name,
+        &generated.hash,
+        &generated.prefix,
+    )
+    .await?;
+    Ok((summary, generated.plaintext))
 }
 
 /// List all app passwords (active and revoked) for a user, newest first.
