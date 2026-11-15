@@ -237,7 +237,7 @@ Concretizes the Architecture section. The backend is Rust + axum, the admin UI i
 ### Backend
 - **`axum`** — web framework. All HTTP routing for REST + HTMX endpoints.
 - **`sqlx`** (`postgres` feature) — async DB driver with compile-time-checked SQL against a real database. SQL is hand-written; no ORM. **Offline mode**: `.sqlx/` (the prepared-query cache produced by `cargo sqlx prepare`) is committed to the repo; `SQLX_OFFLINE=true` is set in CI and in the Docker builder stage so builds are hermetic and need no DB. A CI gate runs `cargo sqlx prepare --check` against the dev DB to catch out-of-sync caches.
-- **`sqlx-cli`** — migrations as plain `.sql` files in `/migrations`, embedded in the binary at build time.
+- **`sqlx-cli`** — migrations as plain `.sql` files in `/migrations`, embedded in the binary at build time (`lied::state::MIGRATOR`; `lied/build.rs` rebuilds when one is added) and **applied on startup** by `AppState::connect`, before the server listens or `create-admin` runs (issue #87). sqlx's advisory lock makes concurrent starts safe; a database carrying a migration the binary doesn't know, or an edited one, fails startup. `just migrate` (sqlx-cli) remains for development.
 - **`dav-server`** — WebDAV crate; mounted under `/orgs/...` and `/users/<user>/library/...`.
 - **`aws-sdk-s3`** — official AWS SDK; speaks MinIO natively.
 - **`argon2`** — password hashing for local accounts.

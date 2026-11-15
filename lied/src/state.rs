@@ -36,12 +36,29 @@ pub struct AppState {
 pub enum StateError {
     #[error("failed to connect to postgres: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("failed to apply database migrations: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("failed to install metrics recorder: {0}")]
     Metrics(#[from] metrics_exporter_prometheus::BuildError),
 }
 
+/// The schema migrations under `/migrations`, embedded in the binary at
+/// compile time (issue #87). [`AppState::connect`] applies them, so the
+/// server and the `create-admin` CLI both find the schema they were built
+/// against.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../migrations");
+
 impl AppState {
-    /// Connect to Postgres and construct the S3 client from config.
+    /// Connect to Postgres, bring its schema up to date, and construct the S3
+    /// client from config.
+    ///
+    /// Pending migrations are applied before anything else touches the
+    /// database. sqlx holds a Postgres advisory lock while it migrates, so
+    /// several instances starting at once apply each migration exactly once,
+    /// and an already-current schema is a no-op. A database carrying a
+    /// migration this binary does not know (an older binary against a newer
+    /// schema), or one whose applied migration was edited since, fails
+    /// startup rather than serving against a schema it was not built for.
     ///
     /// Does not verify MinIO connectivity at startup — `/readyz` is
     /// responsible for live health checks; an unreachable MinIO at boot
@@ -63,6 +80,9 @@ impl AppState {
                     .ssl_mode(PgSslMode::Prefer),
             )
             .await?;
+
+        MIGRATOR.run(&db).await?;
+        tracing::info!("database schema is current");
 
         let s3_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .endpoint_url(&config.s3_endpoint)
