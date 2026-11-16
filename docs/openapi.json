@@ -1075,6 +1075,16 @@
               }
             }
           },
+          "403": {
+            "description": "Insufficient permissions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Resource not found",
             "content": {
@@ -12393,7 +12403,7 @@
             }
           },
           "403": {
-            "description": "Session cookie presented without a matching `HX-CSRF` header",
+            "description": "Session cookie presented without a matching `HX-CSRF` header, or `org` names an organization the caller is not a member of",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14978,7 +14988,7 @@
               "null"
             ],
             "format": "uuid",
-            "description": "Optional active org id to scope the token to (docs/design.md JWT claims:\n`org`, nullable). Not validated against Membership in this item —\norg-scoping enforcement is a later authorization concern; minting\njust records the claim."
+            "description": "Optional active org id to record in the token (docs/design.md JWT\nclaims: `org`, nullable). The caller must be a member of it, or a\nsystem admin, or the mint is refused with `403` (#124). The claim is\ncontext only (it attributes the token's audit rows to that org); it\nis **not** a scope: every request is authorized by the caller's own\nmemberships and assignments."
           },
           "password": {
             "type": [

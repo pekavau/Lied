@@ -18,8 +18,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::{require_org_role_v1, require_system_admin};
+use crate::auth::authz::{require_org_capability_v1, require_org_role_v1, require_system_admin};
 use crate::auth::extractors::BearerOrSession;
+use crate::domain::access;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{organization, user};
@@ -136,7 +137,8 @@ async fn user_by_id(state: &AppState, id: Uuid) -> Result<user::User, AppError> 
         .ok_or(AppError::NotFound)
 }
 
-/// List organizations (any authenticated identity; federation trust model).
+/// List the organizations the caller reaches (#124): those they are a member
+/// of or hold a live part assignment in; a system admin sees every one.
 #[utoipa::path(
     get,
     path = "/orgs",
@@ -166,7 +168,6 @@ async fn list_orgs(
         filters: raw_filters,
     }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<OrganizationResponse>>, AppError> {
-    let _ = &auth;
     let (limit, offset) = crate::pagination::PageParams {
         limit: q.limit,
         offset: q.offset,
@@ -193,6 +194,7 @@ async fn list_orgs(
         sort_column,
         sort_direction,
         name_filter,
+        Some(auth.user.id),
     )
     .await?;
 
@@ -272,7 +274,9 @@ async fn create_org(
     ))
 }
 
-/// Fetch one organization by ID.
+/// Fetch one organization by ID: one the caller reaches (a member, a guest
+/// with a live part assignment, or a system admin); anyone else gets `403`,
+/// existing or not.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}",
@@ -287,6 +291,7 @@ async fn create_org(
             headers(("ETag" = String, description = "updated_at ms-epoch, quoted"))),
         CommonErrors,
         Validation400,
+        Forbidden403,
         NotFound404,
     )
 )]
@@ -295,7 +300,13 @@ async fn get_org(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<axum::response::Response, AppError> {
-    let _ = &auth;
+    // Only an organization the caller reaches (#124): a member, a guest with
+    // a live assignment, or a system admin. Anyone else gets `403` whether or
+    // not it exists, as on every other org-scoped route; a system admin alone
+    // can tell a missing org (`404`).
+    if !auth.user.is_system_admin && !access::reaches_org(&state.db, id, auth.user.id).await? {
+        return Err(AppError::Forbidden);
+    }
     let found = organization::find_by_id(&state.db, id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -344,7 +355,9 @@ async fn update_org(
 ) -> Result<axum::response::Response, AppError> {
     // Settings are the owner's ("Org settings" in the permission matrix); a
     // rename stays the system admin's. A body asking for both needs both.
-    require_org_role_v1(&state, &auth, id, Role::Owner).await?;
+    // The same predicate as the console's Settings screen, so the matrix row
+    // has one encoding.
+    require_org_capability_v1(&state, &auth, id, Role::can_change_org_settings).await?;
     if body.name.is_some() {
         require_system_admin(&auth.user)?;
     }

@@ -34,24 +34,16 @@ pub async fn find_org_id(pool: &PgPool, org_slug: &str) -> Result<Option<Uuid>, 
     Ok(row.map(|r| r.id))
 }
 
-/// The user's membership role in the org, or `None` if they are not a member
-/// (a guest/substitute reaching the tree through a part assignment).
+/// The role the user acts with in the org: their membership role, `owner`
+/// for a system admin, or `None` for a guest/substitute reaching the tree
+/// through a part assignment. The rule is
+/// [`crate::domain::access::effective_role`], shared with `/v1` (#124).
 pub async fn role_in_org(
     pool: &PgPool,
     org_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<Role>, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"SELECT role FROM membership WHERE organization_id = $1 AND user_id = $2"#,
-        org_id,
-        user_id,
-    )
-    .fetch_optional(pool)
-    .await?;
-    // The `role` column is CHECK-constrained, so `parse` cannot fail for real
-    // data; default to the least-privileged role on unexpected drift rather
-    // than erroring the whole WebDAV request.
-    Ok(row.map(|r| Role::parse(&r.role).unwrap_or(Role::Musician)))
+    crate::domain::access::effective_role(pool, org_id, user_id).await
 }
 
 /// Resolve `(org_id, visibility)` for a user in one step. `None` if the org
@@ -341,30 +333,11 @@ pub async fn visible_collection_items(
     }
 }
 
-/// Org slugs a user has any relationship with — a membership, or a part
-/// assignment (guest/substitute). Used to scope the `/orgs` root listing so it
-/// does not enumerate every org on the instance. Ordered by slug.
+/// Org slugs a user reaches — a membership, a live part assignment
+/// (guest/substitute), or system admin (every org). Used to scope the `/orgs`
+/// root listing so it does not enumerate every org on the instance. Ordered
+/// by slug. The rule is [`crate::domain::access::reaches_org_sql`], shared
+/// with `GET /v1/orgs` (#124).
 pub async fn visible_org_slugs(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar!(
-        r#"
-        SELECT o.slug FROM organization o
-        WHERE EXISTS (
-            SELECT 1 FROM membership m
-            WHERE m.organization_id = o.id AND m.user_id = $1
-        )
-        OR EXISTS (
-            SELECT 1 FROM part_assignment pa
-            JOIN voice v ON v.id = pa.voice_id
-            JOIN arrangement a ON a.id = v.arrangement_id
-            JOIN collection_item ci ON ci.id = pa.collection_item_id
-            JOIN collection c ON c.id = ci.collection_id
-            WHERE pa.user_id = $1 AND a.organization_id = o.id
-              AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
-        )
-        ORDER BY o.slug
-        "#,
-        user_id,
-    )
-    .fetch_all(pool)
-    .await
+    crate::domain::access::reachable_org_slugs(pool, user_id).await
 }

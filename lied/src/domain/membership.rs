@@ -537,13 +537,17 @@ pub async fn update(
     Ok(row.map(Row::into_membership))
 }
 
-/// Returns `true` if `user_id` holds at least one `Membership` in any
-/// organization. Used to gate Work creation (docs/design.md Decisions: "creating
-/// a Work is open to any authenticated user with at least one Membership in
-/// any org").
-pub async fn has_any_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+/// Returns `true` if `user_id` holds a **staff** `Membership`
+/// ([`Role::is_staff`]: owner, archivist or conductor) in any organization.
+/// Works are instance-wide, so this is what gates writing them (#124,
+/// [`crate::domain::work::may_write_works`]): cataloguing is archive work,
+/// and a musician reads Works but does not write them.
+pub async fn has_staff_membership(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let exists: bool = sqlx::query_scalar!(
-        r#"SELECT EXISTS(SELECT 1 FROM membership WHERE user_id = $1) as "exists!""#,
+        r#"SELECT EXISTS(
+               SELECT 1 FROM membership
+               WHERE user_id = $1 AND role IN ('owner', 'archivist', 'conductor')
+           ) as "exists!""#,
         user_id,
     )
     .fetch_one(pool)

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT EXISTS(SELECT 1 FROM membership WHERE user_id = $1) as \"exists!\"",
+  "query": "SELECT EXISTS(\n               SELECT 1 FROM membership\n               WHERE user_id = $1 AND role IN ('owner', 'archivist', 'conductor')\n           ) as \"exists!\"",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       null
     ]
   },
-  "hash": "baf5fd7f45dd175e748e7596b54533d0488e2936ba027644f1390ef080745a98"
+  "hash": "fa059a416018c42b24d601b1be9054f97ab78323cb4f646e6fc56e5afd6988d8"
 }

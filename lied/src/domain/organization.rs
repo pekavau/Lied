@@ -141,6 +141,12 @@ pub const FILTER_ALLOWLIST: &[&str] = &["name"];
 /// trusted fixed SQL fragments, never raw user input, so building the query
 /// string with `format!` here does not reopen the SQL-injection surface the
 /// allowlist closes.
+///
+/// `reachable_by`: `Some(user)` keeps only the organizations that user
+/// reaches ([`crate::domain::access::reaches_org_sql`]: a member, a guest
+/// with a live part assignment, or a system admin, who reaches all), as
+/// `GET /v1/orgs` lists them (#124); `None` lists every organization, for the
+/// system-admin console.
 pub async fn list(
     pool: &PgPool,
     limit: i64,
@@ -148,8 +154,10 @@ pub async fn list(
     sort_column: &str,
     sort_direction: crate::listing::SortDirection,
     name_filter: Option<&str>,
+    reachable_by: Option<Uuid>,
 ) -> Result<(Vec<Organization>, i64), sqlx::Error> {
     let direction = sort_direction.as_sql();
+    let reach = crate::domain::access::reaches_org_sql("$4", "organization.id");
     // `sort_column`/`direction` are always one of the fixed fragments in
     // SORT_ALLOWLIST/SortDirection::as_sql, never raw input (see allowlist
     // note above) — `id` is appended as a stable tiebreaker since `name`/
@@ -168,6 +176,7 @@ pub async fn list(
             count(*) OVER() as total
         FROM organization
         WHERE ($3::text IS NULL OR name ILIKE '%' || $3 || '%')
+          AND ($4::uuid IS NULL OR {reach})
         ORDER BY {sort_column} {direction}, id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -177,6 +186,7 @@ pub async fn list(
         .bind(limit)
         .bind(offset)
         .bind(name_filter)
+        .bind(reachable_by)
         .fetch_all(pool)
         .await?;
 
@@ -184,9 +194,15 @@ pub async fn list(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            let count_query = "SELECT count(*) FROM organization WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%')";
-            sqlx::query_scalar::<_, i64>(count_query)
+            let reach = crate::domain::access::reaches_org_sql("$2", "organization.id");
+            let count_query = format!(
+                "SELECT count(*) FROM organization
+                 WHERE ($1::text IS NULL OR name ILIKE '%' || $1 || '%')
+                   AND ($2::uuid IS NULL OR {reach})"
+            );
+            sqlx::query_scalar::<_, i64>(&count_query)
                 .bind(name_filter)
+                .bind(reachable_by)
                 .fetch_one(pool)
                 .await?
         }

@@ -252,10 +252,13 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 **Authorization:**
 - Permissions are scoped to organizations. A user's capabilities within an org are determined by `Membership.role`.
 - No system-wide application roles. An optional `User.is_system_admin` boolean covers instance-level operations (org provisioning, user management).
+- **A system admin is owner-equivalent in every organization**, member or not, on `/v1`, WebDAV and the console alike (#124): they read every org's whole archive and write what an owner writes. One rule, `domain::access::role_with_admin`, raises their role for the read scope and for WebDAV's write checks; `/v1`'s role checks short-circuit the same way. Renaming an org and the instance-level operations stay theirs alone.
+- **Which organizations a caller sees** (#124): those they **reach**, meaning they are a member, hold a live part assignment there (a guest), or are a system admin (every org). `GET /v1/orgs` lists exactly these and the WebDAV `/orgs` root shows exactly these (`domain::access::reaches_org_sql`). `GET /v1/orgs/{orgId}` on any other org is `403`, whether or not it exists, as on every other org-scoped route; only a system admin can tell a missing org (`404`).
+- **The bearer token's `org` claim** is context, not a scope: it attributes the token's audit rows (`auth.token_minted`, app-password events) to an org. `POST /v1/tokens` accepts an `org` only if the caller is a member of it, or a system admin (`403` otherwise, existing or not), so nobody can attribute audit rows to an org they are not in (#124). Every request is authorized by the caller's own memberships and assignments, never by the claim.
 - **What a member reads of the archive** (arrangements, voices, full scores and their files) is their **read scope** (#119), decided by `domain::access::read_scope` for WebDAV and `/v1` alike:
   - **Staff** (`owner`, `archivist`, `conductor`) read everything.
   - A **`musician`** reads only their assigned parts, the same view a guest gets (below): the arrangement list holds only pieces they hold a part in, and every search facet and the total apply within that set; a piece's voice list holds only their voices; other voices and the full score are `403` on `/v1` and absent over WebDAV.
-  - **Unless the org opens its archive to musicians:** the owner's setting `Organization.musicians_read_archive` (off by default) lets every musician read every arrangement, voice and full score, read-only. Whether that is wanted depends on the ensemble: a small amateur band may want everyone to browse, a large or professional orchestra will not. Writes stay by role; licensing and purchase fields stay staff-only either way.
+  - **Unless the org opens its archive to musicians:** the owner's setting `Organization.musicians_read_archive` (off by default) lets every musician read every arrangement, voice and full score, read-only. Whether that is wanted depends on the ensemble: a small amateur band may want everyone to browse, a large or professional orchestra will not. Writes stay by role. The licensing and purchase fields (`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) stay staff-only either way (maintainer decision, #124): purchase and licensing records are the archive's business. Personal annotations are not widened either (below).
   - A **guest** is never widened by the setting.
   - **Collections, assignments and tags follow the same scope** (#123), so no other read undoes it. A musician of a closed archive:
     - lists only the collections they hold a live part in, with filters and totals applied within that set. In such a collection they see the sections and label choices, but only the items they play. Any other collection or item is `403`, existing or not, so no programme names a piece they don't play. That is the WebDAV collections tree's rule.
@@ -284,6 +287,7 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 | Org settings | ✓ | | | |
 | Upload/edit arrangements & files | ✓ | ✓ | | |
 | Manage tags | ✓ | ✓ | | |
+| Create/edit Works (instance-wide; staff in any org, edits by the creator) | ✓ | ✓ | ✓ | |
 | Build/edit collections | ✓ | ✓ | ✓ | |
 | Global annotations | ✓ | | ✓ | |
 | Part assignments | ✓ | ✓ | ✓ | |
@@ -292,15 +296,19 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 | Read collections (items, sections), tags | ✓ | ✓ | ✓ | those holding their parts; all if the org opens the archive |
 | Read part assignments | ✓ | ✓ | ✓ | own only |
 | Read the roster (members, roles) | ✓ | ✓ | ✓ | ✓ |
-| Personal annotations (own) | ✓ | ✓ | ✓ | ✓ |
+| Read licensing & purchase fields | ✓ | ✓ | ✓ | |
+| Personal annotations: write own, read others' | any voice | any voice | any voice | assigned voices |
 
 "Org settings" today is one setting: `musicians_read_archive`, which opens the
 whole archive to musicians, read-only (#119; console *Settings*, or
 `PATCH /v1/orgs/{orgId}` with `musiciansReadArchive`; audited as
-`organization.settings_change`). Renaming an org stays a system-admin
+`organization.settings_change`). Both surfaces check the same predicate,
+`Role::can_change_org_settings`. Renaming an org stays a system-admin
 operation.
 
-A **guest** (a part assignment without membership) has one row: read assigned parts, under *Auth & access*.
+A **guest** (a part assignment without membership) has two rows: read assigned parts, under *Auth & access*, and personal annotations on those voices, like a musician (#124).
+
+A **system admin** acts as `owner` in every org, member or not (*Auth & access*).
 
 ### HTTP & REST API conventions
 
@@ -725,6 +733,8 @@ sees the archivist's tree, but can change nothing in it.
   - Guests (PartAssignment without Membership) get the musician's view scoped to their assigned voice(s).
   - The same files are reachable under `/orgs/<org>/arrangements/...` with the same per-role filtering; the collections subtree is the "what's in this concert, in order" view, not a separate permission domain.
 - **PROPFIND scope at the arrangements root.** A `musician` (or guest/substitute) listing `/orgs/<org>/arrangements/` sees **only arrangements where they hold at least one `PartAssignment`** — unassigned arrangements are simply absent, not shown as empty/403 placeholders. Staff roles (`owner`/`archivist`/`conductor`) see all, and so do musicians of an org that opened its archive to them (`musicians_read_archive`, #119). Rationale: showing every title with locked subdirs would leak the org's full repertoire and naming to guests and clutter a mounted tablet view with hundreds of inaccessible folders; discoverability of "what the org owns" belongs in the admin UI, not the filesystem view. Consistent with the collections-subtree filtering above.
+- **PROPFIND scope at `/orgs`.** The root lists only the orgs the caller reaches: a membership, a live part assignment, or system admin (every org), the same rule as `GET /v1/orgs` (#124). A system admin is owner-equivalent inside each, for reads and writes.
+- **A voice's `annotations/` folder** appears only to a caller who may reach that voice's personal annotations: staff on every voice, anyone else on a voice they play (*Annotations & distribution state*, #124). An open-archive musician sees the voice's files without it.
 - `/users/<user>/library/` is private to that user, not bound to any org.
 - **MOVE, COPY and DELETE per tree (#26).**
 
@@ -1245,7 +1255,7 @@ Attaching and detaching are real inserts and deletes.
 - **Provenance** is flat metadata on `Arrangement` (publisher, arranger, purchase date, license notes, copy count). No separate publisher/license entity unless querying by publisher becomes a clear need.
 - **Editions/variants (UC-19, UC-20).** Each `Arrangement` is already a specific edition. Multiple editions of one work = multiple `Arrangement` rows sharing a `Work`. `Arrangement.status` (`active`, `archived`) lets an org retire an old edition without deleting it; multiple editions may be active simultaneously.
 - **Work is instance-wide.** `Work` rows are not scoped to an organization — the abstract piece is the same everywhere. In the federation topology (NFR posture) this is a feature: orgs reuse each other's catalog entries. No `organization_id` on Work; no `deleted_at` either (Works are durable references; orphans are not garbage-collected). When SaaS topology becomes a goal, a nullable `organization_id` can be added — `null` = shared, non-null = private — backwards-compatible.
-  **Permissions:** *creating* a Work is open to any authenticated user with at least one Membership in any org (an archivist adding a new piece's abstract entry); *editing* a Work is restricted to its original creator (`created_by`) or any `is_system_admin`. This stops "alice fixes a typo and rewrites a shared title for everyone"; for legitimate edits in someone else's Work, escalate to a system admin.
+  **Permissions (#124):** *writing* Works (create, edit, delete) is archive work: it needs a **staff** Membership (`owner`, `archivist` or `conductor`) in any org, or `is_system_admin` (`work::may_write_works`); a musician reads Works but writes none. *Editing and deleting* a Work is further restricted to its original creator (`created_by`) while they are staff anywhere, or any `is_system_admin`. This stops "alice fixes a typo and rewrites a shared title for everyone"; for legitimate edits in someone else's Work, escalate to a system admin.
 - **Tags.** Open-ended dimensions (theme, mood, era, occasion, style) live in a per-org `Tag` entity with a free-text `kind` and a many-to-many `ArrangementTag` join. Per-org so vocabularies don't leak between orgs; `kind` is text (not enum) so orgs can invent categories without a migration.
 - **Instruments are a controlled vocabulary.** Instance-wide `Instrument` table seeded on first migration with ~150 standard instruments (IMSLP/MuseScore canonical list). `VoiceInstrument.instrument_id`, `Membership.instrument_ids`, and `Membership.principal_instrument_ids` all reference `Instrument` by FK / FK-array. Free text was rejected because the coverage check (a voice's instruments ∩ `Membership.principal_instrument_ids`) requires reliable equality; a hard-coded enum was rejected because non-Western and historical instruments would need code releases. **Permissions:** adding or editing an Instrument *(not yet built)* requires `User.is_system_admin = true` (the entity is instance-wide; per-org users shouldn't be able to inject vocabulary that affects every org). Reading the Instrument list is open to any authenticated user.
 
@@ -1308,7 +1318,7 @@ Attaching and detaching are real inserts and deletes.
   - Re-running after adding pieces extends the assignment, since pairs already held are only reported.
   - **Enforced by:** the SQL function `lied_guess_part_number` (migration 0024), used both for the backfill and as the insert default.
 - **Personal annotations** are files in MinIO, no DB record. Naming convention: `orgs/<org-slug>/arrangements/<arr-slug>/voices/<voice-slug>/annotations/<user-slug>/<name>.pdf` — alongside the *voice*, not a specific source-file format. Annotations are independent of source-file updates (this is what "survives format updates" in UC-15 means). The app surfaces a staleness indicator by comparing the annotation's mtime to the latest mtime of any file under the corresponding voice.
-  **Visibility:** an annotation is **author-only-writable** but **org-readable** — any member of the owning org can read another member's annotations on that org's arrangements. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree.
+  **Visibility (maintainer decision, #124):** an annotation is **author-only-writable**, and it **follows the part**. Anyone who holds a live part assignment on the voice (a musician or a guest) reads every annotation under it and writes their own there; staff (`owner`, `archivist`, `conductor`, and a system admin) read every annotation and write their own under any voice. Nobody else reaches a voice's annotations, and opening the archive to musicians (`musicians_read_archive`) does not change that: an open-archive musician reads the voice's files but neither reads nor writes annotations on a part they don't play. The substitute-sees-the-regular's-bowings workflow is the motivating use case; strictly private notes belong in `/users/<slug>/library/` instead, not under an org's arrangement tree. Over WebDAV a voice's `annotations/` folder is absent for a caller who may not reach it (reads `404`, writes `403`). The rule is `ReadScope::annotates_any_voice` with `domain::access::assigned_voice`.
   **Audit:** personal annotation file events (create, replace, delete via WebDAV or REST) ARE captured in the audit log as `personal_annotation.<action>` entries keyed by `(voice_id, user_slug, name)`, even though no DB row backs them. The rule "every write to any persistent thing is logged" applies to MinIO objects under the annotations subtree too, not just DB rows.
 - **Global annotations** are structured records in PostgreSQL — queryable, shared, authored by conductor/director. Issue #36 activated authoring:
   - **Vocabulary:** `type` is a controlled vocabulary (`tempo`, `dynamics`, `articulation`, `structure` for cuts/repeats/vamps, `general`), text + CHECK per the enum convention. It was free text in 0017, before anything wrote to it.

@@ -3,12 +3,12 @@
 //! references, orphans are not garbage-collected"). No unique constraint:
 //! duplicates allowed in phase 1.
 //!
-//! Permissions (docs/design.md Decisions): *creating* a Work is open to any
-//! authenticated user with >= 1 `Membership` in any org; *editing* is
-//! restricted to `created_by` or `is_system_admin` — enforced by
-//! [`crate::routes::arrangements`], not here (this module is pure data
-//! access), except for [`is_editable_by`], a small helper colocated with the
-//! type it checks.
+//! Permissions (docs/design.md Decisions, #124): *writing* Works (create,
+//! edit, delete) is archive work, for a staff member (owner, archivist or
+//! conductor) of any org or a system admin ([`may_write_works`]); a musician
+//! reads them. *Editing and deleting* is further restricted to `created_by`
+//! or `is_system_admin` ([`Work::is_editable_by`]). The handlers in
+//! [`crate::routes::arrangements`] and the console enforce both.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -36,6 +36,20 @@ impl Work {
     pub fn is_editable_by(&self, user_id: Uuid, is_system_admin: bool) -> bool {
         is_system_admin || self.created_by == Some(user_id)
     }
+}
+
+/// Whether `user_id` may write Works at all (#124): a system admin, or a
+/// staff member (owner, archivist, conductor) of any organization. Works are
+/// instance-wide, so no single org's role decides it.
+pub async fn may_write_works(
+    pool: &PgPool,
+    user_id: Uuid,
+    is_system_admin: bool,
+) -> Result<bool, sqlx::Error> {
+    if is_system_admin {
+        return Ok(true);
+    }
+    crate::domain::membership::has_staff_membership(pool, user_id).await
 }
 
 /// Insert a new Work row. Creation has no slug/uniqueness constraint

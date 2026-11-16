@@ -105,22 +105,29 @@ pub async fn require_org_role_v1(
     require_org_role(state, &auth.user, organization_id, minimum).await
 }
 
-/// The caller's [`ReadScope`] in `organization_id`: a system admin reads as
-/// staff (owner-equivalent, as with [`require_org_role`]); anyone else gets
-/// [`access::read_scope`], and a missing organization reads as
-/// [`ReadScope::Restricted`] (whose assignment checks then refuse with `403`,
-/// so a non-member learns nothing about which orgs exist).
+/// The caller's [`ReadScope`] in `organization_id`: [`access::read_scope`],
+/// which reads a system admin as staff (owner-equivalent,
+/// [`access::role_with_admin`], #124). A missing organization reads as
+/// staff for a system admin (the handler then answers `404`) and as
+/// [`ReadScope::Restricted`] for anyone else (whose assignment checks refuse
+/// with `403`, so a non-member learns nothing about which orgs exist). Every
+/// `/v1` archive reader, collections, items, tags and assignments included,
+/// goes through here.
 async fn caller_scope(
     state: &AppState,
     auth: &BearerOrSession,
     organization_id: Uuid,
 ) -> Result<ReadScope, AppError> {
-    if auth.user.is_system_admin {
-        return Ok(ReadScope::Staff);
-    }
+    // `read_scope` already raises a system admin to staff in an existing org
+    // (`access::role_with_admin`). For a missing org a system admin still
+    // proceeds, so the handler answers `404` as it would for an owner.
     Ok(access::read_scope(&state.db, organization_id, auth.user.id)
         .await?
-        .unwrap_or(ReadScope::Restricted))
+        .unwrap_or(if auth.user.is_system_admin {
+            ReadScope::Staff
+        } else {
+            ReadScope::Restricted
+        }))
 }
 
 /// Require the caller to be a member of `organization_id` (any role) or a
