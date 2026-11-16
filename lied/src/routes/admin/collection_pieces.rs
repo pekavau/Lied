@@ -655,7 +655,7 @@ async fn render_renumber(
         Err(error) => return item_error_page(ctx, error, "preview the renumber"),
     };
     let (items, sections) = tokio::join!(
-        collection_item::list_for_collection(&state.db, collection_id),
+        collection_item::list_for_collection(&state.db, collection_id, None),
         collection_section::list_for_collection(&state.db, collection_id),
     );
     let titles: HashMap<Uuid, String> = items

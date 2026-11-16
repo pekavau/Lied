@@ -162,6 +162,147 @@ pub async fn assigned_arrangement(
     .await
 }
 
+/// The organization of collection `collection_id`, if `user_id` holds a live
+/// part assignment on one of its items; `None` otherwise (#123). Such a
+/// restricted reader may see the collection (over `/v1` and WebDAV), but only
+/// the items [`assigned_item`] grants. Live means the collection, the item,
+/// its arrangement and the assigned voice, as the WebDAV collections tree has
+/// always counted it.
+pub async fn assigned_collection(
+    pool: &PgPool,
+    user_id: Uuid,
+    collection_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT c.organization_id
+           FROM collection c
+           WHERE c.id = $2
+             AND c.deleted_at IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM part_assignment pa
+                 JOIN collection_item ci ON ci.id = pa.collection_item_id
+                 JOIN arrangement a ON a.id = ci.arrangement_id
+                 JOIN voice v ON v.id = pa.voice_id
+                 WHERE ci.collection_id = c.id AND pa.user_id = $1
+                   AND ci.deleted_at IS NULL
+                   AND a.deleted_at IS NULL
+                   AND v.deleted_at IS NULL
+             )"#,
+        user_id,
+        collection_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// Where an assigned collection item lives, for checking it against the
+/// request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignedItem {
+    pub organization_id: Uuid,
+    pub collection_id: Uuid,
+}
+
+/// The collection item `item_id`, if `user_id` holds a live part assignment
+/// on it (any voice); `None` otherwise. The same liveness as
+/// [`assigned_collection`].
+pub async fn assigned_item(
+    pool: &PgPool,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<AssignedItem>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"SELECT c.organization_id, c.id AS collection_id
+           FROM collection_item ci
+           JOIN collection c ON c.id = ci.collection_id
+           JOIN arrangement a ON a.id = ci.arrangement_id
+           WHERE ci.id = $2
+             AND ci.deleted_at IS NULL
+             AND c.deleted_at IS NULL
+             AND a.deleted_at IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM part_assignment pa
+                 JOIN voice v ON v.id = pa.voice_id
+                 WHERE pa.collection_item_id = ci.id AND pa.user_id = $1
+                   AND v.deleted_at IS NULL
+             )"#,
+        user_id,
+        item_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| AssignedItem {
+        organization_id: r.organization_id,
+        collection_id: r.collection_id,
+    }))
+}
+
+/// The organization of tag `tag_id`, if it is attached to an arrangement
+/// `user_id` may read through a live part assignment
+/// ([`assigned_arrangement`]'s condition); `None` otherwise (#123). A
+/// restricted reader sees only such tags.
+pub async fn assigned_tag(
+    pool: &PgPool,
+    user_id: Uuid,
+    tag_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"SELECT t.organization_id
+           FROM tag t
+           WHERE t.id = $2
+             AND t.deleted_at IS NULL
+             AND EXISTS (
+                 SELECT 1 FROM arrangement_tag at
+                 JOIN arrangement a ON a.id = at.arrangement_id
+                 JOIN voice v ON v.arrangement_id = a.id
+                 JOIN part_assignment pa ON pa.voice_id = v.id
+                 JOIN collection_item ci ON ci.id = pa.collection_item_id
+                 JOIN collection c ON c.id = ci.collection_id
+                 WHERE at.tag_id = t.id AND pa.user_id = $1
+                   AND a.deleted_at IS NULL
+                   AND v.deleted_at IS NULL
+                   AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
+             )"#,
+        user_id,
+        tag_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+/// SQL condition for the runtime-built tag list (`tag::list_for_org`): the
+/// tag whose id is `tag_id` (a column) is attached to a live arrangement the
+/// user bound at `user_param` holds a live part assignment on.
+/// [`assigned_tag`]'s condition. Both arguments are fixed fragments from the
+/// caller, never input.
+pub(crate) fn live_assignment_on_tag_sql(user_param: &str, tag_id: &str) -> String {
+    let on_arrangement = live_assignment_on_arrangement_sql(user_param, "a_tag.id");
+    format!(
+        "EXISTS (SELECT 1 FROM arrangement_tag at_live
+                 JOIN arrangement a_tag ON a_tag.id = at_live.arrangement_id
+                 WHERE at_live.tag_id = {tag_id} AND a_tag.deleted_at IS NULL
+                   AND {on_arrangement})"
+    )
+}
+
+/// SQL condition for the runtime-built collection list
+/// (`collection::list_for_org`): the user bound at `user_param` holds a live
+/// part assignment in the collection whose id is `collection_id` (a column).
+/// [`assigned_collection`]'s condition; the list test opens every listed
+/// collection through it, so the two cannot drift unnoticed. Both arguments
+/// are fixed fragments from the caller, never input.
+pub(crate) fn live_assignment_in_collection_sql(user_param: &str, collection_id: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM part_assignment pa_live
+                 JOIN collection_item ci_live ON ci_live.id = pa_live.collection_item_id
+                 JOIN arrangement a_live ON a_live.id = ci_live.arrangement_id
+                 JOIN voice v_live ON v_live.id = pa_live.voice_id
+                 WHERE ci_live.collection_id = {collection_id} AND pa_live.user_id = {user_param}
+                   AND ci_live.deleted_at IS NULL AND a_live.deleted_at IS NULL
+                   AND v_live.deleted_at IS NULL)"
+    )
+}
+
 /// SQL condition, for the runtime-built list queries
 /// (`voice::list_for_arrangement`, `arrangement::list_for_org`): the user bound
 /// at `user_param` (`$5`, say) holds a live part assignment on the voice whose

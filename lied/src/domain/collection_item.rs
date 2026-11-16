@@ -842,9 +842,15 @@ pub async fn find_by_id_including_deleted(
 /// rows and submits their ids as the new order, and the domain's [`reorder`]
 /// rejects anything that is not a permutation of the live items — so a page of
 /// them would be refused by construction. The bound is the collection itself.
+///
+/// `assigned_to`: `Some(user)` keeps only the items that user holds a live
+/// part assignment on (a restricted reader's view, #123), with the liveness
+/// of [`crate::domain::access::assigned_item`], so a removed piece is not
+/// listed; `None` lists every live item.
 pub async fn list_for_collection(
     pool: &PgPool,
     collection_id: Uuid,
+    assigned_to: Option<Uuid>,
 ) -> Result<Vec<CollectionItemView>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
@@ -868,9 +874,17 @@ pub async fn list_for_collection(
             ORDER BY s.starts_at DESC LIMIT 1
         ) s ON true
         WHERE ci.collection_id = $1 AND ci.deleted_at IS NULL AND c.deleted_at IS NULL
+          AND ($2::uuid IS NULL OR (
+                a.deleted_at IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM part_assignment pa
+                    JOIN voice v ON v.id = pa.voice_id
+                    WHERE pa.collection_item_id = ci.id AND pa.user_id = $2
+                      AND v.deleted_at IS NULL)))
         ORDER BY ci.position ASC, ci.id ASC
         "#,
         collection_id,
+        assigned_to,
     )
     .fetch_all(pool)
     .await?;

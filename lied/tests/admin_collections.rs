@@ -427,6 +427,7 @@ async fn create_collection(
         "name",
         lied::listing::SortDirection::Asc,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -625,6 +626,7 @@ async fn an_invalid_type_or_empty_name_is_rejected() {
         "name",
         lied::listing::SortDirection::Asc,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -762,7 +764,7 @@ async fn add_piece(ctx: &Ctx, browser: &Browser, org_id: Uuid, coll: Uuid, arr: 
 
 /// The collection's live items in position order.
 async fn items(ctx: &Ctx, coll: Uuid) -> Vec<lied::domain::collection_item::CollectionItemView> {
-    lied::domain::collection_item::list_for_collection(&ctx.pool, coll)
+    lied::domain::collection_item::list_for_collection(&ctx.pool, coll, None)
         .await
         .unwrap()
 }

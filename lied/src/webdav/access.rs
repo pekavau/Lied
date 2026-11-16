@@ -169,24 +169,12 @@ pub async fn has_assignment_in_collection(
     // assignment sits on a since-soft-deleted arrangement/voice would see the
     // collection listed but find it empty on entry (the item/voice listings
     // filter these out) — the "phantom empty directory" the module doc forbids.
-    // Kept in lockstep with `visible_collection_items` and
-    // `has_assignment_on_item`.
-    sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-             SELECT 1 FROM part_assignment pa
-             JOIN collection_item ci ON ci.id = pa.collection_item_id
-             JOIN arrangement a ON a.id = ci.arrangement_id
-             JOIN voice v ON v.id = pa.voice_id
-             WHERE ci.collection_id = $1 AND pa.user_id = $2
-               AND ci.deleted_at IS NULL
-               AND a.deleted_at IS NULL
-               AND v.deleted_at IS NULL
-           ) AS "exists!""#,
-        collection_id,
-        user_id,
+    // The rule is `/v1`'s too (#123), so it lives in `domain::access`.
+    Ok(
+        crate::domain::access::assigned_collection(pool, user_id, collection_id)
+            .await?
+            .is_some(),
     )
-    .fetch_one(pool)
-    .await
 }
 
 /// Whether a restricted user may see a specific collection item — i.e. holds
@@ -198,23 +186,13 @@ pub async fn has_assignment_on_item(
 ) -> Result<bool, sqlx::Error> {
     // Requires the assignment to target a live voice (and live item/arrangement),
     // matching `visible_item_voices` — otherwise the item directory would be
-    // visible but enumerate no voices and no (non-staff) score.
-    sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-             SELECT 1 FROM part_assignment pa
-             JOIN collection_item ci ON ci.id = pa.collection_item_id
-             JOIN arrangement a ON a.id = ci.arrangement_id
-             JOIN voice v ON v.id = pa.voice_id
-             WHERE pa.collection_item_id = $1 AND pa.user_id = $2
-               AND ci.deleted_at IS NULL
-               AND a.deleted_at IS NULL
-               AND v.deleted_at IS NULL
-           ) AS "exists!""#,
-        collection_item_id,
-        user_id,
+    // visible but enumerate no voices and no (non-staff) score. Shared with
+    // `/v1` (#123).
+    Ok(
+        crate::domain::access::assigned_item(pool, user_id, collection_item_id)
+            .await?
+            .is_some(),
     )
-    .fetch_one(pool)
-    .await
 }
 
 /// Whether a user holds a part assignment on `voice_id` **specifically for

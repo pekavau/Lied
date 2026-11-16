@@ -127,6 +127,7 @@ async fn dashboard(
             "name",
             SortDirection::Asc,
             None,
+            None,
         ),
         coverage::for_org(&state.db, org_id, &required),
     );

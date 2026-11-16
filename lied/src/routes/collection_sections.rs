@@ -1,7 +1,8 @@
 //! `/v1/orgs/{orgId}/collections/{collectionId}/sections` and
 //! `…/label-choices` — issue #103 (sections of a standing collection).
 //!
-//! Reads require any org membership (`musician`+); writes require
+//! Reads follow the collection's read rule (#123: a restricted musician
+//! reads only a collection holding their parts); writes require
 //! `owner`/`archivist`/`conductor`, like every collection write
 //! (docs/design.md Permission matrix: "Build/edit collections").
 
@@ -13,12 +14,11 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::{require_collection_editor_v1, require_org_role_v1};
+use crate::auth::authz::{require_collection_editor_v1, require_collection_reader_v1};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::collection_item;
 use crate::domain::collection_section::{self, CollectionSection, SectionChanges, SectionError};
-use crate::domain::membership::Role;
 use crate::error::AppError;
 use crate::listing::{self, etag_response, etag_response_status, if_match_header};
 use crate::routes::collections::{find_collection_scoped, item_error_to_app_error};
@@ -65,7 +65,7 @@ async fn find_section_scoped(
         .ok_or(AppError::NotFound)
 }
 
-/// List a collection's sections by start (requires org membership). Not
+/// List a collection's sections by start (any reader of the collection). Not
 /// paginated: a folder has a handful, and a client needs all of them to
 /// place its pieces.
 #[utoipa::path(
@@ -91,7 +91,7 @@ async fn list_sections(
     State(state): State<AppState>,
     Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<CollectionSection>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_collection_reader_v1(&state, &auth, org_id, collection_id).await?;
     find_collection_scoped(&state, org_id, collection_id).await?;
     Ok(Json(
         collection_section::list_for_collection(&state.db, collection_id).await?,
@@ -184,7 +184,7 @@ async fn create_section(
     ))
 }
 
-/// Fetch one section (requires org membership).
+/// Fetch one section (any reader of the collection).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}/sections/{sectionId}",
@@ -210,7 +210,7 @@ async fn get_section(
     State(state): State<AppState>,
     Path((org_id, collection_id, section_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_collection_reader_v1(&state, &auth, org_id, collection_id).await?;
     let section = find_section_scoped(&state, org_id, collection_id, section_id).await?;
     let updated_at = section.updated_at;
     Ok(etag_response(section, updated_at))
@@ -451,7 +451,7 @@ async fn label_choices(
     State(state): State<AppState>,
     Path((org_id, collection_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<LabelChoices>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_collection_reader_v1(&state, &auth, org_id, collection_id).await?;
     find_collection_scoped(&state, org_id, collection_id).await?;
     let choices = collection_item::label_choices(&state.db, collection_id)
         .await

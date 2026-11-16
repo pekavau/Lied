@@ -203,7 +203,37 @@ pub async fn list_for_org(
     sort_direction: crate::listing::SortDirection,
     kind_filter: Option<&str>,
 ) -> Result<(Vec<Tag>, i64), sqlx::Error> {
+    list_for_reader(
+        pool,
+        organization_id,
+        limit,
+        offset,
+        sort_column,
+        sort_direction,
+        kind_filter,
+        None,
+    )
+    .await
+}
+
+/// As [`list_for_org`], scoped to a reader: `assigned_to: Some(user)` keeps
+/// only the tags on arrangements that user holds a live part assignment on
+/// (a restricted reader's view, #123; see
+/// [`crate::domain::access::assigned_tag`]), and the total counts within
+/// that set. `None` lists every tag.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_for_reader(
+    pool: &PgPool,
+    organization_id: Uuid,
+    limit: i64,
+    offset: i64,
+    sort_column: &str,
+    sort_direction: crate::listing::SortDirection,
+    kind_filter: Option<&str>,
+    assigned_to: Option<Uuid>,
+) -> Result<(Vec<Tag>, i64), sqlx::Error> {
     let direction = sort_direction.as_sql();
+    let assigned = crate::domain::access::live_assignment_on_tag_sql("$5", "tag.id");
     let query = format!(
         r#"
         SELECT
@@ -214,6 +244,7 @@ pub async fn list_for_org(
         WHERE organization_id = $3
           AND deleted_at IS NULL
           AND ($4::text IS NULL OR kind = $4)
+          AND ($5::uuid IS NULL OR {assigned})
         ORDER BY {sort_column} {direction}, id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -224,6 +255,7 @@ pub async fn list_for_org(
         .bind(offset)
         .bind(organization_id)
         .bind(kind_filter)
+        .bind(assigned_to)
         .fetch_all(pool)
         .await?;
 
@@ -231,14 +263,19 @@ pub async fn list_for_org(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            let count_query = r#"
+            let assigned = crate::domain::access::live_assignment_on_tag_sql("$3", "tag.id");
+            let count_query = format!(
+                r#"
                 SELECT count(*) FROM tag
                 WHERE organization_id = $1 AND deleted_at IS NULL
                   AND ($2::text IS NULL OR kind = $2)
-            "#;
-            sqlx::query_scalar::<_, i64>(count_query)
+                  AND ($3::uuid IS NULL OR {assigned})
+                "#
+            );
+            sqlx::query_scalar::<_, i64>(&count_query)
                 .bind(organization_id)
                 .bind(kind_filter)
+                .bind(assigned_to)
                 .fetch_one(pool)
                 .await?
         }
