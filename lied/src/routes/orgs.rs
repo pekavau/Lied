@@ -81,6 +81,10 @@ pub(crate) struct OrganizationResponse {
     pub id: Uuid,
     pub name: String,
     pub slug: String,
+    /// Musicians read the whole archive (every arrangement, voice and score,
+    /// read-only), not only their assigned parts (#119). Off by default; the
+    /// owner sets it.
+    pub musicians_read_archive: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -91,6 +95,7 @@ impl From<organization::Organization> for OrganizationResponse {
             id: o.id,
             name: o.name,
             slug: o.slug,
+            musicians_read_archive: o.musicians_read_archive,
             created_at: o.created_at,
             updated_at: o.updated_at,
         }
@@ -105,12 +110,16 @@ struct CreateOrgRequest {
 }
 
 /// Request body for `PATCH /v1/orgs/{orgId}`: a partial update; an omitted
-/// `name` is kept. The slug never changes here (slug rename is its own,
+/// field is kept. The slug never changes here (slug rename is its own,
 /// admin-gated operation).
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UpdateOrgRequest {
+    /// Rename the organization (system admin only).
     name: Option<String>,
+    /// Open the whole archive to musicians, read-only (owner or system admin;
+    /// #119).
+    musicians_read_archive: Option<bool>,
 }
 
 /// An organization by id, or `404`.
@@ -296,7 +305,8 @@ async fn get_org(
     Ok(response)
 }
 
-/// Rename an organization (system-admin only; requires `If-Match`).
+/// Rename an organization (system admin) or change its settings (owner or
+/// system admin); requires `If-Match`.
 #[utoipa::path(
     patch,
     path = "/orgs/{orgId}",
@@ -327,7 +337,12 @@ async fn update_org(
     headers: HeaderMap,
     ApiJson(body): ApiJson<UpdateOrgRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    require_system_admin(&auth.user)?;
+    // Settings are the owner's ("Org settings" in the permission matrix); a
+    // rename stays the system admin's. A body asking for both needs both.
+    require_org_role_v1(&state, &auth, id, Role::Owner).await?;
+    if body.name.is_some() {
+        require_system_admin(&auth.user)?;
+    }
 
     let current = org_by_id(&state, id).await?;
 
@@ -335,47 +350,88 @@ async fn update_org(
         .map_err(|_| AppError::PreconditionFailed)?;
 
     reject_blank("name", body.name.as_deref())?;
-    let name = match body.name {
-        Some(name) if name != current.name => name,
-        _ => {
-            let updated_at = current.updated_at;
-            return Ok(etag_response(
-                OrganizationResponse::from(current),
-                updated_at,
-            ));
-        }
-    };
+    let name = body.name.filter(|name| *name != current.name);
+    let musicians_read_archive = body
+        .musicians_read_archive
+        .filter(|value| *value != current.musicians_read_archive);
+    if name.is_none() && musicians_read_archive.is_none() {
+        let updated_at = current.updated_at;
+        return Ok(etag_response(
+            OrganizationResponse::from(current),
+            updated_at,
+        ));
+    }
 
-    let Some(updated) = organization::update_name(
-        &state.db,
-        id,
-        Some(listing::version_of(current.updated_at)),
-        &name,
-    )
-    .await?
-    else {
-        return Err(listing::stale_or_gone(org_by_id(&state, id)).await);
+    let ctx = AuditContext {
+        actor_user_id: Some(auth.user.id),
+        org_id: Some(id),
+        request_id: Some(request_id),
     };
-
-    audit(
-        &state.db,
-        &AuditContext {
-            actor_user_id: Some(auth.user.id),
-            org_id: Some(id),
-            request_id: Some(request_id),
-        },
-        "organization.update",
-        "organization",
-        Some(id),
-        serde_json::json!({ "before": { "name": current.name }, "after": { "name": updated.name } }),
-    )
-    .await;
+    let mut updated = current.clone();
+    if let Some(name) = name {
+        let Some(row) = organization::update_name(
+            &state.db,
+            id,
+            Some(listing::version_of(updated.updated_at)),
+            &name,
+        )
+        .await?
+        else {
+            return Err(listing::stale_or_gone(org_by_id(&state, id)).await);
+        };
+        audit(
+            &state.db,
+            &ctx,
+            "organization.update",
+            "organization",
+            Some(id),
+            serde_json::json!({ "before": { "name": updated.name }, "after": { "name": row.name } }),
+        )
+        .await;
+        updated = row;
+    }
+    if let Some(value) = musicians_read_archive {
+        let Some(row) = organization::set_musicians_read_archive(
+            &state.db,
+            id,
+            Some(listing::version_of(updated.updated_at)),
+            value,
+        )
+        .await?
+        else {
+            return Err(listing::stale_or_gone(org_by_id(&state, id)).await);
+        };
+        audit_settings_change(&state, &ctx, &updated, &row).await;
+        updated = row;
+    }
 
     let updated_at = updated.updated_at;
     Ok(etag_response(
         OrganizationResponse::from(updated),
         updated_at,
     ))
+}
+
+/// Audit an org-settings change (#119), the same event from `/v1` and the
+/// console: who opened or closed the archive to musicians, and when.
+pub(crate) async fn audit_settings_change(
+    state: &AppState,
+    ctx: &AuditContext,
+    before: &organization::Organization,
+    after: &organization::Organization,
+) {
+    audit(
+        &state.db,
+        ctx,
+        "organization.settings_change",
+        "organization",
+        Some(after.id),
+        serde_json::json!({
+            "before": { "musiciansReadArchive": before.musicians_read_archive },
+            "after": { "musiciansReadArchive": after.musicians_read_archive },
+        }),
+    )
+    .await;
 }
 
 /// Hard-delete an organization and all its data (system-admin only; requires `If-Match`).

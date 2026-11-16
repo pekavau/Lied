@@ -22,6 +22,9 @@ pub struct Organization {
     pub id: Uuid,
     pub name: String,
     pub slug: String,
+    /// Musicians read the whole archive, not only their assigned parts
+    /// (#119); see [`crate::domain::access::ReadScope`].
+    pub musicians_read_archive: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -64,7 +67,7 @@ pub async fn create(
         INSERT INTO organization (id, name, slug, created_by)
         VALUES ($1, $2, $3, $4)
         RETURNING
-            id, name, slug,
+            id, name, slug, musicians_read_archive,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>"
         "#,
@@ -81,6 +84,7 @@ pub async fn create(
         id: row.id,
         name: row.name,
         slug: row.slug,
+        musicians_read_archive: row.musicians_read_archive,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -91,7 +95,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Organization>,
     let row = sqlx::query!(
         r#"
         SELECT
-            id, name, slug,
+            id, name, slug, musicians_read_archive,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>"
         FROM organization
@@ -106,6 +110,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Organization>,
         id: row.id,
         name: row.name,
         slug: row.slug,
+        musicians_read_archive: row.musicians_read_archive,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }))
@@ -157,7 +162,7 @@ pub async fn list(
     let query = format!(
         r#"
         SELECT
-            id, name, slug,
+            id, name, slug, musicians_read_archive,
             created_at,
             updated_at,
             count(*) OVER() as total
@@ -194,6 +199,7 @@ pub async fn list(
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
                 slug: row.try_get("slug")?,
+                musicians_read_archive: row.try_get("musicians_read_archive")?,
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
             })
@@ -219,7 +225,7 @@ pub async fn update_name(
         SET name = $2, updated_at = now()
         WHERE id = $1 AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
         RETURNING
-            id, name, slug,
+            id, name, slug, musicians_read_archive,
             created_at as "created_at: DateTime<Utc>",
             updated_at as "updated_at: DateTime<Utc>"
         "#,
@@ -234,6 +240,45 @@ pub async fn update_name(
         id: row.id,
         name: row.name,
         slug: row.slug,
+        musicians_read_archive: row.musicians_read_archive,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }))
+}
+
+/// Set [`Organization::musicians_read_archive`] (#119, owner-only, checked
+/// by the caller). Returns the updated row, or `None` if no row matched `id`
+/// (or, with `expected_version`, it changed meanwhile).
+///
+/// `expected_version`: see [guarded writes](crate::domain#guarded-writes).
+pub async fn set_musicians_read_archive(
+    pool: &PgPool,
+    id: Uuid,
+    expected_version: Option<i64>,
+    value: bool,
+) -> Result<Option<Organization>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"
+        UPDATE organization
+        SET musicians_read_archive = $2, updated_at = now()
+        WHERE id = $1 AND ($3::bigint IS NULL OR floor(extract(epoch FROM updated_at) * 1000)::bigint = $3)
+        RETURNING
+            id, name, slug, musicians_read_archive,
+            created_at as "created_at: DateTime<Utc>",
+            updated_at as "updated_at: DateTime<Utc>"
+        "#,
+        id,
+        value,
+        expected_version,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| Organization {
+        id: row.id,
+        name: row.name,
+        slug: row.slug,
+        musicians_read_archive: row.musicians_read_archive,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }))

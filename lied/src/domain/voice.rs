@@ -337,6 +337,11 @@ pub const FILTER_ALLOWLIST: &[&str] = &["instrumentId"];
 /// the parent arrangement is itself soft-deleted or absent — callers that
 /// need to distinguish "arrangement not found" from "no voices" should
 /// resolve the arrangement separately first (the `/v1` handlers do this).
+///
+/// `assigned_to`: `Some(user)` keeps only the voices that user holds a live
+/// part assignment on (a restricted musician's view, #119; see
+/// [`crate::domain::access::ReadScope`]); `None` lists every voice.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_for_arrangement(
     pool: &PgPool,
     arrangement_id: Uuid,
@@ -345,8 +350,10 @@ pub async fn list_for_arrangement(
     sort_column: &str,
     sort_direction: crate::listing::SortDirection,
     instrument_id_filter: Option<Uuid>,
+    assigned_to: Option<Uuid>,
 ) -> Result<(Vec<Voice>, i64), sqlx::Error> {
     let direction = sort_direction.as_sql();
+    let assigned = crate::domain::access::live_assignment_on_voice_sql("$5", "v.id");
     let query = format!(
         r#"
         SELECT
@@ -364,6 +371,7 @@ pub async fn list_for_arrangement(
           AND ($4::uuid IS NULL OR EXISTS (
                 SELECT 1 FROM voice_instrument vi
                 WHERE vi.voice_id = v.id AND vi.instrument_id = $4))
+          AND ($5::uuid IS NULL OR {assigned})
         ORDER BY {sort_column} {direction}, v.id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -374,6 +382,7 @@ pub async fn list_for_arrangement(
         .bind(offset)
         .bind(arrangement_id)
         .bind(instrument_id_filter)
+        .bind(assigned_to)
         .fetch_all(pool)
         .await?;
 
@@ -381,7 +390,9 @@ pub async fn list_for_arrangement(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            let count_query = r#"
+            let assigned = crate::domain::access::live_assignment_on_voice_sql("$3", "v.id");
+            let count_query = format!(
+                r#"
                 SELECT count(*) FROM voice v
                 JOIN arrangement a ON a.id = v.arrangement_id
                 WHERE v.arrangement_id = $1
@@ -390,10 +401,13 @@ pub async fn list_for_arrangement(
                   AND ($2::uuid IS NULL OR EXISTS (
                         SELECT 1 FROM voice_instrument vi
                         WHERE vi.voice_id = v.id AND vi.instrument_id = $2))
-            "#;
-            sqlx::query_scalar::<_, i64>(count_query)
+                  AND ($3::uuid IS NULL OR {assigned})
+                "#
+            );
+            sqlx::query_scalar::<_, i64>(&count_query)
                 .bind(arrangement_id)
                 .bind(instrument_id_filter)
+                .bind(assigned_to)
                 .fetch_one(pool)
                 .await?
         }

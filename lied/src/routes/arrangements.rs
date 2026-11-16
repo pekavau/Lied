@@ -13,9 +13,11 @@ use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::authz::{
-    require_arrangement_reader_v1, require_org_role_v1, require_voice_reader_v1, Reader,
+    require_archive_lister_v1, require_arrangement_reader_v1, require_org_role_v1,
+    require_voice_reader_v1,
 };
 use crate::auth::extractors::BearerOrSession;
+use crate::domain::access::ReadScope;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{arrangement, tag, voice, work};
@@ -426,10 +428,11 @@ async fn delete_work(
 // Arrangement — org-scoped.
 // ---------------------------------------------------------------------------
 
-/// An arrangement. A guest (a part assignment without membership, #99) gets
-/// the same shape as a summary: the musical fields as stored, and the
-/// licensing and purchase fields (`publisher`, `purchaseDate`,
-/// `licenseNotes`, `copyCountAllowed`) always `null`.
+/// An arrangement. Anyone but staff (a musician, #119, or a guest, a part
+/// assignment without membership, #99) gets the same shape as a summary: the
+/// musical fields as stored, and the licensing and purchase fields
+/// (`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) always
+/// `null`.
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArrangementResponse {
@@ -485,10 +488,11 @@ impl From<arrangement::Arrangement> for ArrangementResponse {
 }
 
 impl ArrangementResponse {
-    /// The summary a guest gets (#99): the licensing and purchase fields are
-    /// the archive's business, not the player's.
-    fn for_reader(mut self, reader: Reader) -> Self {
-        if reader == Reader::Guest {
+    /// The summary every non-staff reader gets (guests since #99, musicians
+    /// since #119, the archive open to them or not): the licensing and
+    /// purchase fields are the archive's business, not the player's.
+    fn for_reader(mut self, scope: ReadScope) -> Self {
+        if scope != ReadScope::Staff {
             self.publisher = None;
             self.purchase_date = None;
             self.license_notes = None;
@@ -652,10 +656,16 @@ fn build_search<'a>(
         duration_max_seconds: parse(filters, "durationMaxSeconds", "a whole number of seconds")?,
         tag_ids,
         instrument_id: parse(filters, "instrumentId", "an instrument id")?,
+        assigned_to: None,
     })
 }
 
-/// List arrangements in an organization (requires `musician` role).
+/// List arrangements in an organization (any member).
+///
+/// A musician sees only arrangements they hold a live part assignment in,
+/// unless the org opened its archive to musicians (`musiciansReadArchive`);
+/// the search and every filter apply within that set, and so does `total`.
+/// Anyone but staff gets summaries (licensing fields `null`).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements",
@@ -705,7 +715,7 @@ async fn list_arrangements(
         filters: raw_filters,
     }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<ArrangementResponse>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    let scope = require_archive_lister_v1(&state, &auth, org_id).await?;
 
     let (limit, offset) = crate::pagination::PageParams {
         limit: q.limit,
@@ -721,7 +731,10 @@ async fn list_arrangements(
     .map_err(validation_error)?;
     let filters = listing::resolve_filters(&raw_filters, arrangement::FILTER_ALLOWLIST)
         .map_err(validation_error)?;
-    let search = build_search(&filters, q.q.as_deref())?;
+    let mut search = build_search(&filters, q.q.as_deref())?;
+    // A restricted musician lists only what they hold a part in (#119), and
+    // every facet applies within that set: as the WebDAV PROPFIND scope.
+    search.assigned_to = (!scope.reads_everything()).then_some(auth.user.id);
 
     let (items, total) = arrangement::list_for_org(
         &state.db,
@@ -735,7 +748,10 @@ async fn list_arrangements(
     .await?;
 
     Ok(Json(Page {
-        items: items.into_iter().map(ArrangementResponse::from).collect(),
+        items: items
+            .into_iter()
+            .map(|a| ArrangementResponse::from(a).for_reader(scope))
+            .collect(),
         total,
         limit,
         offset,
@@ -843,11 +859,12 @@ async fn find_arrangement_scoped_including_deleted(
     Ok(found)
 }
 
-/// Fetch one arrangement by ID (requires `musician` role, or a guest's part
-/// assignment on one of its voices).
+/// Fetch one arrangement by ID: staff; a musician of an org that opened its
+/// archive (`musiciansReadArchive`); or a musician or guest holding a live
+/// part assignment on one of its voices.
 ///
-/// A guest (a live part assignment, no membership) gets the summary: the
-/// licensing and purchase fields are `null`. Any other non-member gets `403`.
+/// Anyone but staff gets the summary: the licensing and purchase fields are
+/// `null`. Anyone else gets `403`, whether or not the arrangement exists.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}",
@@ -1233,7 +1250,10 @@ struct VoiceListQuery {
     sort: Option<String>,
 }
 
-/// List voices in an arrangement (requires `musician` role).
+/// List voices in an arrangement (any member).
+///
+/// A musician of an org that keeps its archive closed lists only their own
+/// voices, and only in an arrangement they hold a part in (`403` otherwise).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices",
@@ -1268,7 +1288,15 @@ async fn list_voices(
         filters: raw_filters,
     }: ApiListQuery<VoiceListQuery>,
 ) -> Result<Json<Page<VoiceResponse>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    let scope = require_archive_lister_v1(&state, &auth, org_id).await?;
+    // A restricted musician sees the voices of a piece they hold a part in,
+    // and only their own (#119); any other piece is 403, existing or not.
+    let assigned_to = if scope.reads_everything() {
+        None
+    } else {
+        require_arrangement_reader_v1(&state, &auth, org_id, arrangement_id).await?;
+        Some(auth.user.id)
+    };
 
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
 
@@ -1306,6 +1334,7 @@ async fn list_voices(
         sort_column,
         sort_direction,
         instrument_id_filter,
+        assigned_to,
     )
     .await?;
 
@@ -1434,12 +1463,11 @@ async fn find_voice_scoped_including_deleted(
     Ok(found)
 }
 
-/// Fetch one voice by ID (requires `musician` role, or a guest's part
-/// assignment on this voice).
+/// Fetch one voice by ID: staff; a musician of an org that opened its
+/// archive (`musiciansReadArchive`); or a musician or guest holding a live
+/// part assignment on this voice.
 ///
-/// A guest (a live part assignment, no membership) reads only the voices
-/// they are assigned to; any other voice, like any other non-member's
-/// request, is `403`.
+/// Any other voice, like any other non-member's request, is `403`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}",
@@ -2126,7 +2154,8 @@ async fn undelete_tag(
 // ArrangementTag — tag-to-arrangement attach/detach/list.
 // ---------------------------------------------------------------------------
 
-/// List tags attached to a specific arrangement (requires `musician` role).
+/// List tags attached to a specific arrangement (any member who may read the
+/// arrangement).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/tags",
@@ -2151,7 +2180,9 @@ async fn list_arrangement_tags(
     State(state): State<AppState>,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<TagResponse>>, AppError> {
+    // Members only (guests read no lists), and only of a piece they may read.
     require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_arrangement_reader_v1(&state, &auth, org_id, id).await?;
     find_arrangement_scoped(&state, org_id, id).await?;
 
     let tags = tag::list_tags_for_arrangement(&state.db, id).await?;

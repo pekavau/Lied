@@ -57,7 +57,8 @@ Two design commitments shape everything:
   assembled from the archive.
 - **Part distribution** — assign a voice in a program to a specific player;
   guests and substitutes get read access to their parts without joining the
-  organization.
+  organization. Musicians see only their own parts, unless the owner opens
+  the whole archive to them, read-only (an org setting, off by default).
 - **Two complementary interfaces over one backend:**
   - a **WebDAV** filesystem view of the music tree — mount it in your OS or open
     it from a tablet reader, MuseScore, or Frescobaldi; and
@@ -161,7 +162,9 @@ From an empty instance to a musician holding their part:
 6. Each musician logs in once, creates an **app password** on the
    *App passwords* page, and points their reader app at
    `http://<host>:8080/orgs/<org-slug>/` with their username and that app
-   password. They see the arrangements they hold parts in.
+   password. They see the arrangements they hold parts in, or, if the owner
+   ticked *Musicians may read the whole archive* under *Settings*, the whole
+   archive, read-only.
 
 > Serving over HTTPS? Set `LIED_SECURE_COOKIES=true` — browsers drop `Secure`
 > cookies on plain-HTTP origins, so it defaults to `false` for local/LAN use.
