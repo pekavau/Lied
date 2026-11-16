@@ -210,6 +210,80 @@ pub async fn require_score_reader_v1(
     }
 }
 
+/// Require the caller to read collection `collection_id` of
+/// `organization_id` (its summary, items list, sections, label choices), and
+/// return their [`ReadScope`] (#123):
+///
+/// - a member (or system admin) who [`ReadScope::reads_everything`] reads
+///   every collection;
+/// - a [`ReadScope::Restricted`] member reads one only while holding a live
+///   part assignment in it ([`access::assigned_collection`]), as the WebDAV
+///   collections tree shows it;
+/// - a guest reads no collection on `/v1` (their parts are
+///   `GET /v1/me/parts`).
+///
+/// A restricted refusal is `403` whether or not the collection exists.
+pub async fn require_collection_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    collection_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    let scope = require_archive_lister_v1(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        return Ok(scope);
+    }
+    match access::assigned_collection(&state.db, auth.user.id, collection_id).await? {
+        Some(org) if org == organization_id => Ok(scope),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+/// Require the caller to read item `item_id` of `collection_id` in
+/// `organization_id`: as [`require_collection_reader_v1`], except that a
+/// [`ReadScope::Restricted`] member needs a live part assignment on exactly
+/// this item ([`access::assigned_item`]). `403` otherwise, existing or not.
+pub async fn require_collection_item_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    collection_id: Uuid,
+    item_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    let scope = require_archive_lister_v1(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        return Ok(scope);
+    }
+    match access::assigned_item(&state.db, auth.user.id, item_id).await? {
+        Some(found)
+            if found.organization_id == organization_id && found.collection_id == collection_id =>
+        {
+            Ok(scope)
+        }
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+/// Require the caller to read tag `tag_id` of `organization_id`: a member who
+/// [`ReadScope::reads_everything`] reads every tag; a
+/// [`ReadScope::Restricted`] member only a tag on an arrangement they may
+/// read ([`access::assigned_tag`], #123). `403` otherwise, existing or not.
+pub async fn require_tag_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+    tag_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    let scope = require_archive_lister_v1(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        return Ok(scope);
+    }
+    match access::assigned_tag(&state.db, auth.user.id, tag_id).await? {
+        Some(org) if org == organization_id => Ok(scope),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
 /// Which coverage a caller is entitled to see.
 ///
 /// The view and the authorization are the same decision — a principal is not

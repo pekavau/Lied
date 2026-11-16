@@ -8,7 +8,8 @@
 //! files via the WebDAV collections subtree — see `webdav::access` /
 //! `webdav::fs`.
 //!
-//! Reads require any org membership (`musician`+); writes (add/remove a player,
+//! Reads: staff read every assignment, anyone else only their own (#123);
+//! writes (add/remove a player,
 //! set `notifiedAt`/`acknowledgedAt`, unassign) require
 //! `owner`/`archivist`/`conductor` (docs/design.md Permission matrix: "Part
 //! assignments"), enforced via [`require_collection_editor_v1`]. Optimistic
@@ -25,10 +26,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::{require_collection_editor_v1, require_org_role_v1};
+use crate::auth::authz::{require_collection_editor_v1, require_collection_item_reader_v1};
 use crate::auth::extractors::BearerOrSession;
+use crate::domain::access::ReadScope;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::membership::Role;
 use crate::domain::{collection_item, part_assignment};
 use crate::error::AppError;
 use crate::listing::{self, etag_response, etag_response_status, if_match_header};
@@ -112,7 +113,8 @@ async fn find_assignment_scoped(
 
 // ── list ─────────────────────────────────────────────────────────────────────
 
-/// List a collection item's part assignments (requires org membership).
+/// List a collection item's part assignments (staff: everyone's; any other
+/// reader of the item: their own only).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments",
@@ -141,15 +143,25 @@ async fn list_assignments(
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
     Query(params): Query<crate::pagination::PageParams>,
 ) -> Result<Json<Page<part_assignment::PartAssignment>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    // Staff read the whole distribution plan; anyone else (an open-archive
+    // musician included: the archive is not the plan) only their own
+    // assignments, on an item they may read (#123).
+    let scope =
+        require_collection_item_reader_v1(&state, &auth, org_id, collection_id, item_id).await?;
     find_item_scoped(&state, org_id, collection_id, item_id).await?;
+    let only_user = (scope != ReadScope::Staff).then_some(auth.user.id);
 
     let (limit, offset) =
         params.resolve(state.config.default_page_size, state.config.max_page_size);
 
-    let (items, total) =
-        part_assignment::list_for_item(&state.db, item_id, i64::from(limit), i64::from(offset))
-            .await?;
+    let (items, total) = part_assignment::list_for_item(
+        &state.db,
+        item_id,
+        i64::from(limit),
+        i64::from(offset),
+        only_user,
+    )
+    .await?;
 
     Ok(Json(Page {
         items,
@@ -255,7 +267,7 @@ async fn assign_voice(
 
 // ── get / update / delete a single assignment ───────────────────────────────
 
-/// Fetch one part assignment (requires org membership).
+/// Fetch one part assignment (staff; anyone else only their own, else 403).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}/assignments/{assignmentId}",
@@ -282,9 +294,17 @@ async fn get_assignment(
     State(state): State<AppState>,
     Path((org_id, collection_id, item_id, assignment_id)): Path<(Uuid, Uuid, Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
-    let found =
-        find_assignment_scoped(&state, org_id, collection_id, item_id, assignment_id).await?;
+    let scope =
+        require_collection_item_reader_v1(&state, &auth, org_id, collection_id, item_id).await?;
+    let found = find_assignment_scoped(&state, org_id, collection_id, item_id, assignment_id).await;
+    // Anyone but staff reads only their own assignment; someone else's and a
+    // missing one are the same 403, so ids cannot be probed (#123).
+    let found = match (scope, found) {
+        (ReadScope::Staff, found) => found?,
+        (_, Ok(found)) if found.user_id == auth.user.id => found,
+        (_, Ok(_) | Err(AppError::NotFound)) => return Err(AppError::Forbidden),
+        (_, Err(other)) => return Err(other),
+    };
     let updated_at = found.updated_at;
     Ok(etag_response(found, updated_at))
 }

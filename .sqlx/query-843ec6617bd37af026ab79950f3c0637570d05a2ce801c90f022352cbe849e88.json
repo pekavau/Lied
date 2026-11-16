@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) as \"count!\" FROM part_assignment WHERE collection_item_id = $1",
+  "query": "SELECT count(*) as \"count!\" FROM part_assignment\n           WHERE collection_item_id = $1 AND ($2::uuid IS NULL OR user_id = $2)",
   "describe": {
     "columns": [
       {
@@ -11,6 +11,7 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
@@ -18,5 +19,5 @@
       null
     ]
   },
-  "hash": "a6a723716526be249f06e66b5256db4f4a93146555bb052f8f5a7cdf0cc7bee3"
+  "hash": "843ec6617bd37af026ab79950f3c0637570d05a2ce801c90f022352cbe849e88"
 }

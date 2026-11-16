@@ -260,6 +260,7 @@ async fn collections_page(
         "name",
         SortDirection::Asc,
         None,
+        None,
     )
     .await
     {
@@ -380,7 +381,7 @@ async fn collection_detail_page(
     // pattern the #30 review established for the console's page loads).
     let all_arrangements = arrangement::ArrangementSearch::default();
     let (items, removed_result, candidates_result) = tokio::join!(
-        collection_item::list_for_collection(&state.db, collection_id),
+        collection_item::list_for_collection(&state.db, collection_id, None),
         collection_item::list_deleted_for_collection(&state.db, collection_id, page_size, 0),
         arrangement::list_for_org(
             &state.db,

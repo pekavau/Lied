@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::authz::{
     require_archive_lister_v1, require_arrangement_reader_v1, require_org_role_v1,
-    require_voice_reader_v1,
+    require_tag_reader_v1, require_voice_reader_v1,
 };
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::access::ReadScope;
@@ -1809,7 +1809,8 @@ struct TagListQuery {
     sort: Option<String>,
 }
 
-/// List tags in an organization (requires `musician` role).
+/// List tags in an organization (members; a restricted musician sees only the
+/// tags on pieces they may read).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/tags",
@@ -1842,7 +1843,9 @@ async fn list_tags(
         filters: raw_filters,
     }: ApiListQuery<TagListQuery>,
 ) -> Result<Json<Page<TagResponse>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    // A restricted musician sees only the tags on pieces they may read (#123).
+    let scope = require_archive_lister_v1(&state, &auth, org_id).await?;
+    let assigned_to = (!scope.reads_everything()).then_some(auth.user.id);
 
     let (limit, offset) = crate::pagination::PageParams {
         limit: q.limit,
@@ -1860,7 +1863,7 @@ async fn list_tags(
         .find(|(field, _)| field == "kind")
         .map(|(_, value)| value.as_str());
 
-    let (items, total) = tag::list_for_org(
+    let (items, total) = tag::list_for_reader(
         &state.db,
         org_id,
         i64::from(limit),
@@ -1868,6 +1871,7 @@ async fn list_tags(
         sort_column,
         sort_direction,
         kind_filter,
+        assigned_to,
     )
     .await?;
 
@@ -1962,7 +1966,8 @@ async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag
     Ok(found)
 }
 
-/// Fetch one tag by ID (requires `musician` role).
+/// Fetch one tag by ID (members; a restricted musician only a tag on a piece
+/// they may read, else 403).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/tags/{tagId}",
@@ -1987,7 +1992,7 @@ async fn get_tag(
     State(state): State<AppState>,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_tag_reader_v1(&state, &auth, org_id, id).await?;
     let found = find_tag_scoped(&state, org_id, id).await?;
     let updated_at = found.updated_at;
     Ok(etag_response(TagResponse::from(found), updated_at))

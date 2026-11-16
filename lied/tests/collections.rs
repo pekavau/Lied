@@ -617,8 +617,10 @@ async fn if_match_is_enforced_on_collection_update() {
     assert_eq!(ok_status, axum::http::StatusCode::OK);
 }
 
+/// A musician of a closed archive with no part in a collection lists none
+/// and opens none (#123; the full scope matrix is in `tests/files.rs`).
 #[tokio::test]
-async fn a_musician_can_read_but_not_write() {
+async fn a_musician_without_a_part_sees_no_collection() {
     let (ctx, editor) = setup(membership::Role::Archivist).await;
     let coll = make_collection(&ctx, &editor, "Spring", "program").await;
 
@@ -627,8 +629,7 @@ async fn a_musician_can_read_but_not_write() {
     add_member(&ctx.pool, ctx.org, muso, membership::Role::Musician).await;
     let muso_tok = ctx.token_for(muso);
 
-    // Musician can list and get.
-    let (list_status, _) = send(
+    let (list_status, list) = send(
         &ctx.app,
         req(
             "GET",
@@ -639,6 +640,7 @@ async fn a_musician_can_read_but_not_write() {
     )
     .await;
     assert_eq!(list_status, axum::http::StatusCode::OK);
+    assert_eq!(list["total"], 0, "{list}");
     let (get_status, _) = send(
         &ctx.app,
         req(
@@ -649,7 +651,7 @@ async fn a_musician_can_read_but_not_write() {
         ),
     )
     .await;
-    assert_eq!(get_status, axum::http::StatusCode::OK);
+    assert_eq!(get_status, axum::http::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -884,7 +886,7 @@ fn pos(position: i32) -> Placement<'static> {
 
 /// `(label, position)` of the live items, in position order.
 async fn layout(ctx: &Ctx, coll: Uuid) -> Vec<(String, i32)> {
-    collection_item::list_for_collection(&ctx.pool, coll)
+    collection_item::list_for_collection(&ctx.pool, coll, None)
         .await
         .unwrap()
         .into_iter()
@@ -903,7 +905,7 @@ async fn labels(ctx: &Ctx, coll: Uuid) -> Vec<String> {
 
 /// The live items' ids, in position order.
 async fn order(ctx: &Ctx, coll: Uuid) -> Vec<Uuid> {
-    collection_item::list_for_collection(&ctx.pool, coll)
+    collection_item::list_for_collection(&ctx.pool, coll, None)
         .await
         .unwrap()
         .iter()
@@ -1483,7 +1485,7 @@ async fn add_section(
 
 /// The `(label, section name)` of the live items, in position order.
 async fn sectioned(ctx: &Ctx, coll: Uuid) -> Vec<(String, Option<String>)> {
-    collection_item::list_for_collection(&ctx.pool, coll)
+    collection_item::list_for_collection(&ctx.pool, coll, None)
         .await
         .unwrap()
         .into_iter()
@@ -2025,12 +2027,12 @@ async fn sections_on_the_wire_follow_the_conventions() {
         serde_json::json!([{ "sectionId": polkas["id"], "from": 61, "to": 2 }])
     );
 
-    // A musician reads but does not write.
+    // A musician with no part in the book neither reads (#123) nor writes.
     let musician = create_user(&ctx.pool, "player").await;
     add_member(&ctx.pool, ctx.org, musician, membership::Role::Musician).await;
     let player = ctx.token_for(musician);
     let (status, _) = send(&ctx.app, req("GET", &sections_url, &player, None)).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = send(
         &ctx.app,
         req(

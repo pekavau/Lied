@@ -1552,3 +1552,208 @@ async fn only_the_owner_opens_the_archive_and_it_is_audited() {
     let rename = serde_json::json!({ "name": "Kapelle" });
     assert_eq!(patch_org(&ctx, &owner, org_id, rename).await, 403);
 }
+
+async fn seed_tag(state: &AppState, org_id: Uuid, name: &str, arr_id: Uuid) -> Uuid {
+    let tag = lied::domain::tag::create(&state.db, Uuid::now_v7(), org_id, name, None, None)
+        .await
+        .unwrap();
+    lied::domain::tag::attach(&state.db, Uuid::now_v7(), arr_id, tag.id)
+        .await
+        .unwrap();
+    tag.id
+}
+
+/// Collections, their items, sections and label choices, part assignments
+/// and the org's tags follow the same read scope as arrangements (#123): a
+/// restricted musician sees only the collections and items they hold a part
+/// in, only their own assignments, and only the tags on pieces they may
+/// read; anything else is 403, existing or not, so no programme names a
+/// piece they don't play. With the archive open they read every collection
+/// and tag, but still only their own assignments (the archive is not the
+/// distribution plan). Staff read everything; a guest reads none of it.
+#[tokio::test]
+async fn a_restricted_musician_reads_only_the_collections_assignments_and_tags_of_their_parts() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let (_, owner) = seed_member(&ctx.state, org_id, "olga", membership::Role::Owner).await;
+    let (anna_id, anna) = seed_member(&ctx.state, org_id, "anna", membership::Role::Musician).await;
+    let (bert_id, _) = seed_member(&ctx.state, org_id, "bert", membership::Role::Musician).await;
+    let (guest_id, guest) = seed_guest(&ctx.state, "gus").await;
+
+    let radetzky = seed_arrangement(&ctx.state, org_id, "Radetzky March").await;
+    let secret = seed_arrangement(&ctx.state, org_id, "Secret Piece").await;
+    let flute = seed_voice(&ctx.state, radetzky, "Flute 1").await;
+    let oboe = seed_voice(&ctx.state, radetzky, "Oboe 1").await;
+    let clarinet = seed_voice(&ctx.state, secret, "Clarinet 1").await;
+    let marsch = seed_tag(&ctx.state, org_id, "Marsch", radetzky).await;
+    let geheim = seed_tag(&ctx.state, org_id, "Geheim", secret).await;
+
+    // Spring: Radetzky (anna flute, bert oboe, the guest flute) and the
+    // secret piece (bert only). Autumn: the secret piece only (bert).
+    let (spring, radetzky_item) = seed_program_item(&ctx.state, org_id, radetzky).await;
+    let secret_item = lied::domain::collection_item::create(
+        &ctx.state.db,
+        Uuid::now_v7(),
+        spring,
+        secret,
+        lied::domain::collection_item::Placement {
+            position: None,
+            label: None,
+        },
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    let (autumn, autumn_item) = seed_program_item(&ctx.state, org_id, secret).await;
+    let annas = assign(&ctx.state, radetzky_item, flute, anna_id).await;
+    let berts = assign(&ctx.state, radetzky_item, oboe, bert_id).await;
+    assign(&ctx.state, radetzky_item, flute, guest_id).await;
+    assign(&ctx.state, secret_item, clarinet, bert_id).await;
+    assign(&ctx.state, autumn_item, clarinet, bert_id).await;
+
+    let colls = format!("/v1/orgs/{org_id}/collections");
+    let s = format!("{colls}/{spring}");
+    let a = format!("{colls}/{autumn}");
+    let tags = format!("/v1/orgs/{org_id}/tags");
+    let on_radetzky = format!("{s}/items/{radetzky_item}/assignments");
+    let unknown = Uuid::now_v7();
+
+    // ── archive closed (the default) ──
+    let (status, page) = get_json(&ctx, &colls, &anna).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(total(&page), 1, "{page}");
+    assert_eq!(page["items"][0]["id"], spring.to_string());
+    let (_, programs) = get_json(&ctx, &format!("{colls}?filter[type]=program"), &anna).await;
+    assert_eq!(total(&programs), 1, "{programs}");
+    let (status, items) = get_json(&ctx, &format!("{s}/items"), &anna).await;
+    assert_eq!(status, 200, "{items}");
+    assert_eq!(items.as_array().unwrap().len(), 1, "{items}");
+    assert_eq!(items[0]["id"], radetzky_item.to_string());
+    assert!(!items.to_string().contains("Secret"), "{items}");
+    let (_, mine) = get_json(&ctx, &on_radetzky, &anna).await;
+    assert_eq!(total(&mine), 1, "{mine}");
+    assert_eq!(mine["items"][0]["userId"], anna_id.to_string());
+    let (_, tag_page) = get_json(&ctx, &tags, &anna).await;
+    assert_eq!(total(&tag_page), 1, "{tag_page}");
+    assert_eq!(tag_page["items"][0]["id"], marsch.to_string());
+    for uri in [
+        s.clone(),
+        format!("{s}/sections"),
+        format!("{s}/items/{radetzky_item}"),
+        format!("{on_radetzky}/{annas}"),
+        format!("{tags}/{marsch}"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &anna)).await,
+            200,
+            "{uri}"
+        );
+    }
+    let closed = [
+        a.clone(),
+        format!("{a}/items"),
+        format!("{a}/sections"),
+        format!("{a}/label-choices"),
+        format!("{a}/items/{autumn_item}"),
+        format!("{a}/items/{autumn_item}/assignments"),
+        format!("{s}/items/{secret_item}"),
+        format!("{s}/items/{secret_item}/assignments"),
+        format!("{tags}/{geheim}"),
+    ];
+    for uri in &closed {
+        assert_eq!(status_of(&ctx, get_request(uri, &anna)).await, 403, "{uri}");
+    }
+    // Someone else's assignment, and ids that don't exist: the same 403.
+    for uri in [
+        format!("{on_radetzky}/{berts}"),
+        format!("{on_radetzky}/{unknown}"),
+        format!("{colls}/{unknown}"),
+        format!("{colls}/{unknown}/items"),
+        format!("{s}/items/{unknown}"),
+        format!("{tags}/{unknown}"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &anna)).await,
+            403,
+            "{uri}"
+        );
+    }
+
+    // Staff read everything, and a missing id is 404 to them.
+    let (_, staff_colls) = get_json(&ctx, &colls, &arch).await;
+    assert_eq!(total(&staff_colls), 2, "{staff_colls}");
+    let (_, staff_items) = get_json(&ctx, &format!("{s}/items"), &arch).await;
+    assert_eq!(staff_items.as_array().unwrap().len(), 2, "{staff_items}");
+    let (_, plan) = get_json(&ctx, &on_radetzky, &arch).await;
+    assert_eq!(total(&plan), 3, "{plan}");
+    let (_, staff_tags) = get_json(&ctx, &tags, &arch).await;
+    assert_eq!(total(&staff_tags), 2, "{staff_tags}");
+    for uri in &closed {
+        let status = status_of(&ctx, get_request(uri, &arch)).await;
+        // A program has no label choices (409); everything else reads.
+        assert!(
+            status == 200 || uri.ends_with("label-choices"),
+            "{uri}: {status}"
+        );
+    }
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{on_radetzky}/{berts}"), &arch)).await,
+        200
+    );
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{colls}/{unknown}"), &arch)).await,
+        404
+    );
+
+    // A guest reads none of it on `/v1` (their parts are `/v1/me/parts`).
+    for uri in [
+        colls.clone(),
+        s.clone(),
+        format!("{s}/items"),
+        format!("{s}/items/{radetzky_item}"),
+        on_radetzky.clone(),
+        tags.clone(),
+        format!("{tags}/{marsch}"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &guest)).await,
+            403,
+            "{uri}"
+        );
+    }
+
+    // ── the owner opens the archive ──
+    let open = serde_json::json!({ "musiciansReadArchive": true });
+    assert_eq!(patch_org(&ctx, &owner, org_id, open).await, 200);
+    let (_, page) = get_json(&ctx, &colls, &anna).await;
+    assert_eq!(total(&page), 2, "{page}");
+    let (_, items) = get_json(&ctx, &format!("{s}/items"), &anna).await;
+    assert_eq!(items.as_array().unwrap().len(), 2, "{items}");
+    let (_, tag_page) = get_json(&ctx, &tags, &anna).await;
+    assert_eq!(total(&tag_page), 2, "{tag_page}");
+    for uri in [
+        a.clone(),
+        format!("{a}/items"),
+        format!("{a}/items/{autumn_item}"),
+        format!("{s}/items/{secret_item}"),
+        format!("{tags}/{geheim}"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &anna)).await,
+            200,
+            "{uri}"
+        );
+    }
+    // The plan stays private: their own assignments only.
+    let (_, mine) = get_json(&ctx, &on_radetzky, &anna).await;
+    assert_eq!(total(&mine), 1, "{mine}");
+    let (_, none) = get_json(&ctx, &format!("{a}/items/{autumn_item}/assignments"), &anna).await;
+    assert_eq!(total(&none), 0, "{none}");
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{on_radetzky}/{berts}"), &anna)).await,
+        403
+    );
+    // A guest is never widened.
+    assert_eq!(status_of(&ctx, get_request(&colls, &guest)).await, 403);
+}

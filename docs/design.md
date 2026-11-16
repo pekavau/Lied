@@ -257,9 +257,14 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
   - A **`musician`** reads only their assigned parts, the same view a guest gets (below): the arrangement list holds only pieces they hold a part in, and every search facet and the total apply within that set; a piece's voice list holds only their voices; other voices and the full score are `403` on `/v1` and absent over WebDAV.
   - **Unless the org opens its archive to musicians:** the owner's setting `Organization.musicians_read_archive` (off by default) lets every musician read every arrangement, voice and full score, read-only. Whether that is wanted depends on the ensemble: a small amateur band may want everyone to browse, a large or professional orchestra will not. Writes stay by role; licensing and purchase fields stay staff-only either way.
   - A **guest** is never widened by the setting.
+  - **Collections, assignments and tags follow the same scope** (#123), so no other read undoes it. A musician of a closed archive:
+    - lists only the collections they hold a live part in, with filters and totals applied within that set. In such a collection they see the sections and label choices, but only the items they play. Any other collection or item is `403`, existing or not, so no programme names a piece they don't play. That is the WebDAV collections tree's rule.
+    - lists only the tags on arrangements they may read; any other tag is `403`.
+  - With the archive open, a musician reads every collection, item and tag.
+  - **Part assignments are the distribution plan, not the archive.** Staff read everyone's. Anyone else reads only their own, open archive or not; someone else's assignment and a missing one are the same `403`.
 - A `PartAssignment` implicitly grants the assigned user **read access to that voice's files** for as long as the assignment exists, regardless of Membership in the org. This is how guests and substitutes access parts, and what a musician of a closed archive reads.
   - **Live only:** the assignment counts while its collection item, collection, voice and arrangement are all live. Removing the piece, or deleting any of them, ends the access; the assignment row stays.
-  - **One rule for both surfaces:** `domain::access` (`assigned_voice`, `assigned_arrangement`) decides it for WebDAV and `/v1` alike (#99).
+  - **One rule for both surfaces:** `domain::access` (`assigned_voice`, `assigned_arrangement`, `assigned_collection`, `assigned_item`, `assigned_tag`) decides it for WebDAV and `/v1` alike (#99, #123).
   - **What a guest reads on `/v1`** (no membership, a live assignment): the assigned voice (`GET …/voices/{voiceId}`), its file list and its files (download with `Range`), and the arrangement as a **summary** (`GET …/arrangements/{arrangementId}`): the same response, with the licensing and purchase fields (`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) `null`. Not the other voices, the full score, any list of the org (arrangements, voices, members, collections), global annotations, or any write.
   - **A refusal is `403`**, whether or not the target exists, as it is for every non-member: a guest learns nothing about the org's other repertoire (the same principle as the WebDAV PROPFIND scope).
   - **Finding the parts:** `GET /v1/me/parts` (#98) lists the caller's live assignments across every organization, members' and guests' alike, each with the organization, collection, piece and voice to open. It uses the same liveness as `domain::access`, so every listed part opens. Paginated; sorts `organization` (default), `collection`, `position`, `notifiedAt`, `acknowledgedAt`; filters `organizationId`, `collectionId`, `acknowledged`.
@@ -284,6 +289,9 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 | Part assignments | ✓ | ✓ | ✓ | |
 | Read assigned parts | ✓ | ✓ | ✓ | ✓ |
 | Read the whole archive (all arrangements, voices, scores) | ✓ | ✓ | ✓ | if the org opens it |
+| Read collections (items, sections), tags | ✓ | ✓ | ✓ | those holding their parts; all if the org opens the archive |
+| Read part assignments | ✓ | ✓ | ✓ | own only |
+| Read the roster (members, roles) | ✓ | ✓ | ✓ | ✓ |
 | Personal annotations (own) | ✓ | ✓ | ✓ | ✓ |
 
 "Org settings" today is one setting: `musicians_read_archive`, which opens the

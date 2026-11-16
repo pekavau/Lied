@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        FROM part_assignment\n        WHERE collection_item_id = $1\n        ORDER BY created_at DESC, id ASC\n        LIMIT $2 OFFSET $3\n        ",
+  "query": "\n        SELECT\n            id, collection_item_id, user_id, voice_id,\n            notified_at as \"notified_at: DateTime<Utc>\",\n            acknowledged_at as \"acknowledged_at: DateTime<Utc>\",\n            created_at as \"created_at: DateTime<Utc>\",\n            updated_at as \"updated_at: DateTime<Utc>\",\n            created_by\n        FROM part_assignment\n        WHERE collection_item_id = $1\n          AND ($4::uuid IS NULL OR user_id = $4)\n        ORDER BY created_at DESC, id ASC\n        LIMIT $2 OFFSET $3\n        ",
   "describe": {
     "columns": [
       {
@@ -53,7 +53,8 @@
       "Left": [
         "Uuid",
         "Int8",
-        "Int8"
+        "Int8",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -68,5 +69,5 @@
       true
     ]
   },
-  "hash": "dca8b5624ae3813f337609278742cb28b047c4c5730fc6c00fb41bc81d213cd5"
+  "hash": "5b9f50cb7311d71c72ee91e5a03466e64bb7227e65970594304829c02ff424dc"
 }

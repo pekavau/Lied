@@ -183,11 +183,16 @@ pub async fn list_for_item_voice(
 }
 
 /// One page of a collection item's assignments, newest first.
+///
+/// `only_user`: `Some(user)` keeps only that user's own assignments (anyone
+/// but staff reads only their own, #123); `None` lists everyone's. The total
+/// counts within that set.
 pub async fn list_for_item(
     pool: &PgPool,
     collection_item_id: Uuid,
     limit: i64,
     offset: i64,
+    only_user: Option<Uuid>,
 ) -> Result<(Vec<PartAssignment>, i64), sqlx::Error> {
     let rows = sqlx::query_as!(
         PartAssignment,
@@ -201,19 +206,23 @@ pub async fn list_for_item(
             created_by
         FROM part_assignment
         WHERE collection_item_id = $1
+          AND ($4::uuid IS NULL OR user_id = $4)
         ORDER BY created_at DESC, id ASC
         LIMIT $2 OFFSET $3
         "#,
         collection_item_id,
         limit,
         offset,
+        only_user,
     )
     .fetch_all(pool)
     .await?;
 
     let total = sqlx::query_scalar!(
-        r#"SELECT count(*) as "count!" FROM part_assignment WHERE collection_item_id = $1"#,
+        r#"SELECT count(*) as "count!" FROM part_assignment
+           WHERE collection_item_id = $1 AND ($2::uuid IS NULL OR user_id = $2)"#,
         collection_item_id,
+        only_user,
     )
     .fetch_one(pool)
     .await?;

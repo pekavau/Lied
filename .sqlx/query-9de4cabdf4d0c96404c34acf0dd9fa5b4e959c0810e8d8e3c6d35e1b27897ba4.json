@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT t.organization_id\n           FROM tag t\n           WHERE t.id = $2\n             AND t.deleted_at IS NULL\n             AND EXISTS (\n                 SELECT 1 FROM arrangement_tag at\n                 JOIN arrangement a ON a.id = at.arrangement_id\n                 JOIN voice v ON v.arrangement_id = a.id\n                 JOIN part_assignment pa ON pa.voice_id = v.id\n                 JOIN collection_item ci ON ci.id = pa.collection_item_id\n                 JOIN collection c ON c.id = ci.collection_id\n                 WHERE at.tag_id = t.id AND pa.user_id = $1\n                   AND a.deleted_at IS NULL\n                   AND v.deleted_at IS NULL\n                   AND ci.deleted_at IS NULL AND c.deleted_at IS NULL\n             )",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9de4cabdf4d0c96404c34acf0dd9fa5b4e959c0810e8d8e3c6d35e1b27897ba4"
+}

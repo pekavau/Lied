@@ -186,6 +186,12 @@ pub async fn find_by_id_including_deleted(
 
 /// One page of an organization's collections + total live count, with an
 /// allowlisted sort and optional exact `type` filter. Soft-deleted excluded.
+///
+/// `assigned_to`: `Some(user)` keeps only the collections that user holds a
+/// live part assignment in (a restricted reader's view, #123; see
+/// [`crate::domain::access::assigned_collection`]); `None` lists them all.
+/// The total counts within that set.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_for_org(
     pool: &PgPool,
     organization_id: Uuid,
@@ -194,8 +200,10 @@ pub async fn list_for_org(
     sort_column: &str,
     sort_direction: crate::listing::SortDirection,
     type_filter: Option<&str>,
+    assigned_to: Option<Uuid>,
 ) -> Result<(Vec<Collection>, i64), sqlx::Error> {
     let direction = sort_direction.as_sql();
+    let assigned = crate::domain::access::live_assignment_in_collection_sql("$5", "collection.id");
     // Dynamic ORDER BY over allowlisted, fixed fragments only (see
     // `arrangement::list_for_org` for why this is injection-safe).
     let query = format!(
@@ -208,6 +216,7 @@ pub async fn list_for_org(
         WHERE organization_id = $3
           AND deleted_at IS NULL
           AND ($4::text IS NULL OR type = $4)
+          AND ($5::uuid IS NULL OR {assigned})
         ORDER BY {sort_column} {direction}, id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -218,6 +227,7 @@ pub async fn list_for_org(
         .bind(offset)
         .bind(organization_id)
         .bind(type_filter)
+        .bind(assigned_to)
         .fetch_all(pool)
         .await?;
 
@@ -225,15 +235,20 @@ pub async fn list_for_org(
     let total = match rows.first() {
         Some(row) => row.try_get::<i64, _>("total")?,
         None => {
-            sqlx::query_scalar::<_, i64>(
+            let assigned =
+                crate::domain::access::live_assignment_in_collection_sql("$3", "collection.id");
+            let count_query = format!(
                 r#"SELECT count(*) FROM collection
                    WHERE organization_id = $1 AND deleted_at IS NULL
-                     AND ($2::text IS NULL OR type = $2)"#,
-            )
-            .bind(organization_id)
-            .bind(type_filter)
-            .fetch_one(pool)
-            .await?
+                     AND ($2::text IS NULL OR type = $2)
+                     AND ($3::uuid IS NULL OR {assigned})"#
+            );
+            sqlx::query_scalar::<_, i64>(&count_query)
+                .bind(organization_id)
+                .bind(type_filter)
+                .bind(assigned_to)
+                .fetch_one(pool)
+                .await?
         }
     };
 

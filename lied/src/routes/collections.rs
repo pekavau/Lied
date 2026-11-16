@@ -1,7 +1,9 @@
 //! `/v1/orgs/{orgId}/collections` and `.../collections/{collectionId}/items` — issue #9
 //! (Collections + CollectionItems: program assembly and standing repertoire).
 //!
-//! Reads require any org membership (`musician`+); writes (build/edit) require
+//! Reads require org membership and follow the reader's read scope (#123: a
+//! restricted musician sees only the collections and items holding their
+//! parts); writes (build/edit) require
 //! `owner`/`archivist`/`conductor` (docs/design.md Permission matrix), enforced via
 //! [`require_collection_editor_v1`]. Optimistic concurrency (ETag/`If-Match`),
 //! RFC 7807 errors, and an `audit()` on every write, per the API guidelines.
@@ -15,11 +17,11 @@ use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::auth::authz::{
-    require_collection_editor_v1, require_coverage_viewer_v1, require_org_role_v1, CoverageScope,
+    require_archive_lister_v1, require_collection_editor_v1, require_collection_item_reader_v1,
+    require_collection_reader_v1, require_coverage_viewer_v1, CoverageScope,
 };
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::membership::Role;
 use crate::domain::{collection, collection_item, coverage};
 use crate::error::AppError;
 use crate::listing::{self};
@@ -201,7 +203,8 @@ struct UpdateCollectionRequest {
     number_width: Option<i16>,
 }
 
-/// List an organization's collections (requires org membership).
+/// List an organization's collections (members; a restricted musician sees
+/// only those holding their parts).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections",
@@ -233,7 +236,11 @@ async fn list_collections(
         filters: raw_filters,
     }: ApiListQuery<ListQuery>,
 ) -> Result<Json<Page<collection::Collection>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    // A restricted musician lists only the collections they hold a part in
+    // (#123), and the type filter and total apply within that set, as the
+    // WebDAV collections tree shows them.
+    let scope = require_archive_lister_v1(&state, &auth, org_id).await?;
+    let assigned_to = (!scope.reads_everything()).then_some(auth.user.id);
 
     let (limit, offset) = crate::pagination::PageParams {
         limit: q.limit,
@@ -262,6 +269,7 @@ async fn list_collections(
         sort_column,
         sort_direction,
         type_filter,
+        assigned_to,
     )
     .await?;
 
@@ -354,7 +362,8 @@ async fn create_collection(
     ))
 }
 
-/// Fetch one collection (requires org membership).
+/// Fetch one collection (members; a restricted musician only one holding
+/// their parts, else 403).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}",
@@ -379,7 +388,7 @@ async fn get_collection(
     State(state): State<AppState>,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_collection_reader_v1(&state, &auth, org_id, id).await?;
     let found = find_collection_scoped(&state, org_id, id).await?;
     let updated_at = found.updated_at;
     Ok(etag_response(found, updated_at))
@@ -675,7 +684,8 @@ async fn reorder_items(
 
 // ── CollectionItem ─────────────────────────────────────────────────────────
 
-/// List a collection's items in position order (requires org membership).
+/// List a collection's items in position order (members; a restricted
+/// musician sees only the items they play).
 /// Display each item's `label`. A soft-deleted arrangement is surfaced with
 /// `arrangementRemoved: true` and its slug, not dropped (hide-with-references).
 #[utoipa::path(
@@ -702,9 +712,11 @@ async fn list_items(
     State(state): State<AppState>,
     Path((org_id, id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<collection_item::CollectionItemView>>, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    // A restricted musician sees only the items they hold a part on (#123).
+    let scope = require_collection_reader_v1(&state, &auth, org_id, id).await?;
     find_collection_scoped(&state, org_id, id).await?;
-    let items = collection_item::list_for_collection(&state.db, id).await?;
+    let assigned_to = (!scope.reads_everything()).then_some(auth.user.id);
+    let items = collection_item::list_for_collection(&state.db, id, assigned_to).await?;
     Ok(Json(items))
 }
 
@@ -808,7 +820,8 @@ async fn add_item(
     ))
 }
 
-/// Fetch one collection item (requires org membership).
+/// Fetch one collection item (members; a restricted musician only one they
+/// play, else 403).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/collections/{collectionId}/items/{itemId}",
@@ -834,7 +847,7 @@ async fn get_item(
     State(state): State<AppState>,
     Path((org_id, collection_id, item_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<axum::response::Response, AppError> {
-    require_org_role_v1(&state, &auth, org_id, Role::Musician).await?;
+    require_collection_item_reader_v1(&state, &auth, org_id, collection_id, item_id).await?;
     let item = find_item_scoped(&state, org_id, collection_id, item_id, false).await?;
     let updated_at = item.updated_at;
     Ok(etag_response(item, updated_at))
