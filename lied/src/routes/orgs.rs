@@ -24,7 +24,7 @@ use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::{self, Role};
 use crate::domain::{organization, user};
 use crate::error::AppError;
-use crate::listing::{self, etag_response, if_match_header};
+use crate::listing::{self, etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
@@ -227,7 +227,7 @@ async fn create_org(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<CreateOrgRequest>,
-) -> Result<(StatusCode, Json<OrganizationResponse>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_system_admin(&auth.user)?;
 
     if body.name.trim().is_empty() {
@@ -264,7 +264,12 @@ async fn create_org(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created.into())))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        OrganizationResponse::from(created),
+        updated_at,
+    ))
 }
 
 /// Fetch one organization by ID.
@@ -600,7 +605,7 @@ async fn create_user(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<CreateUserRequest>,
-) -> Result<(StatusCode, Json<user::User>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_system_admin(&auth.user)?;
 
     if body.username.trim().is_empty() || body.password.is_empty() {
@@ -658,7 +663,12 @@ async fn create_user(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 /// Fetch one user by ID (system-admin only).
@@ -933,7 +943,7 @@ async fn create_member(
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
     ApiJson(body): ApiJson<CreateMemberRequest>,
-) -> Result<(StatusCode, Json<MembershipResponse>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Owner).await?;
 
     let role = parse_role_or_validation_error(&body.role)?;
@@ -978,7 +988,12 @@ async fn create_member(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created.into())))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        MembershipResponse::from(created),
+        updated_at,
+    ))
 }
 
 fn membership_error_to_app_error(err: membership::MembershipError) -> AppError {

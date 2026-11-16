@@ -520,13 +520,18 @@ pub async fn soft_delete(
 
 /// Undelete: clears `deleted_at`. Returns `false` if no soft-deleted row
 /// matched `id`.
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// Fails with [`VoiceError::DuplicateSlug`] if a live voice of the arrangement
+/// has since taken its slug (the unique index covers live rows
+/// only), rather than with a raw database error (#125).
+pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, VoiceError> {
     let result = sqlx::query!(
         r#"UPDATE voice SET deleted_at = NULL, updated_at = now() WHERE id = $1 AND deleted_at IS NOT NULL"#,
         id,
     )
     .execute(pool)
-    .await?;
+    .await
+    .map_err(map_write_error)?;
     Ok(result.rows_affected() > 0)
 }
 

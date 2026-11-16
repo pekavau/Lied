@@ -324,13 +324,18 @@ pub async fn soft_delete(
 }
 
 /// Undelete a tag.
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// Fails with [`TagError::Duplicate`] if a live tag has since taken its name
+/// and kind (the unique index covers live rows
+/// only), rather than with a raw database error (#125).
+pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, TagError> {
     let result = sqlx::query!(
         r#"UPDATE tag SET deleted_at = NULL, updated_at = now() WHERE id = $1 AND deleted_at IS NOT NULL"#,
         id,
     )
     .execute(pool)
-    .await?;
+    .await
+    .map_err(map_write_error)?;
     Ok(result.rows_affected() > 0)
 }
 
