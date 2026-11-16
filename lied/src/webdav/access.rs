@@ -3,11 +3,15 @@
 //! Implements the read-filtering and PROPFIND root-scope rules from docs/design.md
 //! ("WebDAV layout" → collections-subtree visibility + PROPFIND scope):
 //!
-//! - **Staff** (`owner` / `archivist` / `conductor`) see every arrangement in
-//!   the org and the full score.
-//! - **Restricted** — a `musician` member, or a guest/substitute with *no*
-//!   membership who reaches the tree via a `PartAssignment` — see only
+//! - **Staff** (`owner` / `archivist` / `conductor`), and a `musician` of an
+//!   org that opened its archive to musicians (`musicians_read_archive`,
+//!   #119), see every arrangement in the org and the full score.
+//! - **Restricted** — any other `musician` member, or a guest/substitute with
+//!   *no* membership who reaches the tree via a `PartAssignment` — see only
 //!   arrangements where they hold ≥1 part assignment, and never the full score.
+//!
+//! The scope itself is [`crate::domain::access::read_scope`], shared with
+//! `/v1`. What may be *written* is decided by role, never by visibility.
 //!
 //! Soft-deleted rows are always hidden. These are the DB queries the
 //! `DavFileSystem` layer calls from `read_dir`/`metadata`; keeping them here
@@ -18,31 +22,9 @@ use uuid::Uuid;
 
 use crate::domain::membership::Role;
 
-/// How much of an org's arrangements tree a user may see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Visibility {
-    /// `owner` / `archivist` / `conductor`: all arrangements + full scores.
-    Staff,
-    /// `musician` member or guest (assignment-only): assigned arrangements,
-    /// full score hidden.
-    Restricted,
-}
-
-impl Visibility {
-    pub fn is_staff(self) -> bool {
-        matches!(self, Visibility::Staff)
-    }
-}
-
-/// Classify a membership role (or its absence) into a [`Visibility`]. `None`
-/// means no membership in the org — a guest/substitute reaching the tree via a
-/// part assignment — which is restricted.
-pub fn visibility_for(role: Option<Role>) -> Visibility {
-    match role {
-        Some(Role::Owner | Role::Archivist | Role::Conductor) => Visibility::Staff,
-        Some(Role::Musician) | None => Visibility::Restricted,
-    }
-}
+/// How much of an org's arrangements tree a user may see: the shared
+/// [`crate::domain::access::ReadScope`], so WebDAV and `/v1` cannot disagree.
+pub use crate::domain::access::ReadScope as Visibility;
 
 /// Resolve an org slug to its id. Organizations have no soft-delete.
 pub async fn find_org_id(pool: &PgPool, org_slug: &str) -> Result<Option<Uuid>, sqlx::Error> {
@@ -82,8 +64,9 @@ pub async fn resolve_org_visibility(
     let Some(org_id) = find_org_id(pool, org_slug).await? else {
         return Ok(None);
     };
-    let role = role_in_org(pool, org_id, user_id).await?;
-    Ok(Some((org_id, visibility_for(role))))
+    Ok(crate::domain::access::read_scope(pool, org_id, user_id)
+        .await?
+        .map(|scope| (org_id, scope)))
 }
 
 /// The arrangement slugs a user may see at the arrangements root, honoring the
@@ -96,7 +79,7 @@ pub async fn visible_arrangement_slugs(
     user_id: Uuid,
     visibility: Visibility,
 ) -> Result<Vec<String>, sqlx::Error> {
-    if visibility.is_staff() {
+    if visibility.reads_everything() {
         sqlx::query_scalar!(
             r#"SELECT slug FROM arrangement
                WHERE organization_id = $1 AND deleted_at IS NULL
@@ -131,7 +114,7 @@ pub async fn visible_arrangement_slugs(
 
 /// Whether a restricted user may see a specific arrangement: holds a live
 /// part assignment on one of its voices. Staff always may; callers should
-/// short-circuit on [`Visibility::is_staff`] before calling this. The rule is
+/// short-circuit on [`Visibility::reads_everything`] before calling this. The rule is
 /// [`crate::domain::access::assigned_arrangement`], shared with `/v1`.
 pub async fn has_assignment_on_arrangement(
     pool: &PgPool,
@@ -175,7 +158,7 @@ pub async fn has_assignment_on_voice(
 
 /// Whether a restricted user may see a collection at all — i.e. holds >=1
 /// part assignment on one of its live items. Staff always may; callers
-/// should short-circuit on [`Visibility::is_staff`] before calling this.
+/// should short-circuit on [`Visibility::reads_everything`] before calling this.
 pub async fn has_assignment_in_collection(
     pool: &PgPool,
     collection_id: Uuid,
@@ -267,7 +250,7 @@ pub async fn visible_collection_slugs(
     user_id: Uuid,
     visibility: Visibility,
 ) -> Result<Vec<String>, sqlx::Error> {
-    if visibility.is_staff() {
+    if visibility.reads_everything() {
         sqlx::query_scalar!(
             r#"SELECT slug FROM collection
                WHERE organization_id = $1 AND deleted_at IS NULL
@@ -330,7 +313,7 @@ pub async fn visible_collection_items(
     user_id: Uuid,
     visibility: Visibility,
 ) -> Result<Vec<VisibleCollectionItem>, sqlx::Error> {
-    if visibility.is_staff() {
+    if visibility.reads_everything() {
         let rows = sqlx::query!(
             r#"SELECT ci.id, ci.label, c.number_width, a.slug as arrangement_slug
                FROM collection_item ci
@@ -406,23 +389,4 @@ pub async fn visible_org_slugs(pool: &PgPool, user_id: Uuid) -> Result<Vec<Strin
     )
     .fetch_all(pool)
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn staff_roles_map_to_staff_visibility() {
-        assert!(visibility_for(Some(Role::Owner)).is_staff());
-        assert!(visibility_for(Some(Role::Archivist)).is_staff());
-        assert!(visibility_for(Some(Role::Conductor)).is_staff());
-    }
-
-    #[test]
-    fn musician_and_guest_are_restricted() {
-        assert!(!visibility_for(Some(Role::Musician)).is_staff());
-        // No membership at all (guest/substitute) → restricted.
-        assert!(!visibility_for(None).is_staff());
-    }
 }

@@ -198,6 +198,8 @@ async fn search_page(
         instrument_id: Some(form.instrument_id.trim())
             .filter(|value| !value.is_empty())
             .and_then(|value| parse_id(value, "Instrument", &mut complaints)),
+        // The search screen is staff-only: every arrangement.
+        assigned_to: None,
     };
 
     let has_query = search.q.is_some();

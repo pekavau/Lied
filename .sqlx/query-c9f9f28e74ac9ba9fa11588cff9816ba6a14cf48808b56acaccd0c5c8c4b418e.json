@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT o.musicians_read_archive, m.role AS \"role?\"\n           FROM organization o\n           LEFT JOIN membership m ON m.organization_id = o.id AND m.user_id = $2\n           WHERE o.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "musicians_read_archive",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "role?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c9f9f28e74ac9ba9fa11588cff9816ba6a14cf48808b56acaccd0c5c8c4b418e"
+}

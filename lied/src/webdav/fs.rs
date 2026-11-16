@@ -155,7 +155,7 @@ impl LiedFs {
             .arr_id_by_slug(org_id, arr)
             .await?
             .ok_or(FsError::NotFound)?;
-        if !vis.is_staff()
+        if !vis.reads_everything()
             && !access::has_assignment_on_arrangement(&self.state.db, arr_id, self.user_id)
                 .await
                 .map_err(db_err)?
@@ -168,8 +168,10 @@ impl LiedFs {
     /// Resolve an arrangement for a *file-writing* op. Only `owner`/`archivist`
     /// may upload/edit arrangement files (docs/design.md permission matrix). Note
     /// this is stricter than [`Visibility::Staff`], which also covers
-    /// `conductor` — a conductor has read + collections but not file writes, so
-    /// visibility (a read concept) must not be reused to authorize writes.
+    /// `conductor` — a conductor has read + collections but not file writes —
+    /// and than [`Visibility::Archive`], a musician who reads the whole archive
+    /// and writes none of it (#119). Visibility is a read concept and must not
+    /// be reused to authorize writes.
     async fn resolve_arr_for_write(&self, org: &str, arr: &str) -> FsResult<(Uuid, Uuid)> {
         let (org_id, arr_id, _vis) = self.resolve_arr(org, arr).await?;
         let role = access::role_in_org(&self.state.db, org_id, self.user_id)
@@ -194,7 +196,7 @@ impl LiedFs {
             .voice_id_by_slug(arr_id, voice)
             .await?
             .ok_or(FsError::NotFound)?;
-        if !vis.is_staff()
+        if !vis.reads_everything()
             && !access::has_assignment_on_voice(&self.state.db, voice_id, self.user_id)
                 .await
                 .map_err(db_err)?
@@ -233,7 +235,7 @@ impl LiedFs {
     /// Voice `(id, slug)` pairs a user may see under an arrangement: staff see
     /// all live voices; a restricted user sees only assigned ones.
     async fn visible_voices(&self, arr_id: Uuid, vis: Visibility) -> FsResult<Vec<(Uuid, String)>> {
-        let rows = if vis.is_staff() {
+        let rows = if vis.reads_everything() {
             sqlx::query!(
                 r#"SELECT id, slug FROM voice
                    WHERE arrangement_id = $1 AND deleted_at IS NULL ORDER BY slug"#,
@@ -315,7 +317,7 @@ impl LiedFs {
             .await?
             .ok_or(FsError::NotFound)?;
         if check_assignment
-            && !vis.is_staff()
+            && !vis.reads_everything()
             && !access::has_assignment_in_collection(&self.state.db, coll_id, self.user_id)
                 .await
                 .map_err(db_err)?
@@ -378,7 +380,7 @@ impl LiedFs {
         }
 
         if check_assignment
-            && !vis.is_staff()
+            && !vis.reads_everything()
             && !access::has_assignment_on_item(&self.state.db, row.item_id, self.user_id)
                 .await
                 .map_err(db_err)?
@@ -417,7 +419,7 @@ impl LiedFs {
             .voice_id_by_slug(arr_id, voice)
             .await?
             .ok_or(FsError::NotFound)?;
-        if !vis.is_staff()
+        if !vis.reads_everything()
             && !access::has_assignment_on_item_voice(
                 &self.state.db,
                 item_id,
@@ -443,7 +445,7 @@ impl LiedFs {
         arr_id: Uuid,
         vis: Visibility,
     ) -> FsResult<Vec<(Uuid, String)>> {
-        let rows = if vis.is_staff() {
+        let rows = if vis.reads_everything() {
             sqlx::query!(
                 r#"SELECT id, slug FROM voice
                    WHERE arrangement_id = $1 AND deleted_at IS NULL ORDER BY slug"#,
@@ -544,7 +546,7 @@ impl LiedFs {
             ScoreDir { org, arr } => {
                 let (_o, _a, vis) = self.resolve_arr(org, arr).await?;
                 // Full score is invisible to restricted users.
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 Ok(LiedMeta::dir())
@@ -562,7 +564,7 @@ impl LiedFs {
 
             ScoreFile { org, arr, file } => {
                 let (_o, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 self.stat_org_file(arr_id, None, file).await
@@ -619,7 +621,7 @@ impl LiedFs {
                 let (.., vis) = self
                     .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 Ok(LiedMeta::dir())
@@ -655,7 +657,7 @@ impl LiedFs {
                 let (_o, _c, _i, arr_id, _arr_slug, vis) = self
                     .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 self.stat_org_file(arr_id, None, file).await
@@ -828,14 +830,14 @@ impl LiedFs {
             }
             Arrangement { org, arr } => {
                 let (_o, _a, vis) = self.resolve_arr(org, arr).await?;
-                if vis.is_staff() {
+                if vis.reads_everything() {
                     out.push(dir_entry("score", LiedMeta::dir()));
                 }
                 out.push(dir_entry("voices", LiedMeta::dir()));
             }
             ScoreDir { org, arr } => {
                 let (_o, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 for e in self.file_entries(org, arr, None, arr_id, None).await? {
@@ -920,7 +922,7 @@ impl LiedFs {
                 let (.., vis) = self
                     .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
-                if vis.is_staff() {
+                if vis.reads_everything() {
                     out.push(dir_entry("score", LiedMeta::dir()));
                 }
                 out.push(dir_entry("voices", LiedMeta::dir()));
@@ -934,7 +936,7 @@ impl LiedFs {
                 let (_o, _c, _i, arr_id, arr_slug, vis) = self
                     .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 for e in self
@@ -1349,7 +1351,7 @@ impl LiedFs {
         match rp {
             ScoreFile { org, arr, file } => {
                 let (_o, arr_id, vis) = self.resolve_arr(org, arr).await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 self.org_file_key(org, arr, None, arr_id, None, file).await
@@ -1392,7 +1394,7 @@ impl LiedFs {
                 let (_o, _c, _i, arr_id, arr_slug, vis) = self
                     .resolve_collection_item(org, coll, label, arr_slug)
                     .await?;
-                if !vis.is_staff() {
+                if !vis.reads_everything() {
                     return Err(FsError::NotFound);
                 }
                 self.org_file_key(org, &arr_slug, None, arr_id, None, file)

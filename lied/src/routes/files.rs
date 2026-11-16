@@ -22,7 +22,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use uuid::Uuid;
 
-use crate::auth::authz::{require_org_role_v1, require_voice_reader_v1};
+use crate::auth::authz::{require_org_role_v1, require_score_reader_v1, require_voice_reader_v1};
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::audit_log::{audit, AuditContext};
 use crate::domain::membership::Role;
@@ -366,9 +366,10 @@ async fn upload_voice_file(
 // ---------------------------------------------------------------------------
 
 /// Read access to a voice's files (`voice_id`) or the arrangement's full
-/// score (`None`). A voice's files are open to a guest with a live part
-/// assignment on that voice (#99); the full score stays member-only, as over
-/// WebDAV.
+/// score (`None`), by the caller's read scope (#119): a voice's files are open
+/// to whoever reads the voice (staff, an archive-reading musician, or a
+/// musician or guest with a live part assignment on it, #99); the full score
+/// only to staff and archive-reading musicians, as over WebDAV.
 async fn require_file_reader(
     state: &AppState,
     auth: &BearerOrSession,
@@ -380,7 +381,7 @@ async fn require_file_reader(
         Some(voice_id) => require_voice_reader_v1(state, auth, org_id, arr_id, voice_id)
             .await
             .map(|_| ()),
-        None => require_org_role_v1(state, auth, org_id, Role::Musician)
+        None => require_score_reader_v1(state, auth, org_id)
             .await
             .map(|_| ()),
     }
@@ -452,7 +453,8 @@ async fn do_download(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("failed to build response: {e}")))
 }
 
-/// Download a full-score file (requires `musician` role). Supports HTTP `Range`.
+/// Download a full-score file (staff, or any musician if the org opened its
+/// archive: `musiciansReadArchive`). Supports HTTP `Range`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/files/{fileId}",
@@ -493,8 +495,8 @@ async fn download_score_file(
     do_download(state, auth, org_id, arr_id, None, file_id, headers).await
 }
 
-/// Download a voice file (requires `musician` role, or a guest's part
-/// assignment on this voice). Supports HTTP `Range`.
+/// Download a voice file (whoever may read the voice: staff, a musician of an
+/// open archive, or a part assignment on this voice). Supports HTTP `Range`.
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files/{fileId}",
@@ -592,7 +594,8 @@ async fn do_list(
     }))
 }
 
-/// List full-score files for an arrangement (requires `musician` role).
+/// List full-score files for an arrangement (staff, or any musician if the
+/// org opened its archive: `musiciansReadArchive`).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/files",
@@ -623,8 +626,8 @@ async fn list_score_files(
     do_list(state, auth, org_id, arr_id, None, q).await
 }
 
-/// List voice files for a specific voice (requires `musician` role, or a
-/// guest's part assignment on this voice).
+/// List voice files for a specific voice (whoever may read the voice: staff,
+/// a musician of an open archive, or a part assignment on this voice).
 #[utoipa::path(
     get,
     path = "/orgs/{orgId}/arrangements/{arrangementId}/voices/{voiceId}/files",

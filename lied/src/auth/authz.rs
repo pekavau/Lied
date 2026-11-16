@@ -25,7 +25,7 @@
 use uuid::Uuid;
 
 use crate::auth::extractors::{AuthSession, BearerOrSession};
-use crate::domain::access;
+use crate::domain::access::{self, ReadScope};
 use crate::domain::membership::{self, Role};
 use crate::domain::user::User;
 use crate::error::AppError;
@@ -105,66 +105,108 @@ pub async fn require_org_role_v1(
     require_org_role(state, &auth.user, organization_id, minimum).await
 }
 
-/// How a caller may read an org's arrangement data on `/v1` (#99).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reader {
-    /// A member of the org, of any role, or a system admin: the member read
-    /// rules.
-    Member,
-    /// A guest: no membership, but a live part assignment
-    /// ([`crate::domain::access`]). Reads only what the assignment grants:
-    /// the assigned voice, its files, and its arrangement's summary.
-    Guest,
+/// The caller's [`ReadScope`] in `organization_id`: a system admin reads as
+/// staff (owner-equivalent, as with [`require_org_role`]); anyone else gets
+/// [`access::read_scope`], and a missing organization reads as
+/// [`ReadScope::Restricted`] (whose assignment checks then refuse with `403`,
+/// so a non-member learns nothing about which orgs exist).
+async fn caller_scope(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    if auth.user.is_system_admin {
+        return Ok(ReadScope::Staff);
+    }
+    Ok(access::read_scope(&state.db, organization_id, auth.user.id)
+        .await?
+        .unwrap_or(ReadScope::Restricted))
+}
+
+/// Require the caller to be a member of `organization_id` (any role) or a
+/// system admin, and return their [`ReadScope`]: for the org-wide archive
+/// lists (arrangements, a piece's voices), which a
+/// [`ReadScope::Restricted`] member sees filtered to their assignments
+/// (#119) and a guest not at all.
+pub async fn require_archive_lister_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    require_org_role_v1(state, auth, organization_id, Role::Musician).await?;
+    caller_scope(state, auth, organization_id).await
 }
 
 /// Require the caller to read arrangement `arrangement_id` of
-/// `organization_id`: a member (any role), or a guest holding a live part
-/// assignment on one of its voices. Anything else is `403`, whether or not
-/// the arrangement exists, as for every non-member before #99, so a guest
-/// learns nothing about the org's other repertoire.
+/// `organization_id`, and return their [`ReadScope`]:
+///
+/// - staff, a system admin, or an [`ReadScope::Archive`] musician read every
+///   arrangement;
+/// - a [`ReadScope::Restricted`] reader (a musician of an org that keeps its
+///   archive closed, or a guest) reads one only while holding a live part
+///   assignment on one of its voices ([`access::assigned_arrangement`]), and
+///   gets its summary.
+///
+/// Anything else is `403`, whether or not the arrangement exists, so a
+/// restricted reader learns nothing about the org's other repertoire.
 pub async fn require_arrangement_reader_v1(
     state: &AppState,
     auth: &BearerOrSession,
     organization_id: Uuid,
     arrangement_id: Uuid,
-) -> Result<Reader, AppError> {
-    match require_org_role_v1(state, auth, organization_id, Role::Musician).await {
-        Ok(_) => Ok(Reader::Member),
-        Err(AppError::Forbidden) => {
-            match access::assigned_arrangement(&state.db, auth.user.id, arrangement_id).await? {
-                Some(org) if org == organization_id => Ok(Reader::Guest),
-                _ => Err(AppError::Forbidden),
-            }
-        }
-        Err(other) => Err(other),
+) -> Result<ReadScope, AppError> {
+    let scope = caller_scope(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        return Ok(scope);
+    }
+    match access::assigned_arrangement(&state.db, auth.user.id, arrangement_id).await? {
+        Some(org) if org == organization_id => Ok(scope),
+        _ => Err(AppError::Forbidden),
     }
 }
 
 /// Require the caller to read voice `voice_id` (and its files) of
-/// `arrangement_id` in `organization_id`: a member (any role), or a guest
-/// holding a live part assignment on exactly this voice. Anything else is
-/// `403`, existing or not (see [`require_arrangement_reader_v1`]).
+/// `arrangement_id` in `organization_id`: as
+/// [`require_arrangement_reader_v1`], except that a
+/// [`ReadScope::Restricted`] reader needs a live part assignment on exactly
+/// this voice ([`access::assigned_voice`]). Anything else is `403`, existing
+/// or not.
 pub async fn require_voice_reader_v1(
     state: &AppState,
     auth: &BearerOrSession,
     organization_id: Uuid,
     arrangement_id: Uuid,
     voice_id: Uuid,
-) -> Result<Reader, AppError> {
-    match require_org_role_v1(state, auth, organization_id, Role::Musician).await {
-        Ok(_) => Ok(Reader::Member),
-        Err(AppError::Forbidden) => {
-            match access::assigned_voice(&state.db, auth.user.id, voice_id).await? {
-                Some(found)
-                    if found.organization_id == organization_id
-                        && found.arrangement_id == arrangement_id =>
-                {
-                    Ok(Reader::Guest)
-                }
-                _ => Err(AppError::Forbidden),
-            }
+) -> Result<ReadScope, AppError> {
+    let scope = caller_scope(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        return Ok(scope);
+    }
+    match access::assigned_voice(&state.db, auth.user.id, voice_id).await? {
+        Some(found)
+            if found.organization_id == organization_id
+                && found.arrangement_id == arrangement_id =>
+        {
+            Ok(scope)
         }
-        Err(other) => Err(other),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+/// Require the caller to read the full score of an arrangement in
+/// `organization_id`: staff, a system admin, or an [`ReadScope::Archive`]
+/// musician. A restricted reader never reads a score, assigned or not, as
+/// over WebDAV. `403` otherwise.
+pub async fn require_score_reader_v1(
+    state: &AppState,
+    auth: &BearerOrSession,
+    organization_id: Uuid,
+) -> Result<ReadScope, AppError> {
+    let scope = caller_scope(state, auth, organization_id).await?;
+    if scope.reads_everything() {
+        Ok(scope)
+    } else {
+        Err(AppError::Forbidden)
     }
 }
 

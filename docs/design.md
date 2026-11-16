@@ -252,7 +252,12 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 **Authorization:**
 - Permissions are scoped to organizations. A user's capabilities within an org are determined by `Membership.role`.
 - No system-wide application roles. An optional `User.is_system_admin` boolean covers instance-level operations (org provisioning, user management).
-- A `PartAssignment` implicitly grants the assigned user **read access to that voice's files** for as long as the assignment exists, regardless of Membership in the org. This is how guests and substitutes access parts.
+- **What a member reads of the archive** (arrangements, voices, full scores and their files) is their **read scope** (#119), decided by `domain::access::read_scope` for WebDAV and `/v1` alike:
+  - **Staff** (`owner`, `archivist`, `conductor`) read everything.
+  - A **`musician`** reads only their assigned parts, the same view a guest gets (below): the arrangement list holds only pieces they hold a part in, and every search facet and the total apply within that set; a piece's voice list holds only their voices; other voices and the full score are `403` on `/v1` and absent over WebDAV.
+  - **Unless the org opens its archive to musicians:** the owner's setting `Organization.musicians_read_archive` (off by default) lets every musician read every arrangement, voice and full score, read-only. Whether that is wanted depends on the ensemble: a small amateur band may want everyone to browse, a large or professional orchestra will not. Writes stay by role; licensing and purchase fields stay staff-only either way.
+  - A **guest** is never widened by the setting.
+- A `PartAssignment` implicitly grants the assigned user **read access to that voice's files** for as long as the assignment exists, regardless of Membership in the org. This is how guests and substitutes access parts, and what a musician of a closed archive reads.
   - **Live only:** the assignment counts while its collection item, collection, voice and arrangement are all live. Removing the piece, or deleting any of them, ends the access; the assignment row stays.
   - **One rule for both surfaces:** `domain::access` (`assigned_voice`, `assigned_arrangement`) decides it for WebDAV and `/v1` alike (#99).
   - **What a guest reads on `/v1`** (no membership, a live assignment): the assigned voice (`GET …/voices/{voiceId}`), its file list and its files (download with `Range`), and the arrangement as a **summary** (`GET …/arrangements/{arrangementId}`): the same response, with the licensing and purchase fields (`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) `null`. Not the other voices, the full score, any list of the org (arrangements, voices, members, collections), global annotations, or any write.
@@ -263,6 +268,7 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 - **Staff** (`owner`, `archivist`, `conductor`) enter their org's workspace; each screen follows the permission matrix, so a conductor builds collections, assigns parts and writes global annotations but sees arrangement, voice and file data read-only.
 - A **principal** (a `musician` with `is_principal`) enters for the **section-coverage screen only**, read-only and scoped to their own section. This is the view the principal flag already grants, not a new permission; the mobile-first version belongs to the phase-3 client.
 - **Every logged-in user**, a plain musician included, reaches the home page and **App passwords** (`/admin/app-passwords`) for their own WebDAV credentials (#88). That grants nothing; it issues the credential WebDAV already requires.
+- The **owner** (or a system admin) also gets **Settings**, the org settings screen (today: opening the archive to musicians, #119).
 - A plain musician has no workspace: their interface is WebDAV.
 
 ### Permission matrix
@@ -277,7 +283,14 @@ tree, `/healthz`, `/readyz`, `/metrics`, serves operators.
 | Global annotations | ✓ | | ✓ | |
 | Part assignments | ✓ | ✓ | ✓ | |
 | Read assigned parts | ✓ | ✓ | ✓ | ✓ |
+| Read the whole archive (all arrangements, voices, scores) | ✓ | ✓ | ✓ | if the org opens it |
 | Personal annotations (own) | ✓ | ✓ | ✓ | ✓ |
+
+"Org settings" today is one setting: `musicians_read_archive`, which opens the
+whole archive to musicians, read-only (#119; console *Settings*, or
+`PATCH /v1/orgs/{orgId}` with `musiciansReadArchive`; audited as
+`organization.settings_change`). Renaming an org stays a system-admin
+operation.
 
 A **guest** (a part assignment without membership) has one row: read assigned parts, under *Auth & access*.
 
@@ -692,17 +705,18 @@ trumpet in the spring concert, which opens with the Radetzky March):
 
 As a musician she sees only the voices she is assigned and no full score;
 the archivist mounting the same URL sees every voice and the `score/`
-directory too.
+directory too. If the town band's owner opens the archive to musicians, Anna
+sees the archivist's tree, but can change nothing in it.
 
 - All path segments are **immutable slugs** stored on the corresponding entity (`Organization.slug`, `Arrangement.slug`, `Voice.slug`, `User.slug`, `Collection.slug`). Slugs are generated from the name/title at creation and do not change when the display name is edited. They are plain ASCII (lowercase letters, numbers, single hyphens), because WebDAV clients and filesystems disagree about Unicode in paths; the name keeps its Unicode. Generation transliterates instead of dropping (#42). The name is first composed (Unicode NFC), so a decomposed `ä` as macOS sends it slugs like a precomposed one; then German umlauts expand (`Märsche` → `maersche`), other accents drop (`Boléro` → `bolero`), other scripts are romanised (`序曲` → `xu-qu`), and a name with nothing transliterable becomes `<entity>-<8 hex>` from a hash of the name, so two such names never collide. The transliteration crate is pinned exactly and its output pinned by tests, since a changed slug for the same title is a breaking change. Renaming a slug *(not yet built)* is a separate, explicit REST operation (admin-gated: requires `Membership.role = owner` for org-scoped entities, or `is_system_admin` for User and Instrument), audited, and reserved for fixing typos. It performs an atomic move of all affected MinIO objects to the new prefix and updates the entity's `slug` field in one transaction; cached WebDAV mounts pointing at the old slug will break.
 - Soft-deleted rows (`deleted_at != NULL`) are hidden from WebDAV listings.
 - The `/orgs/<org>/collections/` subtree is a read-only computed view. Writes go through `/orgs/<org>/arrangements/`.
 - **Collections subtree visibility (auth-filtered):**
   - `owner` / `archivist` / `conductor` see every voice + the full score for each `CollectionItem` — supports program assembly, printing, and the principal coverage workflow.
-  - `musician` sees only the files for voices where they have a `PartAssignment` on that `CollectionItem`. The full score is invisible.
+  - `musician` sees only the files for voices where they have a `PartAssignment` on that `CollectionItem`. The full score is invisible. In an org that opened its archive to musicians (`musicians_read_archive`), a musician sees what staff see, read-only.
   - Guests (PartAssignment without Membership) get the musician's view scoped to their assigned voice(s).
   - The same files are reachable under `/orgs/<org>/arrangements/...` with the same per-role filtering; the collections subtree is the "what's in this concert, in order" view, not a separate permission domain.
-- **PROPFIND scope at the arrangements root.** A `musician` (or guest/substitute) listing `/orgs/<org>/arrangements/` sees **only arrangements where they hold at least one `PartAssignment`** — unassigned arrangements are simply absent, not shown as empty/403 placeholders. Staff roles (`owner`/`archivist`/`conductor`) see all. Rationale: showing every title with locked subdirs would leak the org's full repertoire and naming to guests and clutter a mounted tablet view with hundreds of inaccessible folders; discoverability of "what the org owns" belongs in the admin UI, not the filesystem view. Consistent with the collections-subtree filtering above.
+- **PROPFIND scope at the arrangements root.** A `musician` (or guest/substitute) listing `/orgs/<org>/arrangements/` sees **only arrangements where they hold at least one `PartAssignment`** — unassigned arrangements are simply absent, not shown as empty/403 placeholders. Staff roles (`owner`/`archivist`/`conductor`) see all, and so do musicians of an org that opened its archive to them (`musicians_read_archive`, #119). Rationale: showing every title with locked subdirs would leak the org's full repertoire and naming to guests and clutter a mounted tablet view with hundreds of inaccessible folders; discoverability of "what the org owns" belongs in the admin UI, not the filesystem view. Consistent with the collections-subtree filtering above.
 - `/users/<user>/library/` is private to that user, not bound to any org.
 - **MOVE, COPY and DELETE per tree (#26).**
 
@@ -933,6 +947,7 @@ An orchestra or ensemble.
 |---|---|---|
 | `name` | text | |
 | `slug` | text | Immutable, unique on the instance. |
+| `musicians_read_archive` | boolean | Default `false`. When `true`, every `musician` reads the whole archive, read-only, instead of only their assigned parts (#119; see *Auth & access*). Owner-only. |
 
 Audit fields. No `deleted_at`: deleting an org is an admin-only **hard**
 delete, because the cascade is large and undelete would be messy. It runs in

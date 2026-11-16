@@ -264,7 +264,9 @@ async fn assign(pool: &PgPool, org_id: Uuid, arr_id: Uuid, voice_id: Uuid, user_
            VALUES ($1, $2, 'C', $3, 'program')"#,
         coll,
         org_id,
-        format!("c-{}", &coll.to_string()[..8]),
+        // The whole id: its first hex digits are a UUIDv7's timestamp, the
+        // same for two calls in the same millisecond.
+        format!("c-{}", coll.simple()),
     )
     .execute(pool)
     .await
@@ -1898,4 +1900,118 @@ async fn org_tree_move_copy_and_directory_delete_are_refused() {
     .await
     .unwrap();
     assert_eq!(renamed, 1);
+}
+
+// ── #119: the org's archive setting, over WebDAV as over /v1 ────────────────
+
+async fn propfind_body(ctx: &Ctx, uri: &str, user: &SeededUser) -> (u16, String) {
+    let (status, body) = send(&ctx.app, request("PROPFIND", uri, &basic(user), vec![])).await;
+    (status.as_u16(), String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn get_status(ctx: &Ctx, uri: &str, user: &SeededUser) -> u16 {
+    send(&ctx.app, request("GET", uri, &basic(user), vec![]))
+        .await
+        .0
+        .as_u16()
+}
+
+/// With the archive closed (the default) a musician sees their assigned
+/// parts and nothing else; once the owner opens it they see every
+/// arrangement, voice, score and collection, read-only. A guest sees their
+/// part either way. The rule is `domain::access::read_scope`, which `/v1`
+/// uses too.
+#[tokio::test]
+async fn musicians_see_the_whole_tree_only_when_the_org_opens_its_archive() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let alpha = seed_arr(&ctx.pool, org, "alpha").await;
+    let beta = seed_arr(&ctx.pool, org, "beta").await;
+    let alpha_flute = seed_voice(&ctx.pool, alpha, "flute-1").await;
+    let _alpha_oboe = seed_voice(&ctx.pool, alpha, "oboe-1").await;
+    let _beta_horn = seed_voice(&ctx.pool, beta, "horn-1").await;
+    let arch = seed_user(&ctx.pool, org, "arch", Some("archivist")).await;
+    let muso = seed_user(&ctx.pool, org, "muso", Some("musician")).await;
+    let guest = seed_user(&ctx.pool, org, "guest", None).await;
+    assign(&ctx.pool, org, alpha, alpha_flute, muso.id).await;
+    assign(&ctx.pool, org, alpha, alpha_flute, guest.id).await;
+    // A collection holding only beta, nobody assigned in it.
+    let summer = seed_collection(&ctx.pool, org, "summer").await;
+    seed_item(&ctx.pool, summer, beta, 1).await;
+
+    let files = [
+        "/orgs/acme/arrangements/alpha/voices/flute-1/part.pdf",
+        "/orgs/acme/arrangements/alpha/voices/oboe-1/part.pdf",
+        "/orgs/acme/arrangements/alpha/score/full.pdf",
+        "/orgs/acme/arrangements/beta/voices/horn-1/part.pdf",
+        "/orgs/acme/arrangements/beta/score/full.pdf",
+    ];
+    for uri in files {
+        let (s, _) = send(
+            &ctx.app,
+            request("PUT", uri, &basic(&arch), b"%PDF part".to_vec()),
+        )
+        .await;
+        assert!(s.is_success(), "archivist PUT {uri}: {s}");
+    }
+
+    // ── archive closed ──
+    let (status, root) = propfind_body(&ctx, "/orgs/acme/arrangements", &muso).await;
+    assert_eq!(status, 207);
+    assert!(root.contains("alpha") && !root.contains("beta"), "{root}");
+    let (_, alpha_dir) = propfind_body(&ctx, "/orgs/acme/arrangements/alpha", &muso).await;
+    assert!(!alpha_dir.contains("/score"), "{alpha_dir}");
+    let (_, collections) = propfind_body(&ctx, "/orgs/acme/collections", &muso).await;
+    assert!(!collections.contains("summer"), "{collections}");
+    let statuses: Vec<u16> = get_statuses(&ctx, &files, &muso).await;
+    assert_eq!(statuses, [200, 404, 404, 404, 404]);
+
+    // ── the owner opens the archive ──
+    lied::domain::organization::set_musicians_read_archive(&ctx.pool, org, None, true)
+        .await
+        .unwrap()
+        .expect("org");
+
+    let (_, root) = propfind_body(&ctx, "/orgs/acme/arrangements", &muso).await;
+    assert!(root.contains("alpha") && root.contains("beta"), "{root}");
+    let (_, alpha_dir) = propfind_body(&ctx, "/orgs/acme/arrangements/alpha", &muso).await;
+    assert!(alpha_dir.contains("/score"), "{alpha_dir}");
+    let (_, voices) = propfind_body(&ctx, "/orgs/acme/arrangements/alpha/voices", &muso).await;
+    assert!(voices.contains("oboe-1"), "{voices}");
+    let (_, collections) = propfind_body(&ctx, "/orgs/acme/collections", &muso).await;
+    assert!(collections.contains("summer"), "{collections}");
+    let statuses: Vec<u16> = get_statuses(&ctx, &files, &muso).await;
+    assert_eq!(statuses, [200, 200, 200, 200, 200]);
+
+    // Read-only: no file writes, no deletes.
+    for uri in [files[1], files[4]] {
+        let (s, _) = send(
+            &ctx.app,
+            request("PUT", uri, &basic(&muso), b"%PDF mine".to_vec()),
+        )
+        .await;
+        assert_eq!(s.as_u16(), 403, "PUT {uri}");
+        let (s, _) = send(&ctx.app, request("DELETE", uri, &basic(&muso), vec![])).await;
+        assert_eq!(s.as_u16(), 403, "DELETE {uri}");
+    }
+    assert_eq!(get_status(&ctx, files[1], &arch).await, 200, "file intact");
+
+    // A guest is never widened.
+    let (_, root) = propfind_body(&ctx, "/orgs/acme/arrangements", &guest).await;
+    assert!(root.contains("alpha") && !root.contains("beta"), "{root}");
+    let statuses: Vec<u16> = get_statuses(&ctx, &files, &guest).await;
+    assert_eq!(statuses, [200, 404, 404, 404, 404]);
+
+    // Staff are unchanged.
+    let statuses: Vec<u16> = get_statuses(&ctx, &files, &arch).await;
+    assert_eq!(statuses, [200, 200, 200, 200, 200]);
+}
+
+/// GET each of `uris` as `user`, in order.
+async fn get_statuses(ctx: &Ctx, uris: &[&str], user: &SeededUser) -> Vec<u16> {
+    let mut statuses = Vec::new();
+    for uri in uris {
+        statuses.push(get_status(ctx, uri, user).await);
+    }
+    statuses
 }

@@ -792,6 +792,7 @@
                           "id",
                           "name",
                           "slug",
+                          "musiciansReadArchive",
                           "createdAt",
                           "updatedAt"
                         ],
@@ -803,6 +804,10 @@
                           "id": {
                             "type": "string",
                             "format": "uuid"
+                          },
+                          "musiciansReadArchive": {
+                            "type": "boolean",
+                            "description": "Musicians read the whole archive (every arrangement, voice and score,\nread-only), not only their assigned parts (#119). Off by default; the\nowner sets it."
                           },
                           "name": {
                             "type": "string"
@@ -1384,6 +1389,7 @@
           "arrangements"
         ],
         "summary": "List arrangements",
+        "description": "A musician sees only arrangements they hold a live part assignment in,\nunless the org opened its archive to musicians (`musiciansReadArchive`);\nthe search and every filter apply within that set, and so does `total`.\nAnyone but staff gets summaries (licensing fields `null`).",
         "operationId": "list_arrangements",
         "parameters": [
           {
@@ -1524,7 +1530,7 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "description": "An arrangement. A guest (a part assignment without membership, #99) gets\nthe same shape as a summary: the musical fields as stored, and the\nlicensing and purchase fields (`publisher`, `purchaseDate`,\n`licenseNotes`, `copyCountAllowed`) always `null`.",
+                        "description": "An arrangement. Anyone but staff (a musician, #119, or a guest, a part\nassignment without membership, #99) gets the same shape as a summary: the\nmusical fields as stored, and the licensing and purchase fields\n(`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) always\n`null`.",
                         "required": [
                           "id",
                           "organizationId",
@@ -1873,7 +1879,7 @@
           "arrangements"
         ],
         "summary": "Get an arrangement",
-        "description": "A guest (a live part assignment, no membership) gets the summary: the\nlicensing and purchase fields are `null`. Any other non-member gets `403`.",
+        "description": "Anyone but staff gets the summary: the licensing and purchase fields are\n`null`. Anyone else gets `403`, whether or not the arrangement exists.",
         "operationId": "get_arrangement",
         "parameters": [
           {
@@ -4394,6 +4400,7 @@
           "voices"
         ],
         "summary": "List voices",
+        "description": "A musician of an org that keeps its archive closed lists only their own\nvoices, and only in an arrangement they hold a part in (`403` otherwise).",
         "operationId": "list_voices",
         "parameters": [
           {
@@ -4788,7 +4795,7 @@
           "voices"
         ],
         "summary": "Get a voice",
-        "description": "A guest (a live part assignment, no membership) reads only the voices\nthey are assigned to; any other voice, like any other non-member's\nrequest, is `403`.",
+        "description": "Any other voice, like any other non-member's request, is `403`.",
         "operationId": "get_voice",
         "parameters": [
           {
@@ -13744,7 +13751,7 @@
       },
       "ArrangementResponse": {
         "type": "object",
-        "description": "An arrangement. A guest (a part assignment without membership, #99) gets\nthe same shape as a summary: the musical fields as stored, and the\nlicensing and purchase fields (`publisher`, `purchaseDate`,\n`licenseNotes`, `copyCountAllowed`) always `null`.",
+        "description": "An arrangement. Anyone but staff (a musician, #119, or a guest, a part\nassignment without membership, #99) gets the same shape as a summary: the\nmusical fields as stored, and the licensing and purchase fields\n(`publisher`, `purchaseDate`, `licenseNotes`, `copyCountAllowed`) always\n`null`.",
         "required": [
           "id",
           "organizationId",
@@ -15072,6 +15079,7 @@
           "id",
           "name",
           "slug",
+          "musiciansReadArchive",
           "createdAt",
           "updatedAt"
         ],
@@ -15083,6 +15091,10 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "musiciansReadArchive": {
+            "type": "boolean",
+            "description": "Musicians read the whole archive (every arrangement, voice and score,\nread-only), not only their assigned parts (#119). Off by default; the\nowner sets it."
           },
           "name": {
             "type": "string"
@@ -15805,13 +15817,21 @@
       },
       "UpdateOrgRequest": {
         "type": "object",
-        "description": "Request body for `PATCH /v1/orgs/{orgId}`: a partial update; an omitted\n`name` is kept. The slug never changes here (slug rename is its own,\nadmin-gated operation).",
+        "description": "Request body for `PATCH /v1/orgs/{orgId}`: a partial update; an omitted\nfield is kept. The slug never changes here (slug rename is its own,\nadmin-gated operation).",
         "properties": {
+          "musiciansReadArchive": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Open the whole archive to musicians, read-only (owner or system admin;\n#119)."
+          },
           "name": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Rename the organization (system admin only)."
           }
         },
         "additionalProperties": false

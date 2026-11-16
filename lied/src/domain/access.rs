@@ -1,14 +1,20 @@
-//! Read access granted by a part assignment (docs/design.md, *Auth & access*:
-//! "a `PartAssignment` implicitly grants the assigned user read access to
-//! that voice's files for as long as the assignment exists, regardless of
-//! Membership in the org").
+//! Who reads what of an organization's archive (docs/design.md, *Auth &
+//! access*). Two rules live here, and only here:
 //!
-//! This is the one definition of that rule. The WebDAV tree
-//! ([`crate::webdav::access`]) and the `/v1` read paths
+//! - **The read scope** ([`ReadScope`], [`read_scope`]): staff read the whole
+//!   archive; a `musician` reads only their assigned parts, unless the org has
+//!   opened the archive to musicians (`Organization.musicians_read_archive`,
+//!   #119); everyone else (a guest, a non-member) reads only assigned parts.
+//! - **What an assignment grants**: "a `PartAssignment` implicitly grants the
+//!   assigned user read access to that voice's files for as long as the
+//!   assignment exists, regardless of Membership in the org"
+//!   ([`assigned_voice`], [`assigned_arrangement`]).
+//!
+//! The WebDAV tree ([`crate::webdav::access`]) and the `/v1` read paths
 //! ([`crate::auth::authz::require_voice_reader_v1`] and
-//! [`crate::auth::authz::require_arrangement_reader_v1`]) both call it, so a
-//! guest sees the same voices over either surface, and `GET /v1/me/parts`
-//! lists only parts these functions let the caller open.
+//! [`crate::auth::authz::require_arrangement_reader_v1`]) both call these, so
+//! a musician or a guest sees the same voices over either surface, and
+//! `GET /v1/me/parts` lists only parts these functions let the caller open.
 //!
 //! An assignment counts only while everything it hangs from is live: the
 //! collection item and its collection, the voice and its arrangement.
@@ -17,6 +23,74 @@
 
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::domain::membership::Role;
+
+/// How much of an organization's archive (arrangements, voices, full scores
+/// and their files) a caller may **read**. Writes are a separate question,
+/// decided by role ([`Role::can_edit_arrangements`] and friends): an
+/// [`ReadScope::Archive`] musician still writes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadScope {
+    /// `owner` / `archivist` / `conductor`: everything, licensing fields
+    /// included.
+    Staff,
+    /// A `musician` in an org with `musicians_read_archive` on: every
+    /// arrangement, voice and full score, read-only. Licensing and purchase
+    /// fields stay the archive's business, as for [`ReadScope::Restricted`].
+    Archive,
+    /// A `musician` otherwise, or a guest or non-member: only what a live part
+    /// assignment grants ([`assigned_voice`], [`assigned_arrangement`]).
+    Restricted,
+}
+
+impl ReadScope {
+    /// Whether this scope reads every arrangement, voice and score, assigned
+    /// or not.
+    pub fn reads_everything(self) -> bool {
+        !matches!(self, ReadScope::Restricted)
+    }
+}
+
+/// The read scope for a membership `role` (`None`: no membership) in an org
+/// whose `musicians_read_archive` setting is `musicians_read_archive`. A pure
+/// function, so the rule is testable without a database; [`read_scope`] feeds
+/// it from one.
+pub fn scope_for(role: Option<Role>, musicians_read_archive: bool) -> ReadScope {
+    match role {
+        Some(Role::Owner | Role::Archivist | Role::Conductor) => ReadScope::Staff,
+        Some(Role::Musician) if musicians_read_archive => ReadScope::Archive,
+        Some(Role::Musician) | None => ReadScope::Restricted,
+    }
+}
+
+/// `user_id`'s read scope in organization `organization_id`, or `None` if the
+/// organization does not exist. A system admin is not special here: callers
+/// that let one in as owner-equivalent (`/v1`) check that first.
+pub async fn read_scope(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<ReadScope>, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"SELECT o.musicians_read_archive, m.role AS "role?"
+           FROM organization o
+           LEFT JOIN membership m ON m.organization_id = o.id AND m.user_id = $2
+           WHERE o.id = $1"#,
+        organization_id,
+        user_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        // The `role` column is CHECK-constrained, so `parse` cannot fail for
+        // real data; on drift, fall back to the least-privileged role.
+        let role = r
+            .role
+            .map(|role| Role::parse(&role).unwrap_or(Role::Musician));
+        scope_for(role, r.musicians_read_archive)
+    }))
+}
 
 /// Where an assigned voice lives, for checking it against the request path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +160,36 @@ pub async fn assigned_arrangement(
     )
     .fetch_optional(pool)
     .await
+}
+
+/// SQL condition, for the runtime-built list queries
+/// (`voice::list_for_arrangement`, `arrangement::list_for_org`): the user bound
+/// at `user_param` (`$5`, say) holds a live part assignment on the voice whose
+/// id is `voice_id` (a column such as `v.id`). The same liveness as
+/// [`assigned_voice`], whose compile-time-checked query cannot share a string
+/// with it; the list tests open every listed entry through [`assigned_voice`]
+/// and [`assigned_arrangement`], so the two cannot drift unnoticed. Both
+/// arguments are fixed fragments from the caller, never input.
+pub(crate) fn live_assignment_on_voice_sql(user_param: &str, voice_id: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM part_assignment pa_live
+                 JOIN collection_item ci_live ON ci_live.id = pa_live.collection_item_id
+                 JOIN collection c_live ON c_live.id = ci_live.collection_id
+                 WHERE pa_live.user_id = {user_param} AND pa_live.voice_id = {voice_id}
+                   AND ci_live.deleted_at IS NULL AND c_live.deleted_at IS NULL)"
+    )
+}
+
+/// As [`live_assignment_on_voice_sql`], for an arrangement (a column such as
+/// `a.id`): the user holds a live part assignment on one of its live voices,
+/// [`assigned_arrangement`]'s condition.
+pub(crate) fn live_assignment_on_arrangement_sql(user_param: &str, arrangement_id: &str) -> String {
+    let on_voice = live_assignment_on_voice_sql(user_param, "v_live.id");
+    format!(
+        "EXISTS (SELECT 1 FROM voice v_live
+                 WHERE v_live.arrangement_id = {arrangement_id} AND v_live.deleted_at IS NULL
+                   AND {on_voice})"
+    )
 }
 
 // ── the caller's parts (`GET /v1/me/parts`, #98) ─────────────────────────────
@@ -247,4 +351,34 @@ pub async fn list_parts(
     .await?;
 
     Ok((parts, total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staff_read_everything_whatever_the_setting() {
+        for role in [Role::Owner, Role::Archivist, Role::Conductor] {
+            assert_eq!(scope_for(Some(role), false), ReadScope::Staff);
+            assert_eq!(scope_for(Some(role), true), ReadScope::Staff);
+        }
+    }
+
+    #[test]
+    fn musicians_read_the_archive_only_when_the_org_opens_it() {
+        assert_eq!(
+            scope_for(Some(Role::Musician), false),
+            ReadScope::Restricted
+        );
+        assert_eq!(scope_for(Some(Role::Musician), true), ReadScope::Archive);
+        assert!(ReadScope::Archive.reads_everything());
+        assert!(!ReadScope::Restricted.reads_everything());
+    }
+
+    #[test]
+    fn guests_are_never_widened_by_the_setting() {
+        assert_eq!(scope_for(None, false), ReadScope::Restricted);
+        assert_eq!(scope_for(None, true), ReadScope::Restricted);
+    }
 }

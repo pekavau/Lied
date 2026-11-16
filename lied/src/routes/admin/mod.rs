@@ -27,6 +27,7 @@ pub mod layout;
 pub mod members;
 pub mod orgs;
 pub mod search;
+pub mod settings;
 pub mod tags;
 
 use axum::extract::State;
@@ -85,6 +86,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(annotations::router())
         // The caller's own WebDAV app passwords; no org role needed (issue #88).
         .merge(app_passwords::router())
+        // The owner's org settings: archive access for musicians (issue #119).
+        .merge(settings::router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             csrf_middleware,

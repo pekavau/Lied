@@ -418,6 +418,11 @@ pub struct ArrangementSearch<'a> {
     /// Instrumentation: the arrangement must have a live voice for this
     /// instrument.
     pub instrument_id: Option<Uuid>,
+    /// Not a facet the caller picks but the reader's scope (#119): `Some(user)`
+    /// keeps only arrangements that user holds a live part assignment on (a
+    /// restricted musician, [`crate::domain::access::ReadScope::Restricted`]),
+    /// so every other facet, and the total, apply within that set.
+    pub assigned_to: Option<Uuid>,
 }
 
 /// Resolve the sort for a search, applying the two rules `relevance` needs on
@@ -524,6 +529,10 @@ pub async fn list_for_org(
               )
           )
     "#;
+    let where_body = format!(
+        "{WHERE_BODY} AND ($12::uuid IS NULL OR {})",
+        crate::domain::access::live_assignment_on_arrangement_sql("$12", "a.id")
+    );
 
     // Runtime `sqlx::query` (dynamic allowlisted ORDER BY) — see
     // `organization::list` for why building this with `format!` around
@@ -539,7 +548,7 @@ pub async fn list_for_org(
             count(*) OVER() as total
         FROM arrangement a
         LEFT JOIN work w ON w.id = a.work_id
-        WHERE a.organization_id = $3 AND {WHERE_BODY}
+        WHERE a.organization_id = $3 AND {where_body}
         ORDER BY {sort_column} {direction}, a.id ASC
         LIMIT $1 OFFSET $2
         "#
@@ -561,6 +570,7 @@ pub async fn list_for_org(
         .bind(search.duration_max_seconds)
         .bind(tag_ids)
         .bind(search.instrument_id)
+        .bind(search.assigned_to)
         .fetch_all(pool)
         .await?;
 
@@ -578,7 +588,7 @@ pub async fn list_for_org(
                 SELECT count(*)
                 FROM arrangement a
                 LEFT JOIN work w ON w.id = a.work_id
-                WHERE a.organization_id = $3 AND {WHERE_BODY}
+                WHERE a.organization_id = $3 AND {where_body}
                 "#
             );
             sqlx::query_scalar::<_, i64>(&count_query)
@@ -593,6 +603,7 @@ pub async fn list_for_org(
                 .bind(search.duration_max_seconds)
                 .bind(tag_ids)
                 .bind(search.instrument_id)
+                .bind(search.assigned_to)
                 .fetch_one(pool)
                 .await?
         }

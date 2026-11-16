@@ -73,8 +73,13 @@ impl Role {
         self.is_staff()
     }
 
-    /// Manage members and roles, and org settings.
+    /// Manage members and roles.
     pub fn can_manage_members(self) -> bool {
+        matches!(self, Role::Owner)
+    }
+
+    /// Change the org's settings (opening the archive to musicians, #119).
+    pub fn can_change_org_settings(self) -> bool {
         matches!(self, Role::Owner)
     }
 

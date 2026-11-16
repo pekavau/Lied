@@ -84,6 +84,10 @@ impl Access {
         self.role_can(Role::can_manage_members)
     }
 
+    fn can_change_settings(&self) -> bool {
+        self.role_can(Role::can_change_org_settings)
+    }
+
     fn can_author_global_annotations(&self) -> bool {
         self.role_can(Role::can_author_global_annotations)
     }
@@ -176,6 +180,9 @@ impl ConsoleCtx {
     pub fn can_manage_members(&self) -> bool {
         self.access.can_manage_members()
     }
+    pub fn can_change_settings(&self) -> bool {
+        self.access.can_change_settings()
+    }
     pub fn can_author_global_annotations(&self) -> bool {
         self.access.can_author_global_annotations()
     }
@@ -237,11 +244,12 @@ pub enum Section {
     Annotations,
     Search,
     Members,
+    Settings,
 }
 
 impl Section {
     /// Display order for the nav.
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 8] = [
         Section::Home,
         Section::Arrangements,
         Section::Collections,
@@ -249,6 +257,7 @@ impl Section {
         Section::Annotations,
         Section::Search,
         Section::Members,
+        Section::Settings,
     ];
 
     fn label(self) -> &'static str {
@@ -260,6 +269,7 @@ impl Section {
             Section::Annotations => "Global annotations",
             Section::Search => "Search",
             Section::Members => "Members",
+            Section::Settings => "Settings",
         }
     }
 
@@ -273,6 +283,7 @@ impl Section {
             Section::Annotations => "annotations",
             Section::Search => "search",
             Section::Members => "members",
+            Section::Settings => "settings",
         }
     }
 
@@ -292,6 +303,7 @@ impl Section {
             Section::Coverage => access.can_view_coverage(),
             Section::Annotations => access.can_author_global_annotations(),
             Section::Members => access.can_manage_members(),
+            Section::Settings => access.can_change_settings(),
         }
     }
 }
@@ -564,9 +576,11 @@ mod tests {
                 Section::Annotations,
                 Section::Search,
                 Section::Members,
+                Section::Settings,
             ]
         );
-        // Archivist: everything staff except global annotations and members.
+        // Archivist: everything staff except global annotations, members and
+        // settings.
         assert_eq!(
             member(Role::Archivist).visible_sections(),
             vec![

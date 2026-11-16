@@ -1249,3 +1249,306 @@ async fn my_parts_list_every_live_part_across_ensembles() {
         .unwrap();
     assert_eq!(status_of(&ctx, anonymous).await, 401);
 }
+
+// --- #119: what a musician reads, and the owner's archive setting ---
+
+/// A member of `org_id` with `role`, and a bearer token for them.
+async fn seed_member(
+    state: &AppState,
+    org_id: Uuid,
+    username: &str,
+    role: membership::Role,
+) -> (Uuid, String) {
+    let (uid, token) = seed_guest(state, username).await;
+    membership::create(
+        &state.db,
+        Uuid::now_v7(),
+        uid,
+        org_id,
+        membership::MembershipFields {
+            role,
+            instrument_ids: &[],
+            is_principal: false,
+            principal_instrument_ids: &[],
+        },
+        None,
+    )
+    .await
+    .expect("membership");
+    (uid, token)
+}
+
+/// `PATCH /v1/orgs/{orgId}` as `token` with the org's current ETag.
+async fn patch_org(ctx: &Ctx, token: &str, org_id: Uuid, body: serde_json::Value) -> u16 {
+    let org = organization::find_by_id(&ctx.state.db, org_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut request = json_request("PATCH", &format!("/v1/orgs/{org_id}"), token, body);
+    request.headers_mut().insert(
+        axum::http::header::IF_MATCH,
+        axum::http::HeaderValue::from_str(&lied::listing::etag_for(org.updated_at)).unwrap(),
+    );
+    status_of(ctx, request).await
+}
+
+async fn get_json(ctx: &Ctx, uri: &str, token: &str) -> (u16, serde_json::Value) {
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(get_request(uri, token))
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = body_bytes(response).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn total(page: &serde_json::Value) -> i64 {
+    page["total"].as_i64().unwrap_or(-1)
+}
+
+/// A musician reads only their assigned parts over `/v1`, like a guest and
+/// like WebDAV: the arrangement list (and every facet) is limited to pieces
+/// they play, the voice list to their voices, and the score and other voices
+/// are 403. Once the owner opens the archive, they read everything, still
+/// without the licensing fields and still without any write. Staff never
+/// change, and a guest is never widened by the setting.
+#[tokio::test]
+async fn a_musician_reads_assigned_parts_unless_the_owner_opens_the_archive() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let (_, owner) = seed_member(&ctx.state, org_id, "olga", membership::Role::Owner).await;
+    let (anna_id, anna) = seed_member(&ctx.state, org_id, "anna", membership::Role::Musician).await;
+    let (guest_id, guest) = seed_guest(&ctx.state, "gus").await;
+
+    let radetzky = seed_arrangement(&ctx.state, org_id, "Radetzky March").await;
+    let florentiner = seed_arrangement(&ctx.state, org_id, "Florentiner").await;
+    sqlx::query("UPDATE arrangement SET publisher = 'Edition X'")
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let flute = seed_voice(&ctx.state, radetzky, "Flute 1").await;
+    let oboe = seed_voice(&ctx.state, radetzky, "Oboe 1").await;
+    let clarinet = seed_voice(&ctx.state, florentiner, "Clarinet 1").await;
+    let marsch =
+        lied::domain::tag::create(&ctx.state.db, Uuid::now_v7(), org_id, "Marsch", None, None)
+            .await
+            .unwrap();
+    for arr in [radetzky, florentiner] {
+        lied::domain::tag::attach(&ctx.state.db, Uuid::now_v7(), arr, marsch.id)
+            .await
+            .unwrap();
+    }
+
+    let r = format!("/v1/orgs/{org_id}/arrangements/{radetzky}");
+    let f = format!("/v1/orgs/{org_id}/arrangements/{florentiner}");
+    let score = upload_pdf(&ctx, &arch, &format!("{r}/files"), PDF).await;
+    upload_pdf(&ctx, &arch, &format!("{r}/voices/{flute}/files"), PDF).await;
+    let oboe_file = upload_pdf(&ctx, &arch, &format!("{r}/voices/{oboe}/files"), PDF).await;
+    let clarinet_file = upload_pdf(&ctx, &arch, &format!("{f}/voices/{clarinet}/files"), PDF).await;
+
+    let (_c, item) = seed_program_item(&ctx.state, org_id, radetzky).await;
+    assign(&ctx.state, item, flute, anna_id).await;
+    assign(&ctx.state, item, flute, guest_id).await;
+
+    let list = format!("/v1/orgs/{org_id}/arrangements");
+
+    // ── archive closed (the default) ──
+    let (status, page) = get_json(&ctx, &list, &anna).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(total(&page), 1, "{page}");
+    assert_eq!(page["items"][0]["id"], radetzky.to_string());
+    assert!(page["items"][0]["publisher"].is_null(), "{page}");
+    // Facets apply within the musician's set, never beyond it.
+    let tag_filter = format!("{list}?filter[tag]={}", marsch.id);
+    let (_, tagged) = get_json(&ctx, &tag_filter, &anna).await;
+    assert_eq!(total(&tagged), 1, "{tagged}");
+    let (_, searched) = get_json(&ctx, &format!("{list}?q=Florentiner"), &anna).await;
+    assert_eq!(total(&searched), 0, "{searched}");
+    let (_, searched) = get_json(&ctx, &format!("{list}?q=Radetzky"), &anna).await;
+    assert_eq!(total(&searched), 1, "{searched}");
+    // The listed arrangement opens, as a summary.
+    let (status, summary) = get_json(&ctx, &r, &anna).await;
+    assert_eq!(status, 200);
+    assert!(summary["publisher"].is_null(), "{summary}");
+    // Only their own voice is listed.
+    let (status, voices) = get_json(&ctx, &format!("{r}/voices"), &anna).await;
+    assert_eq!(status, 200, "{voices}");
+    assert_eq!(total(&voices), 1, "{voices}");
+    assert_eq!(voices["items"][0]["id"], flute.to_string());
+    for uri in [
+        format!("{r}/voices/{flute}"),
+        format!("{r}/voices/{flute}/files"),
+        format!("{r}/tags"),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &anna)).await,
+            200,
+            "{uri}"
+        );
+    }
+    let closed = [
+        format!("{r}/voices/{oboe}"),
+        format!("{r}/voices/{oboe}/files"),
+        format!("{r}/voices/{oboe}/files/{oboe_file}"),
+        format!("{r}/files"),
+        format!("{r}/files/{score}"),
+        f.clone(),
+        format!("{f}/voices"),
+        format!("{f}/tags"),
+        format!("{f}/voices/{clarinet}"),
+        format!("{f}/voices/{clarinet}/files/{clarinet_file}"),
+    ];
+    for uri in &closed {
+        assert_eq!(status_of(&ctx, get_request(uri, &anna)).await, 403, "{uri}");
+    }
+    let unknown = format!("/v1/orgs/{org_id}/arrangements/{}", Uuid::now_v7());
+    assert_eq!(status_of(&ctx, get_request(&unknown, &anna)).await, 403);
+
+    // Staff are unchanged: every arrangement, the licensing fields.
+    let (_, staff_page) = get_json(&ctx, &list, &arch).await;
+    assert_eq!(total(&staff_page), 2, "{staff_page}");
+    assert_eq!(staff_page["items"][0]["publisher"], "Edition X");
+    let (_, staff_voices) = get_json(&ctx, &format!("{r}/voices"), &arch).await;
+    assert_eq!(total(&staff_voices), 2);
+
+    // ── the owner opens the archive ──
+    let open = serde_json::json!({ "musiciansReadArchive": true });
+    assert_eq!(patch_org(&ctx, &owner, org_id, open).await, 200);
+    let (_, org) = get_json(&ctx, &format!("/v1/orgs/{org_id}"), &anna).await;
+    assert_eq!(org["musiciansReadArchive"], true, "{org}");
+
+    let (_, page) = get_json(&ctx, &list, &anna).await;
+    assert_eq!(total(&page), 2, "{page}");
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["publisher"].is_null()),
+        "{page}"
+    );
+    let (_, tagged) = get_json(&ctx, &tag_filter, &anna).await;
+    assert_eq!(total(&tagged), 2, "{tagged}");
+    let (_, voices) = get_json(&ctx, &format!("{r}/voices"), &anna).await;
+    assert_eq!(total(&voices), 2, "{voices}");
+    for uri in &closed {
+        assert_eq!(status_of(&ctx, get_request(uri, &anna)).await, 200, "{uri}");
+    }
+    let (_, summary) = get_json(&ctx, &f, &anna).await;
+    assert!(summary["publisher"].is_null(), "{summary}");
+    // A made-up id is still not a way to probe.
+    assert_eq!(status_of(&ctx, get_request(&unknown, &anna)).await, 404);
+
+    // Still read-only.
+    let rename = json_request("PATCH", &f, &anna, serde_json::json!({ "title": "x" }));
+    assert_eq!(status_of(&ctx, rename).await, 403);
+    for uri in [format!("{r}/files"), format!("{r}/voices/{oboe}/files")] {
+        let upload = multipart_upload(&uri, &anna, "mine.pdf", "application/pdf", PDF);
+        assert_eq!(status_of(&ctx, upload).await, 403, "{uri}");
+    }
+    let delete = json_request(
+        "DELETE",
+        &format!("{r}/voices/{oboe}/files/{oboe_file}"),
+        &anna,
+        serde_json::json!({}),
+    );
+    assert_eq!(status_of(&ctx, delete).await, 403);
+
+    // A guest is never widened: their part, nothing else, no lists.
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{r}/voices/{flute}"), &guest)).await,
+        200
+    );
+    for uri in [
+        list.clone(),
+        format!("{r}/voices"),
+        format!("{r}/voices/{oboe}"),
+        format!("{r}/files"),
+        format!("{r}/files/{score}"),
+        f.clone(),
+    ] {
+        assert_eq!(
+            status_of(&ctx, get_request(&uri, &guest)).await,
+            403,
+            "{uri}"
+        );
+    }
+
+    // Staff are unchanged here too.
+    let (_, staff_page) = get_json(&ctx, &list, &arch).await;
+    assert_eq!(total(&staff_page), 2);
+    assert_eq!(staff_page["items"][0]["publisher"], "Edition X");
+
+    // Closing it again restricts the musician again.
+    let close = serde_json::json!({ "musiciansReadArchive": false });
+    assert_eq!(patch_org(&ctx, &owner, org_id, close).await, 200);
+    let (_, page) = get_json(&ctx, &list, &anna).await;
+    assert_eq!(total(&page), 1, "{page}");
+    assert_eq!(status_of(&ctx, get_request(&f, &anna)).await, 403);
+}
+
+/// Only the owner (or a system admin) opens or closes the archive; every
+/// change is audited; renaming stays the system admin's.
+#[tokio::test]
+async fn only_the_owner_opens_the_archive_and_it_is_audited() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let (_, owner) = seed_member(&ctx.state, org_id, "olga", membership::Role::Owner).await;
+    let (_, conductor) = seed_member(&ctx.state, org_id, "carl", membership::Role::Conductor).await;
+    let (_, musician) = seed_member(&ctx.state, org_id, "anna", membership::Role::Musician).await;
+    let (_, outsider) = seed_guest(&ctx.state, "gus").await;
+    let open = serde_json::json!({ "musiciansReadArchive": true });
+
+    let (_, org) = get_json(&ctx, &format!("/v1/orgs/{org_id}"), &musician).await;
+    assert_eq!(org["musiciansReadArchive"], false, "off by default: {org}");
+
+    for token in [&arch, &conductor, &musician, &outsider] {
+        assert_eq!(patch_org(&ctx, token, org_id, open.clone()).await, 403);
+    }
+    assert_eq!(
+        audit_count(&ctx.pool, "organization.settings_change").await,
+        0
+    );
+
+    // A stale ETag is 412, as for every PATCH.
+    let stale = json_request("PATCH", &format!("/v1/orgs/{org_id}"), &owner, open.clone());
+    assert_eq!(status_of(&ctx, stale).await, 412);
+
+    assert_eq!(patch_org(&ctx, &owner, org_id, open.clone()).await, 200);
+    let stored = organization::find_by_id(&ctx.state.db, org_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.musicians_read_archive);
+    assert_eq!(
+        audit_count(&ctx.pool, "organization.settings_change").await,
+        1
+    );
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE action = 'organization.settings_change'",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        details["before"]["musiciansReadArchive"], false,
+        "{details}"
+    );
+    assert_eq!(details["after"]["musiciansReadArchive"], true, "{details}");
+
+    // Setting it to what it already is changes and audits nothing.
+    assert_eq!(patch_org(&ctx, &owner, org_id, open).await, 200);
+    assert_eq!(
+        audit_count(&ctx.pool, "organization.settings_change").await,
+        1
+    );
+
+    // An owner still cannot rename the org.
+    let rename = serde_json::json!({ "name": "Kapelle" });
+    assert_eq!(patch_org(&ctx, &owner, org_id, rename).await, 403);
+}
