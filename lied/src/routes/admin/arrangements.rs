@@ -886,6 +886,12 @@ async fn undelete(
         Ok(false) => {
             Redirect::to(&format!("/admin/orgs/{org_id}/arrangements/{arr_id}")).into_response()
         }
+        Err(arrangement::ArrangementError::DuplicateSlug) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "A live arrangement already holds this arrangement's slug. Rename or delete it \
+             before restoring this one.",
+        ),
         Err(error) => {
             tracing::error!(%error, "failed to undelete arrangement");
             error_page(
@@ -1891,6 +1897,12 @@ async fn undelete_voice(
             "/admin/orgs/{org_id}/arrangements/{arr_id}/voices/{voice_id}"
         ))
         .into_response(),
+        Err(voice::VoiceError::DuplicateSlug) => error_page(
+            &ctx,
+            StatusCode::CONFLICT,
+            "A live voice of this arrangement already holds this voice's slug. Rename or \
+             delete it before restoring this one.",
+        ),
         Err(error) => {
             tracing::error!(%error, "failed to undelete voice");
             error_page(

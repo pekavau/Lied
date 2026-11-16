@@ -23,7 +23,7 @@ use crate::domain::membership::{self, Role};
 use crate::domain::{arrangement, tag, voice, work};
 use crate::error::AppError;
 use crate::listing;
-use crate::listing::{etag_response, if_match_header};
+use crate::listing::{etag_response, etag_response_status, if_match_header};
 use crate::pagination::Page;
 use crate::routes::json::ApiJson;
 use crate::routes::openapi::{
@@ -195,7 +195,7 @@ async fn create_work(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
     ApiJson(body): ApiJson<CreateWorkRequest>,
-) -> Result<(StatusCode, Json<work::Work>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     if body.title.trim().is_empty() {
         let mut report = garde::Report::new();
         report.append(
@@ -235,7 +235,12 @@ async fn create_work(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created)))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        created,
+        updated_at,
+    ))
 }
 
 /// Fetch one work by ID.
@@ -786,7 +791,7 @@ async fn create_arrangement(
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
     ApiJson(body): ApiJson<CreateArrangementRequest>,
-) -> Result<(StatusCode, Json<ArrangementResponse>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     let id = Uuid::now_v7();
@@ -828,7 +833,12 @@ async fn create_arrangement(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created.into())))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        ArrangementResponse::from(created),
+        updated_at,
+    ))
 }
 
 pub(crate) async fn find_arrangement_scoped(
@@ -1112,6 +1122,7 @@ async fn delete_arrangement(
         Validation400,
         Forbidden403,
         NotFound404,
+        Conflict409,
     )
 )]
 async fn undelete_arrangement(
@@ -1124,7 +1135,16 @@ async fn undelete_arrangement(
 
     let current = find_arrangement_scoped_including_deleted(&state, org_id, id).await?;
 
-    let restored = arrangement::undelete(&state.db, id).await?;
+    let restored = arrangement::undelete(&state.db, id)
+        .await
+        .map_err(|err| match err {
+            arrangement::ArrangementError::DuplicateSlug => AppError::Conflict(
+                "a live arrangement already holds this arrangement's slug; rename or delete it \
+                 before restoring this one"
+                    .to_string(),
+            ),
+            err => arrangement_error_to_app_error(err),
+        })?;
     if !restored {
         return Err(AppError::NotFound);
     }
@@ -1375,7 +1395,7 @@ async fn create_voice(
     RequestId(request_id): RequestId,
     Path((org_id, arrangement_id)): Path<(Uuid, Uuid)>,
     ApiJson(body): ApiJson<CreateVoiceRequest>,
-) -> Result<(StatusCode, Json<VoiceResponse>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     find_arrangement_scoped(&state, org_id, arrangement_id).await?;
@@ -1428,7 +1448,12 @@ async fn create_voice(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created.into())))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        VoiceResponse::from(created),
+        updated_at,
+    ))
 }
 
 async fn find_voice_scoped(
@@ -1675,6 +1700,7 @@ async fn delete_voice(
         Validation400,
         Forbidden403,
         NotFound404,
+        Conflict409,
     )
 )]
 async fn undelete_voice(
@@ -1687,7 +1713,16 @@ async fn undelete_voice(
 
     let current = find_voice_scoped_including_deleted(&state, org_id, arrangement_id, id).await?;
 
-    let restored = voice::undelete(&state.db, id).await?;
+    let restored = voice::undelete(&state.db, id)
+        .await
+        .map_err(|err| match err {
+            voice::VoiceError::DuplicateSlug => AppError::Conflict(
+                "a live voice of this arrangement already holds this voice's slug; rename or \
+                 delete it before restoring this one"
+                    .to_string(),
+            ),
+            err => voice_error_to_app_error(err),
+        })?;
     if !restored {
         return Err(AppError::NotFound);
     }
@@ -1871,7 +1906,7 @@ async fn create_tag(
     RequestId(request_id): RequestId,
     Path(org_id): Path<Uuid>,
     ApiJson(body): ApiJson<CreateTagRequest>,
-) -> Result<(StatusCode, Json<TagResponse>), AppError> {
+) -> Result<axum::response::Response, AppError> {
     require_org_role_v1(&state, &auth, org_id, Role::Archivist).await?;
 
     if body.name.trim().is_empty() {
@@ -1909,7 +1944,12 @@ async fn create_tag(
     )
     .await;
 
-    Ok((StatusCode::CREATED, Json(created.into())))
+    let updated_at = created.updated_at;
+    Ok(etag_response_status(
+        StatusCode::CREATED,
+        TagResponse::from(created),
+        updated_at,
+    ))
 }
 
 async fn find_tag_scoped(state: &AppState, org_id: Uuid, id: Uuid) -> Result<tag::Tag, AppError> {
@@ -2108,6 +2148,7 @@ async fn delete_tag(
         Validation400,
         Forbidden403,
         NotFound404,
+        Conflict409,
     )
 )]
 async fn undelete_tag(
@@ -2128,7 +2169,16 @@ async fn undelete_tag(
         return Err(AppError::NotFound);
     }
 
-    let restored = tag::undelete(&state.db, id).await?;
+    let restored = tag::undelete(&state.db, id)
+        .await
+        .map_err(|err| match err {
+            tag::TagError::Duplicate => AppError::Conflict(
+                "a live tag already has this tag's name and kind; rename or delete it before \
+                 restoring this one"
+                    .to_string(),
+            ),
+            err => tag_error_to_app_error(err),
+        })?;
     if !restored {
         return Err(AppError::NotFound);
     }

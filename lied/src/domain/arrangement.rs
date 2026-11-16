@@ -720,13 +720,18 @@ pub async fn soft_delete(
 /// Undelete: clears `deleted_at`. Returns `false` if no soft-deleted row
 /// matched `id` (including if `id` doesn't exist at all, or is already
 /// live).
-pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+///
+/// Fails with [`ArrangementError::DuplicateSlug`] if a live arrangement has since
+/// taken its slug (the unique index covers live rows
+/// only), rather than with a raw database error (#125).
+pub async fn undelete(pool: &PgPool, id: Uuid) -> Result<bool, ArrangementError> {
     let result = sqlx::query!(
         r#"UPDATE arrangement SET deleted_at = NULL, updated_at = now() WHERE id = $1 AND deleted_at IS NOT NULL"#,
         id,
     )
     .execute(pool)
-    .await?;
+    .await
+    .map_err(map_write_error)?;
     Ok(result.rows_affected() > 0)
 }
 

@@ -395,6 +395,14 @@ async fn undelete_tag(
             .await;
         }
         Ok(false) => {}
+        Err(tag::TagError::Duplicate) => {
+            return error_page(
+                &ctx,
+                StatusCode::CONFLICT,
+                "A live tag already has this tag's name and kind. Rename or delete it before \
+                 restoring this one.",
+            );
+        }
         Err(error) => {
             tracing::error!(%error, "failed to undelete tag");
             return error_page(
