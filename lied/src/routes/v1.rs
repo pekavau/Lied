@@ -98,10 +98,12 @@ async fn list_instruments(
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MintTokenRequest {
-    /// Optional active org id to scope the token to (docs/design.md JWT claims:
-    /// `org`, nullable). Not validated against Membership in this item —
-    /// org-scoping enforcement is a later authorization concern; minting
-    /// just records the claim.
+    /// Optional active org id to record in the token (docs/design.md JWT
+    /// claims: `org`, nullable). The caller must be a member of it, or a
+    /// system admin, or the mint is refused with `403` (#124). The claim is
+    /// context only (it attributes the token's audit rows to that org); it
+    /// is **not** a scope: every request is authorized by the caller's own
+    /// memberships and assignments.
     org: Option<Uuid>,
     /// Login identifier. Required when no session cookie is present.
     username: Option<String>,
@@ -137,7 +139,8 @@ struct MintTokenResponse {
     request_body = MintTokenRequest,
     responses(
         (status = 200, description = "Bearer JWT minted", body = MintTokenResponse),
-        (status = 403, description = "Session cookie presented without a matching `HX-CSRF` header",
+        (status = 403, description = "Session cookie presented without a matching `HX-CSRF` header, \
+                                      or `org` names an organization the caller is not a member of",
          body = crate::routes::openapi::ProblemDetails, content_type = "application/problem+json"),
         // 401 = bad credentials, 429 = login rate limit, 500 = internal — all
         // RFC 7807 ProblemDetails bodies.
@@ -209,6 +212,19 @@ async fn mint_token(
     let Some(user_id) = authenticated_user_id else {
         return Err(AppError::Unauthorized);
     };
+
+    // The `org` claim must name an org the caller acts in (#124): a member,
+    // or a system admin (owner-equivalent everywhere,
+    // `access::effective_role`). Otherwise anyone could attribute audit rows
+    // to any org. `403` whether or not the org exists.
+    if let Some(org_id) = body.org {
+        if crate::domain::access::effective_role(&state.db, org_id, user_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
 
     let (token, claims) = state
         .jwt_keyring

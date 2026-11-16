@@ -1379,3 +1379,215 @@ async fn me_without_credentials_is_401() {
         "application/problem+json"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #124: who sees which organizations, and the token `org` claim.
+// ---------------------------------------------------------------------------
+
+/// Give `user_id` a live part assignment in `org_id` without a membership
+/// (a guest): an arrangement, a voice, a collection with the piece, and the
+/// assignment. Returns the collection id, whose soft delete ends the access.
+async fn assign_guest(pool: &PgPool, org_id: Uuid, user_id: Uuid) -> Uuid {
+    let (arr, voice, coll, item) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    sqlx::query(
+        "INSERT INTO arrangement (id, organization_id, title, slug, status)
+         VALUES ($1, $2, 'Piece', $3, 'active')",
+    )
+    .bind(arr)
+    .bind(org_id)
+    .bind(format!("piece-{}", arr.simple()))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO voice (id, arrangement_id, name, slug) VALUES ($1, $2, 'Flute', 'flute')",
+    )
+    .bind(voice)
+    .bind(arr)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collection (id, organization_id, name, slug, type)
+         VALUES ($1, $2, 'Gig', $3, 'program')",
+    )
+    .bind(coll)
+    .bind(org_id)
+    .bind(format!("gig-{}", coll.simple()))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO collection_item (id, collection_id, arrangement_id, position, label)
+         VALUES ($1, $2, $3, 1, '1')",
+    )
+    .bind(item)
+    .bind(coll)
+    .bind(arr)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO part_assignment (id, collection_item_id, user_id, voice_id)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(item)
+    .bind(user_id)
+    .bind(voice)
+    .execute(pool)
+    .await
+    .unwrap();
+    coll
+}
+
+/// `(status, names)` of `GET /v1/orgs` as `token`.
+async fn listed_org_names(app: &axum::Router, token: &str) -> (u16, Vec<String>) {
+    let request = bearer_request("GET", "/v1/orgs?sort=name", token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let json = body_json(response).await;
+    assert_eq!(
+        json["total"].as_u64().unwrap() as usize,
+        json["items"].as_array().unwrap().len(),
+        "the total counts only the visible orgs"
+    );
+    let names = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["name"].as_str().unwrap().to_string())
+        .collect();
+    (status, names)
+}
+
+async fn get_org_status(app: &axum::Router, token: &str, org_id: Uuid) -> u16 {
+    let request = bearer_request("GET", &format!("/v1/orgs/{org_id}"), token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.clone()
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// An organization is visible to those who reach it: its members, a guest
+/// with a live assignment there, and a system admin, who sees every one.
+/// Anyone else gets `403` on it whether or not it exists, as on every other
+/// org-scoped route, and it is not in their list.
+#[tokio::test]
+async fn organizations_are_visible_only_to_those_who_reach_them() {
+    let db = TestDb::create_and_migrate().await;
+    let admin = bootstrap_admin(&db.pool, "admin", "correct horse battery staple").await;
+    let alpha = create_org(&db.pool, "Alpha").await;
+    let beta = create_org(&db.pool, "Beta").await;
+    let member = create_plain_user(&db.pool, "member", "pw-member-123456").await;
+    add_member(&db.pool, alpha.id, member.id, membership::Role::Musician).await;
+    let guest = create_plain_user(&db.pool, "guest", "pw-guest-1234567").await;
+    let gig = assign_guest(&db.pool, beta.id, guest.id).await;
+    let outsider = create_plain_user(&db.pool, "outsider", "pw-outsider-12345").await;
+
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let admin_t = mint_token(&state, admin.id);
+    let member_t = mint_token(&state, member.id);
+    let guest_t = mint_token(&state, guest.id);
+    let outsider_t = mint_token(&state, outsider.id);
+    let missing = Uuid::now_v7();
+    let names = |list: &[&str]| -> Vec<String> { list.iter().map(|s| s.to_string()).collect() };
+
+    assert_eq!(
+        listed_org_names(&app, &admin_t).await,
+        (200, names(&["Alpha", "Beta"]))
+    );
+    assert_eq!(
+        listed_org_names(&app, &member_t).await,
+        (200, names(&["Alpha"]))
+    );
+    assert_eq!(
+        listed_org_names(&app, &guest_t).await,
+        (200, names(&["Beta"]))
+    );
+    assert_eq!(listed_org_names(&app, &outsider_t).await, (200, names(&[])));
+
+    assert_eq!(get_org_status(&app, &member_t, alpha.id).await, 200);
+    assert_eq!(get_org_status(&app, &member_t, beta.id).await, 403);
+    assert_eq!(get_org_status(&app, &member_t, missing).await, 403);
+    assert_eq!(get_org_status(&app, &guest_t, beta.id).await, 200);
+    assert_eq!(get_org_status(&app, &guest_t, alpha.id).await, 403);
+    assert_eq!(get_org_status(&app, &outsider_t, alpha.id).await, 403);
+    assert_eq!(get_org_status(&app, &admin_t, beta.id).await, 200);
+    assert_eq!(get_org_status(&app, &admin_t, missing).await, 404);
+
+    // The guest's reach ends with the assignment's liveness.
+    sqlx::query("UPDATE collection SET deleted_at = now() WHERE id = $1")
+        .bind(gig)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(listed_org_names(&app, &guest_t).await, (200, names(&[])));
+    assert_eq!(get_org_status(&app, &guest_t, beta.id).await, 403);
+}
+
+async fn mint_with_org(app: &axum::Router, username: &str, password: &str, org: Uuid) -> u16 {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/tokens")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(
+            serde_json::json!({ "username": username, "password": password, "org": org })
+                .to_string(),
+        ))
+        .unwrap();
+    app.clone()
+        .oneshot(with_peer_ip(request))
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The token's `org` claim must name an org the caller is a member of (a
+/// system admin may name any), so nobody can attribute audit rows to an org
+/// they are not in. A refusal is `403`, existing org or not, and mints
+/// nothing.
+#[tokio::test]
+async fn a_token_names_only_an_org_the_caller_is_a_member_of() {
+    let db = TestDb::create_and_migrate().await;
+    bootstrap_admin(&db.pool, "admin", "correct horse battery staple").await;
+    let alpha = create_org(&db.pool, "Alpha").await;
+    let beta = create_org(&db.pool, "Beta").await;
+    let member = create_plain_user(&db.pool, "member", "pw-member-123456").await;
+    add_member(&db.pool, alpha.id, member.id, membership::Role::Musician).await;
+
+    let (app, _state) = build_test_app(db.pool.clone()).await;
+    let pw = "pw-member-123456";
+
+    assert_eq!(mint_with_org(&app, "member", pw, alpha.id).await, 200);
+    assert_eq!(mint_with_org(&app, "member", pw, beta.id).await, 403);
+    assert_eq!(mint_with_org(&app, "member", pw, Uuid::now_v7()).await, 403);
+    assert_eq!(
+        mint_with_org(&app, "admin", "correct horse battery staple", beta.id).await,
+        200
+    );
+
+    let minted_for_beta: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'auth.token_minted' AND org_id = $1",
+    )
+    .bind(beta.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        minted_for_beta, 1,
+        "only the admin's mint is attributed to Beta"
+    );
+}

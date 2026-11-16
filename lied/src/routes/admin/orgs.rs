@@ -86,7 +86,7 @@ async fn list_orgs_page(
     let token = csrf::ensure_token(&session).await.unwrap_or_default();
 
     let (orgs, _total) =
-        match organization::list(&state.db, 200, 0, "name", SortDirection::Asc, None).await {
+        match organization::list(&state.db, 200, 0, "name", SortDirection::Asc, None, None).await {
             Ok(result) => result,
             Err(error) => {
                 tracing::error!(%error, "failed to list organizations");

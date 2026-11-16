@@ -19,7 +19,7 @@ use crate::auth::authz::{
 use crate::auth::extractors::BearerOrSession;
 use crate::domain::access::ReadScope;
 use crate::domain::audit_log::{audit, AuditContext};
-use crate::domain::membership::{self, Role};
+use crate::domain::membership::Role;
 use crate::domain::{arrangement, tag, voice, work};
 use crate::error::AppError;
 use crate::listing;
@@ -173,7 +173,7 @@ async fn list_works(
     }))
 }
 
-/// Create an abstract work (any authenticated user with at least one membership).
+/// Create an abstract work (a staff member of any org, or a system admin; #124).
 #[utoipa::path(
     post,
     path = "/works",
@@ -205,9 +205,7 @@ async fn create_work(
         return Err(AppError::Validation(report));
     }
 
-    if !auth.user.is_system_admin
-        && !membership::has_any_membership(&state.db, auth.user.id).await?
-    {
+    if !work::may_write_works(&state.db, auth.user.id, auth.user.is_system_admin).await? {
         return Err(AppError::Forbidden);
     }
 
@@ -273,7 +271,7 @@ async fn get_work(
     Ok(etag_response(found.clone(), found.updated_at))
 }
 
-/// Update a work's title or composer (creator or system-admin only; requires `If-Match`).
+/// Update a work's title or composer (its creator while staff of any org, or a system admin; requires `If-Match`).
 #[utoipa::path(
     patch,
     path = "/works/{workId}",
@@ -306,7 +304,9 @@ async fn update_work(
 ) -> Result<axum::response::Response, AppError> {
     let current = work_by_id(&state, id).await?;
 
-    if !current.is_editable_by(auth.user.id, auth.user.is_system_admin) {
+    if !current.is_editable_by(auth.user.id, auth.user.is_system_admin)
+        || !work::may_write_works(&state.db, auth.user.id, auth.user.is_system_admin).await?
+    {
         return Err(AppError::Forbidden);
     }
 
@@ -354,7 +354,7 @@ async fn update_work(
     Ok(etag_response(updated, updated_at))
 }
 
-/// Hard-delete a work (creator or system-admin; requires `If-Match`).
+/// Hard-delete a work (its creator while staff of any org, or a system admin; requires `If-Match`).
 ///
 /// Fails with `409` if the work is still referenced by a live arrangement.
 #[utoipa::path(
@@ -386,7 +386,9 @@ async fn delete_work(
 ) -> Result<StatusCode, AppError> {
     let current = work_by_id(&state, id).await?;
 
-    if !current.is_editable_by(auth.user.id, auth.user.is_system_admin) {
+    if !current.is_editable_by(auth.user.id, auth.user.is_system_admin)
+        || !work::may_write_works(&state.db, auth.user.id, auth.user.is_system_admin).await?
+    {
         return Err(AppError::Forbidden);
     }
 

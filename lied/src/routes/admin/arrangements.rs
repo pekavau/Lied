@@ -1000,7 +1000,8 @@ async fn create_work(
         Ok(ctx) => ctx,
         Err(response) => return response,
     };
-    // Any member may create a work; console access already requires staff.
+    // Works are written by staff (#124, `work::may_write_works`); console
+    // access already requires staff of this org.
     if !ctx.is_staff() {
         return console::section_forbidden(&ctx);
     }

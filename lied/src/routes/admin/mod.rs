@@ -141,6 +141,7 @@ async fn index(State(state): State<AppState>, auth: Option<AuthSession>) -> Resp
                 "name",
                 crate::listing::SortDirection::Asc,
                 None,
+                None,
             )
             .await
             {

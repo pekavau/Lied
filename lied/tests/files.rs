@@ -1757,3 +1757,49 @@ async fn a_restricted_musician_reads_only_the_collections_assignments_and_tags_o
     // A guest is never widened.
     assert_eq!(status_of(&ctx, get_request(&colls, &guest)).await, 403);
 }
+
+/// #124: a system admin who is not a member reads an org's whole archive and
+/// writes to it over `/v1`, as an owner would, and as over WebDAV
+/// (`domain::access::role_with_admin`).
+#[tokio::test]
+async fn a_non_member_system_admin_reads_and_writes_as_owner() {
+    let ctx = Ctx::new(200 * 1024 * 1024).await;
+    let (org_id, arch) = seed_org_archivist(&ctx.state, "Stadtkapelle", "arch").await;
+    let (admin_id, admin) = seed_guest(&ctx.state, "root").await;
+    sqlx::query(r#"UPDATE "user" SET is_system_admin = true WHERE id = $1"#)
+        .bind(admin_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let radetzky = seed_arrangement(&ctx.state, org_id, "Radetzky March").await;
+    sqlx::query("UPDATE arrangement SET publisher = 'Edition X'")
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let flute = seed_voice(&ctx.state, radetzky, "Flute 1").await;
+    let r = format!("/v1/orgs/{org_id}/arrangements/{radetzky}");
+    let score = upload_pdf(&ctx, &arch, &format!("{r}/files"), PDF).await;
+
+    let (status, page) = get_json(&ctx, &format!("/v1/orgs/{org_id}/arrangements"), &admin).await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(total(&page), 1, "{page}");
+    assert_eq!(page["items"][0]["publisher"], "Edition X", "staff fields");
+    assert_eq!(
+        status_of(&ctx, get_request(&format!("{r}/files/{score}"), &admin)).await,
+        200
+    );
+    upload_pdf(&ctx, &admin, &format!("{r}/voices/{flute}/files"), PDF).await;
+
+    // #123's readers follow the same scope: every collection, every
+    // assignment (the distribution plan is staff data).
+    let (anna_id, _anna) =
+        seed_member(&ctx.state, org_id, "anna", membership::Role::Musician).await;
+    let (collection, item) = seed_program_item(&ctx.state, org_id, radetzky).await;
+    assign(&ctx.state, item, flute, anna_id).await;
+    let colls = format!("/v1/orgs/{org_id}/collections");
+    let (status, page) = get_json(&ctx, &colls, &admin).await;
+    assert_eq!((status, total(&page)), (200, 1), "{page}");
+    let assignments = format!("{colls}/{collection}/items/{item}/assignments");
+    let (status, page) = get_json(&ctx, &assignments, &admin).await;
+    assert_eq!((status, total(&page)), (200, 1), "{page}");
+}

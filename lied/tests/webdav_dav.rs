@@ -2015,3 +2015,118 @@ async fn get_statuses(ctx: &Ctx, uris: &[&str], user: &SeededUser) -> Vec<u16> {
     }
     statuses
 }
+
+// ── #124: personal annotations follow the part; system admins ───────────────
+
+async fn put_status(ctx: &Ctx, uri: &str, user: &SeededUser) -> u16 {
+    send(
+        &ctx.app,
+        request("PUT", uri, &basic(user), b"%PDF marks".to_vec()),
+    )
+    .await
+    .0
+    .as_u16()
+}
+
+/// Personal annotations are read and written only under a voice the caller
+/// plays, guests included (a substitute marks up their part and sees the
+/// regular player's markings). Opening the archive does not widen this: a
+/// musician reads every voice's files, but not the annotations of a part
+/// they don't play, and writes none there. Staff read all and annotate any
+/// voice.
+#[tokio::test]
+async fn personal_annotations_follow_the_part_not_the_archive() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let alpha = seed_arr(&ctx.pool, org, "alpha").await;
+    let flute = seed_voice(&ctx.pool, alpha, "flute-1").await;
+    let _oboe = seed_voice(&ctx.pool, alpha, "oboe-1").await;
+    let cond = seed_user(&ctx.pool, org, "cond", Some("conductor")).await;
+    let regular = seed_user(&ctx.pool, org, "regular", Some("musician")).await;
+    let muso = seed_user(&ctx.pool, org, "muso", Some("musician")).await;
+    let sub = seed_user(&ctx.pool, org, "sub", None).await;
+    assign(&ctx.pool, org, alpha, flute, regular.id).await;
+    assign(&ctx.pool, org, alpha, flute, sub.id).await;
+    lied::domain::organization::set_musicians_read_archive(&ctx.pool, org, None, true)
+        .await
+        .unwrap()
+        .expect("org");
+
+    let flute_dir = "/orgs/acme/arrangements/alpha/voices/flute-1";
+    let ann = |voice: &str, user: &str| {
+        format!("/orgs/acme/arrangements/alpha/voices/{voice}/annotations/{user}/marks.pdf")
+    };
+    let regular_marks = ann("flute-1", "regular");
+
+    // The regular player and the substitute (a guest) annotate their part...
+    assert!(put_status(&ctx, &regular_marks, &regular).await < 300);
+    assert!(put_status(&ctx, &ann("flute-1", "sub"), &sub).await < 300);
+    // ...and the substitute reads the regular's markings.
+    assert_eq!(get_status(&ctx, &regular_marks, &sub).await, 200);
+    // A guest has no other voice at all: the voice is absent, so the PUT has
+    // no parent collection (dav-server's 409).
+    assert_eq!(put_status(&ctx, &ann("oboe-1", "sub"), &sub).await, 409);
+
+    // An open-archive musician reads the voice, but not its annotations...
+    let (status, listing) = propfind_body(&ctx, flute_dir, &muso).await;
+    assert_eq!(status, 207);
+    assert!(!listing.contains("annotations"), "{listing}");
+    assert_eq!(get_status(&ctx, &regular_marks, &muso).await, 404);
+    let (status, _) = propfind_body(&ctx, &format!("{flute_dir}/annotations"), &muso).await;
+    assert_eq!(status, 404);
+    // ...and writes none there.
+    assert_eq!(put_status(&ctx, &ann("flute-1", "muso"), &muso).await, 403);
+    let (status, _) = send(
+        &ctx.app,
+        request(
+            "MKCOL",
+            &format!("{flute_dir}/annotations/muso"),
+            &basic(&muso),
+            vec![],
+        ),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 403);
+
+    // The player still sees the annotations folder on their own part.
+    let (_, listing) = propfind_body(&ctx, flute_dir, &regular).await;
+    assert!(listing.contains("annotations"), "{listing}");
+
+    // Staff read everyone's and annotate any voice.
+    assert_eq!(get_status(&ctx, &regular_marks, &cond).await, 200);
+    assert!(put_status(&ctx, &ann("oboe-1", "cond"), &cond).await < 300);
+}
+
+/// A system admin is owner-equivalent in every org over WebDAV as over
+/// `/v1`, member or not: the org is in their `/orgs` root, and they read and
+/// write its archive. A non-member who is not an admin sees none of it.
+#[tokio::test]
+async fn a_system_admin_acts_as_owner_over_webdav() {
+    let ctx = Ctx::new().await;
+    let org = seed_org(&ctx.pool, "acme").await;
+    let alpha = seed_arr(&ctx.pool, org, "alpha").await;
+    seed_voice(&ctx.pool, alpha, "flute-1").await;
+    let admin = seed_user(&ctx.pool, org, "admin", None).await;
+    sqlx::query(r#"UPDATE "user" SET is_system_admin = true WHERE id = $1"#)
+        .bind(admin.id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let outsider = seed_user(&ctx.pool, org, "outsider", None).await;
+
+    let (status, orgs) = propfind_body(&ctx, "/orgs", &admin).await;
+    assert_eq!(status, 207);
+    assert!(orgs.contains("acme"), "{orgs}");
+    let (_, orgs) = propfind_body(&ctx, "/orgs", &outsider).await;
+    assert!(!orgs.contains("acme"), "{orgs}");
+
+    let score = "/orgs/acme/arrangements/alpha/score/full.pdf";
+    let part = "/orgs/acme/arrangements/alpha/voices/flute-1/part.pdf";
+    assert!(put_status(&ctx, score, &admin).await < 300);
+    assert!(put_status(&ctx, part, &admin).await < 300);
+    assert_eq!(get_statuses(&ctx, &[score, part], &admin).await, [200, 200]);
+    assert_eq!(
+        get_statuses(&ctx, &[score, part], &outsider).await,
+        [404, 404]
+    );
+}

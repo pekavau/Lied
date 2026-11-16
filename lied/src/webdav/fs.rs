@@ -7,7 +7,8 @@
 //!   agree, since the object key is derived from the same entity tree); writes
 //!   are `owner`/`archivist` only; reads are role-filtered.
 //! - Personal annotations (`…/voices/<voice>/annotations/<user>/<file>`): MinIO
-//!   objects with no `File` row; author-only-writable, org-readable; audited.
+//!   objects with no `File` row; author-only-writable, readable by whoever
+//!   plays the part and by staff (#124); audited.
 //! - User library (`/users/<user>/library/…`): private free-form MinIO objects.
 
 use std::io::SeekFrom;
@@ -204,6 +205,33 @@ impl LiedFs {
             return Err(FsError::NotFound);
         }
         Ok((org_id, arr_id, voice_id, vis))
+    }
+
+    /// Resolve a voice for its **personal annotations** (#124): as
+    /// [`Self::resolve_voice`], but only staff reach the annotations of a
+    /// voice they are not assigned to
+    /// ([`crate::domain::access::ReadScope::annotates_any_voice`]). A
+    /// musician whose org opened its archive reads the voice's files, but
+    /// neither reads nor writes annotations there unless they play it. `deny`
+    /// is the refusal: `NotFound` for a read (the subtree is hidden, as
+    /// elsewhere in the tree), `Forbidden` for a write.
+    async fn resolve_voice_for_annotations(
+        &self,
+        org: &str,
+        arr: &str,
+        voice: &str,
+        deny: FsError,
+    ) -> FsResult<(Uuid, Uuid, Uuid, Visibility)> {
+        let resolved = self.resolve_voice(org, arr, voice).await?;
+        let (_, _, voice_id, vis) = resolved;
+        if !vis.annotates_any_voice()
+            && !access::has_assignment_on_voice(&self.state.db, voice_id, self.user_id)
+                .await
+                .map_err(db_err)?
+        {
+            return Err(deny);
+        }
+        Ok(resolved)
     }
 
     async fn arr_id_by_slug(&self, org_id: Uuid, slug: &str) -> FsResult<Option<Uuid>> {
@@ -551,14 +579,16 @@ impl LiedFs {
                 }
                 Ok(LiedMeta::dir())
             }
-            Voice { org, arr, voice } | AnnotationsDir { org, arr, voice } => {
+            Voice { org, arr, voice } => {
                 self.resolve_voice(org, arr, voice).await?;
                 Ok(LiedMeta::dir())
             }
-            AnnotationsUserDir {
+            AnnotationsDir { org, arr, voice }
+            | AnnotationsUserDir {
                 org, arr, voice, ..
             } => {
-                self.resolve_voice(org, arr, voice).await?;
+                self.resolve_voice_for_annotations(org, arr, voice, FsError::NotFound)
+                    .await?;
                 Ok(LiedMeta::dir())
             }
 
@@ -586,7 +616,8 @@ impl LiedFs {
                 user,
                 file,
             } => {
-                self.resolve_voice(org, arr, voice).await?;
+                self.resolve_voice_for_annotations(org, arr, voice, FsError::NotFound)
+                    .await?;
                 let key = annotation_key(org, arr, voice, user, file);
                 self.stat_object(&key).await
             }
@@ -851,17 +882,26 @@ impl LiedFs {
                 }
             }
             Voice { org, arr, voice } => {
-                let (_o, arr_id, voice_id, _vis) = self.resolve_voice(org, arr, voice).await?;
+                let (_o, arr_id, voice_id, vis) = self.resolve_voice(org, arr, voice).await?;
                 for e in self
                     .file_entries(org, arr, Some(voice), arr_id, Some(voice_id))
                     .await?
                 {
                     out.push(Box::new(e));
                 }
-                out.push(dir_entry("annotations", LiedMeta::dir()));
+                // Annotations only where the caller may reach them (#124):
+                // staff anywhere, anyone else on a voice they play.
+                if vis.annotates_any_voice()
+                    || access::has_assignment_on_voice(&self.state.db, voice_id, self.user_id)
+                        .await
+                        .map_err(db_err)?
+                {
+                    out.push(dir_entry("annotations", LiedMeta::dir()));
+                }
             }
             AnnotationsDir { org, arr, voice } => {
-                self.resolve_voice(org, arr, voice).await?;
+                self.resolve_voice_for_annotations(org, arr, voice, FsError::NotFound)
+                    .await?;
                 let prefix = format!("orgs/{org}/arrangements/{arr}/voices/{voice}/annotations/");
                 let listing = storage::list_objects(&self.state.s3, self.bucket(), &prefix)
                     .await
@@ -876,7 +916,8 @@ impl LiedFs {
                 voice,
                 user,
             } => {
-                self.resolve_voice(org, arr, voice).await?;
+                self.resolve_voice_for_annotations(org, arr, voice, FsError::NotFound)
+                    .await?;
                 let prefix =
                     format!("orgs/{org}/arrangements/{arr}/voices/{voice}/annotations/{user}/");
                 let listing = storage::list_objects(&self.state.s3, self.bucket(), &prefix)
@@ -1373,7 +1414,10 @@ impl LiedFs {
                 user,
                 file,
             } => {
-                self.resolve_voice(org, arr, voice).await?; // org-readable
+                // Readable by anyone who may reach this voice's annotations:
+                // staff, and whoever plays the part (#124).
+                self.resolve_voice_for_annotations(org, arr, voice, FsError::NotFound)
+                    .await?;
                 let key = annotation_key(org, arr, voice, user, file);
                 let meta = self.stat_object(&key).await?;
                 Ok((key, meta))
@@ -1520,11 +1564,15 @@ impl LiedFs {
                 user,
                 file,
             } => {
-                // Author-only-writable.
+                // Author-only-writable, and only on a voice the author may
+                // annotate: staff anywhere, anyone else (a guest included) on
+                // a voice they play (#124).
                 if user != &self.user_slug {
                     return Err(FsError::Forbidden);
                 }
-                let (org_id, _arr_id, voice_id, _vis) = self.resolve_voice(org, arr, voice).await?;
+                let (org_id, _arr_id, voice_id, _vis) = self
+                    .resolve_voice_for_annotations(org, arr, voice, FsError::Forbidden)
+                    .await?;
                 let key = annotation_key(org, arr, voice, user, file);
                 let ext = file::split_filename(file).map(|(_, e)| e).unwrap_or("");
                 let mime = file::mime_for_ext(ext)
@@ -1616,7 +1664,9 @@ impl LiedFs {
                 if user != &self.user_slug {
                     return Err(FsError::Forbidden);
                 }
-                let (org_id, _a, voice_id, _v) = self.resolve_voice(org, arr, voice).await?;
+                let (org_id, _a, voice_id, _v) = self
+                    .resolve_voice_for_annotations(org, arr, voice, FsError::Forbidden)
+                    .await?;
                 let key = annotation_key(org, arr, voice, user, file);
                 storage::delete_object(&self.state.s3, self.bucket(), &key)
                     .await
@@ -1815,7 +1865,9 @@ impl LiedFs {
                 if user != &self.user_slug {
                     return Err(FsError::Forbidden);
                 }
-                let (org_id, _a, voice_id, _v) = self.resolve_voice(org, arr, voice).await?;
+                let (org_id, _a, voice_id, _v) = self
+                    .resolve_voice_for_annotations(org, arr, voice, FsError::Forbidden)
+                    .await?;
                 let from_key = annotation_key(org, arr, voice, user, file);
                 let to_key = annotation_key(org, arr, voice, user, to_file);
                 self.move_object(&from_key, &to_key).await?;
@@ -2091,7 +2143,8 @@ impl DavFileSystem for LiedFs {
                     voice,
                     user,
                 } if user == &self.user_slug => {
-                    self.resolve_voice(org, arr, voice).await?;
+                    self.resolve_voice_for_annotations(org, arr, voice, FsError::Forbidden)
+                        .await?;
                     Ok(())
                 }
                 _ => Err(FsError::Forbidden),

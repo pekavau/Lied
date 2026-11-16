@@ -542,21 +542,21 @@ async fn update_with_stale_or_missing_if_match_returns_412() {
 }
 
 // ---------------------------------------------------------------------------
-// Work: open creation, creator-only edit.
+// Work: staff creation, creator-only edit.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn any_member_creates_a_work_but_a_non_creator_cannot_edit_it() {
+async fn staff_create_works_but_a_non_creator_cannot_edit_it() {
     let db = TestDb::create_and_migrate().await;
     let (app, state) = build_test_app(db.pool.clone()).await;
 
-    // A musician (in some org) is "a member", so may create a Work.
+    // A conductor (staff in some org) may create a Work (#124).
     let (_org_id, creator_token) = org_with_member(
         &db.pool,
         &state,
         "Org",
         "creator",
-        membership::Role::Musician,
+        membership::Role::Conductor,
     )
     .await;
 
@@ -611,6 +611,68 @@ async fn creating_a_work_without_any_membership_is_forbidden() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
 
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+/// #124: cataloguing is archive work. A musician reads Works but creates,
+/// edits and deletes none, and a creator who is no longer staff anywhere
+/// loses the edit right on their own Work.
+#[tokio::test]
+async fn musicians_read_works_but_do_not_write_them() {
+    let db = TestDb::create_and_migrate().await;
+    let (app, state) = build_test_app(db.pool.clone()).await;
+    let org = create_org(&db.pool, "Band").await;
+    let muso = create_plain_user(&db.pool, "muso").await;
+    add_member(&db.pool, org.id, muso.id, membership::Role::Musician).await;
+    let muso_token = mint_token(&state, muso.id);
+    let arch = create_plain_user(&db.pool, "arch").await;
+    add_member(&db.pool, org.id, arch.id, membership::Role::Archivist).await;
+    let arch_token = mint_token(&state, arch.id);
+
+    let create = |token: &str| {
+        bearer_request("POST", "/v1/works", token)
+            .body(axum::body::Body::from(r#"{"title":"Egmont"}"#))
+            .unwrap()
+    };
+    let response = app.clone().oneshot(create(&muso_token)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+    let response = app.clone().oneshot(create(&arch_token)).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    let work_id = body_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The musician reads it.
+    let request = bearer_request("GET", &format!("/v1/works/{work_id}"), &muso_token)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    // The creator is demoted to musician: no longer staff anywhere.
+    sqlx::query("UPDATE membership SET role = 'musician' WHERE user_id = $1")
+        .bind(arch.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let current = work::find_by_id(&db.pool, Uuid::parse_str(&work_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let etag = lied::listing::etag_for(current.updated_at);
+    let request = bearer_request("PATCH", &format!("/v1/works/{work_id}"), &arch_token)
+        .header(axum::http::header::IF_MATCH, etag.clone())
+        .body(axum::body::Body::from(r#"{"title":"Mine"}"#))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let request = bearer_request("DELETE", &format!("/v1/works/{work_id}"), &arch_token)
+        .header(axum::http::header::IF_MATCH, etag)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
 }
 

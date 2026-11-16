@@ -50,12 +50,23 @@ impl ReadScope {
     pub fn reads_everything(self) -> bool {
         !matches!(self, ReadScope::Restricted)
     }
+
+    /// Whether this scope reads and writes **personal annotations** under any
+    /// voice it can read (#124). Only staff do. Everyone else, a musician
+    /// whose org opened its archive included, reads and writes annotations
+    /// only under a voice they hold a live part assignment on
+    /// ([`assigned_voice`]): a substitute sees the regular player's markings
+    /// on the part they play, and nobody marks up a part they don't play.
+    pub fn annotates_any_voice(self) -> bool {
+        matches!(self, ReadScope::Staff)
+    }
 }
 
-/// The read scope for a membership `role` (`None`: no membership) in an org
-/// whose `musicians_read_archive` setting is `musicians_read_archive`. A pure
+/// The read scope for a `role` (`None`: no membership) in an org whose
+/// `musicians_read_archive` setting is `musicians_read_archive`. A pure
 /// function, so the rule is testable without a database; [`read_scope`] feeds
-/// it from one.
+/// it from one, with a system admin's role already raised to `owner`
+/// ([`role_with_admin`]).
 pub fn scope_for(role: Option<Role>, musicians_read_archive: bool) -> ReadScope {
     match role {
         Some(Role::Owner | Role::Archivist | Role::Conductor) => ReadScope::Staff,
@@ -64,16 +75,34 @@ pub fn scope_for(role: Option<Role>, musicians_read_archive: bool) -> ReadScope 
     }
 }
 
-/// `user_id`'s read scope in organization `organization_id`, or `None` if the
-/// organization does not exist. A system admin is not special here: callers
-/// that let one in as owner-equivalent (`/v1`) check that first.
-pub async fn read_scope(
+/// The role a user acts with in an org: their membership role, except that a
+/// **system admin is owner-equivalent in every org**, member or not (#124).
+/// `/v1` ([`crate::auth::authz::require_org_role`]) and WebDAV (its write
+/// checks and [`read_scope`]) follow this one rule.
+pub fn role_with_admin(membership_role: Option<Role>, is_system_admin: bool) -> Option<Role> {
+    if is_system_admin {
+        Some(Role::Owner)
+    } else {
+        membership_role
+    }
+}
+
+/// What [`read_scope`] and [`effective_role`] read, in one query.
+struct Standing {
+    role: Option<Role>,
+    musicians_read_archive: bool,
+}
+
+async fn standing(
     pool: &PgPool,
     organization_id: Uuid,
     user_id: Uuid,
-) -> Result<Option<ReadScope>, sqlx::Error> {
+) -> Result<Option<Standing>, sqlx::Error> {
     let row = sqlx::query!(
-        r#"SELECT o.musicians_read_archive, m.role AS "role?"
+        r#"SELECT o.musicians_read_archive,
+                  m.role AS "role?",
+                  COALESCE((SELECT u.is_system_admin FROM "user" u WHERE u.id = $2), false)
+                      AS "is_system_admin!"
            FROM organization o
            LEFT JOIN membership m ON m.organization_id = o.id AND m.user_id = $2
            WHERE o.id = $1"#,
@@ -88,8 +117,87 @@ pub async fn read_scope(
         let role = r
             .role
             .map(|role| Role::parse(&role).unwrap_or(Role::Musician));
-        scope_for(role, r.musicians_read_archive)
+        Standing {
+            role: role_with_admin(role, r.is_system_admin),
+            musicians_read_archive: r.musicians_read_archive,
+        }
     }))
+}
+
+/// `user_id`'s read scope in organization `organization_id`, or `None` if the
+/// organization does not exist. A system admin reads as staff
+/// ([`role_with_admin`]).
+pub async fn read_scope(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<ReadScope>, sqlx::Error> {
+    Ok(standing(pool, organization_id, user_id)
+        .await?
+        .map(|s| scope_for(s.role, s.musicians_read_archive)))
+}
+
+/// The role `user_id` acts with in `organization_id` ([`role_with_admin`]):
+/// `None` for a non-member who is not a system admin, or a missing org. Write
+/// checks match on this, never on the [`ReadScope`].
+pub async fn effective_role(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<Role>, sqlx::Error> {
+    Ok(standing(pool, organization_id, user_id)
+        .await?
+        .and_then(|s| s.role))
+}
+
+/// SQL condition, for runtime-built queries: the user bound at `user_param`
+/// **reaches** the organization whose id is `org_id` (a column such as
+/// `o.id`): they are a system admin, a member, or hold a live part assignment
+/// there (a guest). The organizations list and `GET /v1/orgs/{orgId}` (#124)
+/// and the WebDAV `/orgs` root show exactly the organizations a caller
+/// reaches. Both arguments are fixed fragments from the caller, never input.
+pub(crate) fn reaches_org_sql(user_param: &str, org_id: &str) -> String {
+    let assigned = live_assignment_on_arrangement_sql(user_param, "a_reach.id");
+    format!(
+        r#"(EXISTS (SELECT 1 FROM "user" u_reach
+                    WHERE u_reach.id = {user_param} AND u_reach.is_system_admin)
+            OR EXISTS (SELECT 1 FROM membership m_reach
+                       WHERE m_reach.organization_id = {org_id} AND m_reach.user_id = {user_param})
+            OR EXISTS (SELECT 1 FROM arrangement a_reach
+                       WHERE a_reach.organization_id = {org_id} AND a_reach.deleted_at IS NULL
+                         AND {assigned}))"#
+    )
+}
+
+/// Whether `user_id` reaches organization `organization_id`
+/// ([`reaches_org_sql`]); `false` for a missing organization.
+pub async fn reaches_org(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let query = format!(
+        "SELECT EXISTS (SELECT 1 FROM organization o WHERE o.id = $1 AND {})",
+        reaches_org_sql("$2", "o.id")
+    );
+    sqlx::query_scalar::<_, bool>(&query)
+        .bind(organization_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+}
+
+/// Org slugs `user_id` reaches ([`reaches_org_sql`]), ordered by slug: the
+/// WebDAV `/orgs` root, so it never enumerates every org on the instance.
+pub async fn reachable_org_slugs(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+    let query = format!(
+        "SELECT o.slug FROM organization o WHERE {} ORDER BY o.slug",
+        reaches_org_sql("$1", "o.id")
+    );
+    sqlx::query_scalar::<_, String>(&query)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
 }
 
 /// Where an assigned voice lives, for checking it against the request path.
@@ -521,5 +629,26 @@ mod tests {
     fn guests_are_never_widened_by_the_setting() {
         assert_eq!(scope_for(None, false), ReadScope::Restricted);
         assert_eq!(scope_for(None, true), ReadScope::Restricted);
+    }
+
+    #[test]
+    fn a_system_admin_acts_as_owner_in_every_org() {
+        assert_eq!(role_with_admin(None, true), Some(Role::Owner));
+        assert_eq!(
+            role_with_admin(Some(Role::Musician), true),
+            Some(Role::Owner)
+        );
+        assert_eq!(role_with_admin(None, false), None);
+        assert_eq!(
+            role_with_admin(Some(Role::Conductor), false),
+            Some(Role::Conductor)
+        );
+    }
+
+    #[test]
+    fn only_staff_annotate_voices_they_are_not_assigned_to() {
+        assert!(ReadScope::Staff.annotates_any_voice());
+        assert!(!ReadScope::Archive.annotates_any_voice());
+        assert!(!ReadScope::Restricted.annotates_any_voice());
     }
 }
